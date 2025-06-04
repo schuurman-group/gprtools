@@ -7,18 +7,26 @@ import numpy as np
 import itertools
 from abc import ABC, abstractmethod
 import graci.core.libs as libs
+import chempotpy
+import constants as constants
 
 class Surface(ABC):
 
     def __init__(self):
         super().__init__()
-    
-    @abstractmethod
-    def initialize(self):
-        pass
+        self.have_gradients = False
+        self.have_coupling  = False
 
     @abstractmethod
     def evaluate(self):
+        pass
+
+    @abstractmethod
+    def gradient(self):
+        pass
+
+    @abstractmethod
+    def coupling(self):
         pass
 
 #
@@ -26,31 +34,26 @@ class Graci(Surface):
     """
     GRaCI surface evaluator
     """
-    def __init__(self):
+    def __init__(self, ci_obj, nstates, scf_obj=None, mol_obj=None):
         super().__init__()
         self.graci_ci    = None
         self.graci_scf   = None
         self.graci_mol   = None
+        self.nstates     = None
         self.ci_type     = ''
         self.nroots      = 0
         self.valid_types = ['dftmrci','dftmrci2']
 
-    # 
-    def initialize(self, ci_obj, scf_obj=None, mol_obj=None):
-        """
-        set the ci object to be evaluated and extract some info
-        about the object
-        """
-
         ci_type  = ci_obj.__class__.__name__.lower()
         if ci_type not in self.valid_types:
-            print('CI type: ' + str(ci_type) + 
+            print('CI type: ' + str(ci_type) +
                   ' not a recognized GRaCI object',flush=True)
             return None
 
         # set the CI object and quiet output
         self.graci_ci = ci_obj.copy()
         self.ci_type  = self.graci_ci.__class__.__name__.lower()
+        self.nstates  = nstates
         self.nroots   = self.graci_ci.n_states()
         self.graci_ci.verbose  = False
 
@@ -70,10 +73,8 @@ class Graci(Surface):
         # load the bitci shared library
         libs.lib_load('bitci')
 
-        return True
-
     #
-    def evaluate(self, gms, n_s=None, scr_dir=None, propagate=True):
+    def evaluate(self, gms, scr_dir=None, propagate=True, clean=True):
         """
         evaluate the energy at passed geometry, gm
         """
@@ -93,8 +94,7 @@ class Graci(Surface):
 
         # if the number of states is not specified, use
         # the default number of stats in ci object
-        if n_s is not None:
-            self.nroots = n_s
+        self.nroots = self.nstates
         self.graci_ci.nstates = np.asarray([self.nroots], dtype=int)
 
         energies = np.zeros((gms.shape[0], self.nroots), dtype=float)
@@ -103,8 +103,8 @@ class Graci(Surface):
 
         # sort geometries so they're in optimal order for propagating
         # orbitals and/or reference spaces
-        origin = self.graci_mol.cart().flatten(order='C')
-        ordr   = self.sort_geoms(origin, gms)
+        origin     = self.graci_mol.cart().flatten(order='C')
+        ordr, dist = self.sort_geoms(origin, gms)
 
         # iterate over all gms passed, propagating orbitals and reference
         # space as we go
@@ -130,7 +130,7 @@ class Graci(Surface):
             # guess
             elif propagate:
                 scf_guess = self.graci_scf.copy()
-              
+
             # run the CI. Use previous reference space as a guess by
             # default. Currently only enabled for DFT/MRCI(2)
             conv = self.graci_ci.run(self.graci_scf, ci_guess)
@@ -145,11 +145,28 @@ class Graci(Surface):
             else:
                 ci_fail.append(ordr[i])
 
-        # move back up to main directory and remove scratch
+        # move back up to main directory
         os.chdir('../')
-        shutil.rmtree('scratch')
+
+        #remove scratch if requested
+        if clean:
+            shutil.rmtree('scratch')
 
         return energies, scf_fail, ci_fail
+
+    #
+    def gradient(self, geoms):
+        """
+        not defined for GRaCI surfaces
+        """
+        return None
+
+    #
+    def coupling(self, geoms):
+        """
+        time-derivative couplings will be added in the future
+        """
+        return None
 
     #
     def sort_geoms(self, origin, geoms):
@@ -165,7 +182,7 @@ class Graci(Surface):
         dif = gms[r,:] - gms[c,:]
 
         # compute the distances between all unique pairs of geoms 
-        dist = np.sqrt(np.einsum('ij,ij->i',dif_ten, dif_ten))
+        dist = np.sqrt(np.einsum('ij,ij->i',dif, dif))
 
         # construct the distance matrix
         dmat      = -np.identity(gms.shape[0], dtype=float)
@@ -174,14 +191,17 @@ class Graci(Surface):
         # order the geometries so each step takes you to closest
         # unique geometry
         ordr    = []       
+        ndist   = []
         current = 0
         for i in range(geoms.shape[0]):
             valid   = np.where(dmat[current,:] >= 0.)[0]
             nearest = valid[dmat[current, valid].argmin()]
+            mindist = dmat[current, nearest]
+            ndist.append(mindist)
             # decrement closest by 1: first geometry is the origin 
             ordr.append(nearest-1)
             # remove this pair as a future possibility
-            dmat[current, nearest] = dmat[nearest, current] = -1
+            dmat[current, :] = dmat[:, current] = -1
             # move to next geometry
             current = nearest
           
@@ -191,7 +211,7 @@ class Graci(Surface):
                   ' != '+str(geoms.shape[0]))
             ordr = [i for i in range(geoms.shape[0])]
  
-        return ordr
+        return ordr, ndist
 
 #
 class Kdc(Surface):
@@ -200,16 +220,12 @@ class Kdc(Surface):
     """
     def __init__(self):
         super().__init__() 
-        self.ham         = Kdc_ham()
-        self.nmodes      = None
-        self.nstates     = None
-        self.norder      = 0
-
-    # 
-    def initialize(self, op_file):
-        """
-        Load the KDC Hamiltonian after parsing to operator file
-        """
+        self.ham            = Kdc_ham()
+        self.nmodes         = None
+        self.nstates        = None
+        self.norder         = 0
+        self.have_gradients = True
+        self.have_coupling  = True
 
         if os.path.isfile(op_file):
             self.ham.parse_op_file(op_file)
@@ -218,8 +234,6 @@ class Kdc(Surface):
 
         self.nmodes  = self.ham.nmodes
         self.nstates = self.ham.nstates
-
-        return True
 
     #
     def evaluate(self, gms, n_s=None, rep='adiabatic'):
@@ -614,4 +628,118 @@ class Kdc_ham():
         for pki in self.gen_partition(k,n):
             plist.append(pki.copy())
         return plist
+
+class ChemPotPy(Surface):
+    """
+    ChemPotPy surface evaluator
+    """
+    def __init__(self, molecule, surface_name, nstates, ref_geom,
+                   e_units='eV', g_units='Angstrom'):
+        super().__init__()
+        self.molecule = molecule
+        self.surface  = surface_name
+        self.nstates  = nstates
+        self.atms     = ref_geom.atms
+
+        if e_units.lower() == 'ev':
+            self.econv = constants.ev2au 
+        elif e_units.lower() == 'au':
+            self.econv = 1.
+        else:
+            print('e_units='+str(e_units)+' not recognized.')
+            os.abort()
+
+        if g_units.lower() == 'angstrom':
+            self.gconv = constants.ang2bohr 
+        elif g_units.lower() == 'bohr':
+            self.gconv = 1.
+        else:
+            print('g_units='+str(g_units)+' not recognized.')
+            os.abort()
+
+        self.ref_geom = self._chempotpygeom(ref_geom.x * self.gconv)
+
+        self.have_gradients = True
+        self.have_coupling  = True
+
+    #
+    def evaluate(self, gms, nst=None):
+        """
+        evaluate the potential at the passed geometries. Geometries
+        are assumed to be a 2D numpy array
+        """
+        if nst == None:
+            nst = self.nstates
+        elif nst > self.nstates:
+            print('surface only defined for ' +str(self.nstates) +
+                   ': Exiting...')
+            os.abort()
+
+        ngm = gms.shape[0]
+        energies = np.zeros((ngm, nst), dtype=float)
+
+        for i in range(gms.shape[0]):
+            gm            = self._chempotpygeom(gms[i,:] / self.gconv) 
+            evals         = chempotpy.p(self.molecule, self.surface, gm)
+            energies[i,:nst] = evals[:nst] 
+
+        energies *= self.econv
+
+        return energies
+
+    #
+    def gradient(self, gms, nst = None):
+        """
+        evaluate the gradients at the passed geometries. Geometries
+        are assumed to be a 2D numpy array
+        """
+
+        if nst == None:
+            nst = self.nstates
+        elif nst > self.nstates:
+            print('surface only defined for ' +str(self.nstates) +
+                   ': Exiting...')
+            os.abort()
+
+        ngm = gms.shape[0]
+        energies = np.zeros((ngm, nst), dtype=float)
+        grads    = np.zeros((ngm, nst, 3*len(self.atms)), dtype=float)
+
+        for i in range(gms.shape[0]):
+            gm                        = self._chempotpygeom(gms[i,:] / self.gcov)
+            cppsurf                   = chempotpy.pg(self.molecule, self.surface, gm)
+            energies[i,:], grads[i,:] = cppsurf[0][:nst+1], cppsurf[1][:nst+1]
+
+        grads    *= (self.econv / self.gconv)
+
+        return grads
+
+    #
+    def coupling(self, gms):
+        """
+        evaluate the NACs at the passed geometries. Geometries
+        are assumed to be a 2D numpy array
+        """
+        ngm      = gms.shape[0]
+        energies = np.zeros((ngm, self.nstates), dtype=float)
+        nacs     = np.zeros((ngm, self.nstates, 3*len(self.atms)), dtype=float)
+
+        for i in range(gms.shape[0]):
+            gm                        = self._chempotpygeom(gms[i,:] / self.gconv)
+            energies[i,:], nacs[i,:] = chempotpy.pg(self.molecule, self.surface, gm)
+
+        nacs    *= (self.econv / self.gconv)
+
+        return nacs
+
+    #
+    def _chempotpygeom(self, gm):
+        """
+        convert a numpy array geometry to chempotpy format
+        """
+        cgm = []
+        for i in range(len(self.atms)):
+            xyz = gm[3*i:3*i+3].tolist()
+            cgm.append([self.atms[i]] + xyz)
+        return cgm
 
