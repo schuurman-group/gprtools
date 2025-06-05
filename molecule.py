@@ -2,9 +2,10 @@
 Trajectory class
 """
 import numpy as np
-from scipy.integrate import solve_ivp
+from scipy.integrate import RK45
 import constants as constants
 import intc as intc
+
 
 ref_masses = {'Ghost': 0, 'X': 0., 'H':1.008, 'He':4.002602,
               'Li': 6.94, 'Be':9.0121831, 
@@ -107,14 +108,18 @@ class Trajectory():
         self.ns     = ns
         self.state  = state
         self.energy = np.zeros(ns, dtype=float)
-        self.coup   = np.zeros((ns, self.x.shape[0]), dtype=float)
+        self.grad   = np.zeros(self.nc, dtype=float)
+        self.dm     = np.zeros((ns, ns), dtype=complex)
         self.time   = 0.
-        self.tseries = None
+
+        # initialize the density matrix
+        self.dm[self.state, self.state] = 1.
+
         if surface is not None:
             self.surface = surface
 
     #
-    def propagate(self, dt, propagator='RK45', tols=None):
+    def propagate(self, dt, tols=None, chk_surf=False, chk_func=None):
         """
         propagate a trajectory from current time t to t+dt using
         the surrogate
@@ -124,15 +129,44 @@ class Trajectory():
         else:
             [rtol, atol] = [1.e-3,1e-6]
 
-        y0 = np.concatenate((self.x, self.p))
-        res = solve_ivp(
-                fun    = self.step_function, # dy/dt
-                t_span = (self.time, self.time+dt), # t0, t0+dt
-                y0     = y0,                  # starting x,p 
-                method = propagator,          # default RK45
-                rtol   = rtol,                # relative tolerance
-                atol   = atol                 # absolute tolerance
-                )
+        if chk_surf and chk_func == None:
+            print('Surface error monitoring requested, but no check'+
+                  ' function specified in Trajectory.propagate.')
+            os.abort()
+
+        t0 = self.time
+        y0 = np.concatenate((self.x, self.p, self.dm.ravel()))
+
+        current_time = t0 
+        current_y    = y0
+        surf_fail = False
+        while current_time < t0+dt and not surf_fail:
+
+            propagator = RK45(
+                    fun     = self.step_function, 
+                    t0      = time,
+                    y0      = ycurrent,
+                    t_bound = t0 + dt, 
+                    max_step=0.1)
+
+            while propagator.status == 'running':
+                time = propagator.t
+                ycurrent = propagator.y[0]
+
+                t.append(propagator.t)
+                y.append(propagator.y[0])
+                new_state = self.compute_fssh_prob()
+
+                if new_state != self.state:
+                    self.state = new_state
+                    self.scale_momentum()
+                    break
+
+                rk45.step()
+
+                if chk_surf:
+                    surf_fail = chk_func(thresh):
+                    break
 
         # update position and momentum
         self.tseries = res
@@ -142,6 +176,17 @@ class Trajectory():
         self.time    = res.t[-1]
 
         return self.time
+
+    # 
+    def compute_fssh_prob(self):
+        """
+        compute the Tully FSSH hopping probability to
+        each state and return the new state if a hop
+        is executed
+        """
+        
+
+
 
     #
     def update_surface(self, new_surface):
@@ -156,19 +201,37 @@ class Trajectory():
         function to pass to solve_ivp to propagate trajectory
         """
 
+        # API expect geometry as a 2D array of gms
+        gm = np.array([y[:self.nc].real])
+
         # vector to put dy / dt
-        dely = np.zeros(y.shape[0], dtype=float)
+        dely = np.zeros(y.shape[0], dtype=complex)
 
         # evaluate the gradient of the potential at y.x,
         # -grad = F = ma
-        grad = self.surface.gradient(np.array([y[:self.nc]]), 
-                                     states=[self.state])
+        grad = self.surface.gradient(gm, states=[self.state])
         acc = -grad[0,0,:] / self.m
 
         # dx/dt = v = mv/m
         dely[:self.nc] = self.p / self.m
+        # dp/dt = -F/m = a
         dely[self.nc:] = acc
+
+        # propagate the dm, ns>1 and y has the correct
+        # shape
+        if self.ns > 1 and y.shape[0] == (2*self.nc + self.ns**2):
+            pairs = [[i,j] for i in range(self.ns) for j in range(i)]
+            nac   = self.surface.coupling(gm, pairs)
+            dely[2*self.nc:] = self.propagate_dm(nac, pairs)
 
         return dely
     
+    #
+    def propagate_dm(self, nac, pairs):
+        """
+        propagate the state density matrix
+        """
+        dMdt = np.zeros((self.ns, self.ns), dtype=complex)
+
+
 

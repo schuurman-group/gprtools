@@ -683,10 +683,10 @@ class ChemPotPy(Surface):
         ngm = gms.shape[0]
         energies = np.zeros((ngm, nst), dtype=float)
 
-        for i in range(gms.shape[0]):
-            gm            = self._chempotpygeom(gms[i,:] / self.gconv) 
-            evals         = chempotpy.p(self.molecule, self.surface, gm)
-            energies[i, :] = evals[[states]]
+        for i in range(ngm):
+            gm             = self._chempotpygeom(gms[i,:] / self.gconv) 
+            cppsurf        = chempotpy.p(self.molecule, self.surface, gm)
+            energies[i, :] = cppsurf[[states]]
 
         energies *= self.econv
 
@@ -709,14 +709,12 @@ class ChemPotPy(Surface):
         nst = len(states)
         nat = len(self.atms)
         ngm = gms.shape[0]
-        energies = np.zeros((ngm, nst), dtype=float)
         grads    = np.zeros((ngm, nst, 3*nat), dtype=float)
 
-        for i in range(gms.shape[0]):
-            gm             = self._chempotpygeom(gms[i,:] / self.gconv)
-            cppsurf        = chempotpy.pg(self.molecule, self.surface, gm)
-            energies[i,:]  = cppsurf[0][[states]]
-            grads[i,:,:]   = np.reshape(cppsurf[1][[states]], (nst, 3*nat))
+        for i in range(ngm):
+            gm           = self._chempotpygeom(gms[i,:] / self.gconv)
+            cppsurf      = chempotpy.pg(self.molecule, self.surface, gm)
+            grads[i,:,:] = np.reshape(cppsurf[1][[states]], (nst, 3*nat))
 
         grads    *= (self.econv / self.gconv)
 
@@ -738,29 +736,32 @@ class ChemPotPy(Surface):
         nst = len(states)
         nat = len(self.atms)
         ngm = gms.shape[0]
-        energies = np.zeros((ngm, nst), dtype=float)
         hessian  = np.zeros((ngm, nst, 3*nat, 3*nat), dtype=float)
-
+        for i in range(ngm):
+            for j in range(natm):
+                gm  = self._chempotpygeom(gms[i,:] / self.gconv)
+                cppsurf = chempotpy.pg(self.molecule, self.surface, gm)
+                hessian[i,:,:,:] = np.reshape(cppsurf[1][[states]], (nst, 3*nat))
 
         return hessian
 
-
     #
-    def coupling(self, gms, st_pairs = None):
+    def coupling(self, gms, pairs = None):
         """
         evaluate the NACs at the passed geometries. Geometries
         are assumed to be a 2D numpy array
         """
 
-        npair    = len(st_pairs)
-        nat      = len(self.atms)
-        ngm      = gms.shape[0]
-        energies = np.zeros((ngm, self.nstates), dtype=float)
-        nacs     = np.zeros((ngm, npair, 3*nat), dtype=float)
+        npair = len(pairs)
+        nat   = len(self.atms)
+        ngm   = gms.shape[0]
+        nacs  = np.zeros((ngm, npair, 3*nat), dtype=float)
 
-        for i in range(gms.shape[0]):
-            gm                        = self._chempotpygeom(gms[i,:] / self.gconv)
-            energies[i,:], nacs[i,:] = chempotpy.pg(self.molecule, self.surface, gm)
+        for i in range(ngm):
+            gm        = self._chempotpygeom(gms[i,:] / self.gconv)
+            cppsurf   = chempotpy.pgd(self.molecule, self.surface, gm) 
+            for j in range(npair):
+                nacs[i,j,:] = cppsurf[2][pairs[j][0], pairs[j][1],:]
 
         nacs    *= (self.econv / self.gconv)
 
