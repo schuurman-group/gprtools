@@ -97,22 +97,24 @@ class Trajectory():
     """
     Trajectory class, currently not much 
     """
-    def __init__(self, m, xi, pi, ns, state, surrogate=None):
-        self.m      = m
-        self.x      = xi
+    def __init__(self, gm, pi, ns, state, surface=None):
+        amass       = [[gm.masses[i]]*3 
+                            for i in range(len(gm.masses))]
+        self.m      = np.array(sum(amass, []), dtype=float)
+        self.x      = gm.x
         self.p      = pi
-        self.nc     = xi.shape[0]
+        self.nc     = self.x.shape[0]
         self.ns     = ns
         self.state  = state
         self.energy = np.zeros(ns, dtype=float)
-        self.coup   = np.zeros((ns, xi.shape[0]), dtype=float)
+        self.coup   = np.zeros((ns, self.x.shape[0]), dtype=float)
         self.time   = 0.
-        if surrogate is not None:
-            self.surrogate = surrogate
+        self.tseries = None
+        if surface is not None:
+            self.surface = surface
 
     #
-    def propagate(self, dt, gradients=False, propagator='RK45', 
-                  tols=None):
+    def propagate(self, dt, propagator='RK45', tols=None):
         """
         propagate a trajectory from current time t to t+dt using
         the surrogate
@@ -122,7 +124,7 @@ class Trajectory():
         else:
             [rtol, atol] = [1.e-3,1e-6]
 
-        y0 = np.concatenate(self.x, self.p)
+        y0 = np.concatenate((self.x, self.p))
         res = solve_ivp(
                 fun    = self.step_function, # dy/dt
                 t_span = (self.time, self.time+dt), # t0, t0+dt
@@ -133,20 +135,20 @@ class Trajectory():
                 )
 
         # update position and momentum
-        t = res.t
-        self.x = res.y[:self.nc, -1]
-        self.p = res.y[self.nc:, -1]
-        self.time = res.t[-1]
+        self.tseries = res
+        t            = res.t
+        self.x       = res.y[:self.nc, -1]
+        self.p       = res.y[self.nc:, -1]
+        self.time    = res.t[-1]
 
         return self.time
-     
 
     #
-    def update_surrogate(self, new_surrogate):
+    def update_surface(self, new_surface):
         """
         replace surrogate potential with new_surrogate
         """
-        self.surrogate = new_surrogate
+        self.surface = new_surface
 
     #
     def step_function(self, t, y):
@@ -159,7 +161,9 @@ class Trajectory():
 
         # evaluate the gradient of the potential at y.x,
         # -grad = F = ma
-        acc = -self.surrogate.gradient([y[:self.nc]]) / self.m 
+        grad = self.surface.gradient(np.array([y[:self.nc]]), 
+                                     states=[self.state])
+        acc = -grad[0,0,:] / self.m
 
         # dx/dt = v = mv/m
         dely[:self.nc] = self.p / self.m

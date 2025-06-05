@@ -41,6 +41,10 @@ class Surrogate(ABC):
     def hessian(self):
         pass
 
+    @abstractmethod
+    def coupling(self):
+        pass
+
 #
 class Adiabat(Surrogate):
     """
@@ -123,18 +127,18 @@ class Adiabat(Surrogate):
 
 
     #
-    def gradient(self, gms):
+    def gradient(self, gms, states = None):
         """
         evaluate the gradient of the surrogate at gms
         """
 
         delta = 0.0001
-        np    = gms.shape[0]
+        ng    = gms.shape[0]
         nc    = gms.shape[1]
-        grads = np.zeros((np, nc), dtype=float)
+        grads = np.zeros((ng, 1, nc), dtype=float)
 
         o_ener    = self.evaluate(gms)
-        for i in range(np):
+        for i in range(ng):
 
             origin = np.tile(gms[i,:], (nc, 1))
 
@@ -152,12 +156,12 @@ class Adiabat(Surrogate):
 
             grad = (-p2_ener + 8*p_ener - 8*m_ener + m2_ener ) / (12.*delta)
             
-            grads[i, :] = grad
+            grads[i, 0, :] = grad
 
         return grads
             
     #
-    def hessian(self, gms):
+    def hessian(self, gms, states = None):
         """
         compute the hessian by gradient differences
         """
@@ -186,6 +190,15 @@ class Adiabat(Surrogate):
 
         return hessall
 
+    #
+    def coupling(self, gms, st_pairs = None):
+        """
+        this function is not defined for a single adiabat 
+        """
+        print('Adiabat.coupling: this function hsould not be called...')
+        os.abort()
+
+        return None 
 
 #
 class CP(Surrogate):

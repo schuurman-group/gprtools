@@ -26,6 +26,10 @@ class Surface(ABC):
         pass
 
     @abstractmethod
+    def hessian(self):
+        pass
+
+    @abstractmethod
     def coupling(self):
         pass
 
@@ -663,66 +667,96 @@ class ChemPotPy(Surface):
         self.have_coupling  = True
 
     #
-    def evaluate(self, gms, nst=None):
+    def evaluate(self, gms, states = None):
         """
         evaluate the potential at the passed geometries. Geometries
         are assumed to be a 2D numpy array
         """
-        if nst == None:
-            nst = self.nstates
-        elif nst > self.nstates:
+        if states == None:
+            states = [i for i in range(self.nstates)]
+        elif max(states) > self.nstates:
             print('surface only defined for ' +str(self.nstates) +
                    ': Exiting...')
             os.abort()
 
+        nst = len(states)
         ngm = gms.shape[0]
         energies = np.zeros((ngm, nst), dtype=float)
 
         for i in range(gms.shape[0]):
             gm            = self._chempotpygeom(gms[i,:] / self.gconv) 
             evals         = chempotpy.p(self.molecule, self.surface, gm)
-            energies[i,:nst] = evals[:nst] 
+            energies[i, :] = evals[[states]]
 
         energies *= self.econv
 
         return energies
 
     #
-    def gradient(self, gms, nst = None):
+    def gradient(self, gms, states = None):
         """
         evaluate the gradients at the passed geometries. Geometries
         are assumed to be a 2D numpy array
         """
 
-        if nst == None:
-            nst = self.nstates
-        elif nst > self.nstates:
+        if states == None:
+            states = [i for i in range(self.nstates)]
+        elif max(states) > self.nstates:
             print('surface only defined for ' +str(self.nstates) +
                    ': Exiting...')
             os.abort()
 
+        nst = len(states)
+        nat = len(self.atms)
         ngm = gms.shape[0]
         energies = np.zeros((ngm, nst), dtype=float)
-        grads    = np.zeros((ngm, nst, 3*len(self.atms)), dtype=float)
+        grads    = np.zeros((ngm, nst, 3*nat), dtype=float)
 
         for i in range(gms.shape[0]):
-            gm                        = self._chempotpygeom(gms[i,:] / self.gcov)
-            cppsurf                   = chempotpy.pg(self.molecule, self.surface, gm)
-            energies[i,:], grads[i,:] = cppsurf[0][:nst+1], cppsurf[1][:nst+1]
+            gm             = self._chempotpygeom(gms[i,:] / self.gconv)
+            cppsurf        = chempotpy.pg(self.molecule, self.surface, gm)
+            energies[i,:]  = cppsurf[0][[states]]
+            grads[i,:,:]   = np.reshape(cppsurf[1][[states]], (nst, 3*nat))
 
         grads    *= (self.econv / self.gconv)
 
         return grads
 
     #
-    def coupling(self, gms):
+    def hessian(self, gms, states = None):
+        """
+        evaluate the hessian on states 'states'. If states=None, return
+        hessian for all defined states
+        """
+        if states == None:
+            states = [i for i in range(self.nstates)]
+        elif max(states) > self.nstates:
+            print('surface only defined for ' +str(self.nstates) +
+                   ': Exiting...')
+            os.abort()
+
+        nst = len(states)
+        nat = len(self.atms)
+        ngm = gms.shape[0]
+        energies = np.zeros((ngm, nst), dtype=float)
+        hessian  = np.zeros((ngm, nst, 3*nat, 3*nat), dtype=float)
+
+
+        return hessian
+
+
+    #
+    def coupling(self, gms, st_pairs = None):
         """
         evaluate the NACs at the passed geometries. Geometries
         are assumed to be a 2D numpy array
         """
+
+        npair    = len(st_pairs)
+        nat      = len(self.atms)
         ngm      = gms.shape[0]
         energies = np.zeros((ngm, self.nstates), dtype=float)
-        nacs     = np.zeros((ngm, self.nstates, 3*len(self.atms)), dtype=float)
+        nacs     = np.zeros((ngm, npair, 3*nat), dtype=float)
 
         for i in range(gms.shape[0]):
             gm                        = self._chempotpygeom(gms[i,:] / self.gconv)
