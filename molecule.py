@@ -99,16 +99,17 @@ class Trajectory():
     Trajectory class, currently not much 
     """
     def __init__(self, gm, pi, ns, state, surface=None):
+
         amass       = [[gm.masses[i]]*3 
                             for i in range(len(gm.masses))]
+
+        # self.m is a length 3*N vector of atomic masses
         self.m      = np.array(sum(amass, []), dtype=float)
         self.x      = gm.x
         self.p      = pi
         self.nc     = self.x.shape[0]
         self.ns     = ns
         self.state  = state
-        self.energy = np.zeros(ns, dtype=float)
-        self.grad   = np.zeros(self.nc, dtype=float)
         self.dm     = np.zeros((ns, ns), dtype=complex)
         self.time   = 0.
 
@@ -119,7 +120,7 @@ class Trajectory():
             self.surface = surface
 
     #
-    def propagate(self, dt, tols=None, chk_surf=False, chk_func=None):
+    def propagate(self, dt, tols=None, chk_func=None, chk_thresh=None):
         """
         propagate a trajectory from current time t to t+dt using
         the surrogate
@@ -129,64 +130,69 @@ class Trajectory():
         else:
             [rtol, atol] = [1.e-3,1e-6]
 
-        if chk_surf and chk_func == None:
-            print('Surface error monitoring requested, but no check'+
-                  ' function specified in Trajectory.propagate.')
-            os.abort()
-
+        self.dm[self.state, self.state] = 1.
         t0 = self.time
         y0 = np.concatenate((self.x, self.p, self.dm.ravel()))
-
-        current_time = t0 
         current_y    = y0
-        surf_fail = False
-        while current_time < t0+dt and not surf_fail:
+        tseries      = []
+        yseries      = []
+        chk_vals     = []
+        update_surf  = False
+
+        # propagate outer loop until final itme reached,
+        # or we need to update our surface
+        while self.time < t0+dt and not update_surf:
 
             propagator = RK45(
-                    fun     = self.step_function, 
-                    t0      = time,
-                    y0      = ycurrent,
-                    t_bound = t0 + dt, 
-                    max_step=0.1)
+                    fun      = self.step_function, 
+                    t0       = t0,
+                    y0       = y0,
+                    t_bound  = t0 + dt, 
+                    rtol     = rtol,
+                    atol     = atol,
+                    max_step = 0.1)
 
             while propagator.status == 'running':
-                time = propagator.t
-                ycurrent = propagator.y[0]
+                self.time = propagator.t
+                ycurrent  = propagator.y
 
-                t.append(propagator.t)
-                y.append(propagator.y[0])
-                new_state = self.compute_fssh_prob()
+                if chk_func is not None:
+                    chk_vals.append(chk_func(y[:self.nc],
+                                             y[self.nc:2*self.nc],
+                                             self.state))
+                    if chk_vals[-1] > chk_thresh:
+                        update_surf = True
+                        break
+
+                # save current time, position, and momentum
+                if len(tseries) > 0:
+                    delta_t = self.time - tseries[-1]
+                else:
+                    delta_t = self.time - t0
+                tseries.append(self.time)
+                yseries.append(ycurrent)
+
+                # update the trajectory
+                self.x  = ycurrent[:self.nc].real
+                self.p  = ycurrent[self.nc:2*self.nc].real
+                self.dm = np.reshape(ycurrent[2*self.nc:], 
+                                         (self.ns, self.ns))
+                new_state = self.compute_fssh_hop(delta_t)
 
                 if new_state != self.state:
-                    self.state = new_state
-                    self.scale_momentum()
-                    break
+                    success = self.scale_momentum(new_state)
+                    if success:
+                        break
 
-                rk45.step()
+                propagator.step()
 
-                if chk_surf:
-                    surf_fail = chk_func(thresh):
-                    break
+            # if we got here because the propagator failed not b/c
+            # of a hop or surface update, end propagation
+            if propagator.status == 'failed':
+                print('propagation failed.')
+                return None
 
-        # update position and momentum
-        self.tseries = res
-        t            = res.t
-        self.x       = res.y[:self.nc, -1]
-        self.p       = res.y[self.nc:, -1]
-        self.time    = res.t[-1]
-
-        return self.time
-
-    # 
-    def compute_fssh_prob(self):
-        """
-        compute the Tully FSSH hopping probability to
-        each state and return the new state if a hop
-        is executed
-        """
-        
-
-
+        return [t, y, chk_vals] 
 
     #
     def update_surface(self, new_surface):
@@ -209,29 +215,119 @@ class Trajectory():
 
         # evaluate the gradient of the potential at y.x,
         # -grad = F = ma
+        ener = self.surface.evaluate(gm, 
+                                     states=[i for i in range(self.ns)])
         grad = self.surface.gradient(gm, states=[self.state])
         acc = -grad[0,0,:] / self.m
-
+        vel = self.p / self.m
+ 
         # dx/dt = v = mv/m
-        dely[:self.nc] = self.p / self.m
+        dely[:self.nc] = vel 
         # dp/dt = -F/m = a
-        dely[self.nc:] = acc
+        dely[self.nc:2*self.nc] = acc
 
         # propagate the dm, ns>1 and y has the correct
         # shape
         if self.ns > 1 and y.shape[0] == (2*self.nc + self.ns**2):
-            pairs = [[i,j] for i in range(self.ns) for j in range(i)]
-            nac   = self.surface.coupling(gm, pairs)
-            dely[2*self.nc:] = self.propagate_dm(nac, pairs)
+            ddmdt = self.propagate_dm(gm, ener, vel)
+            dely[2*self.nc:] = ddmdt.ravel()
 
         return dely
     
     #
-    def propagate_dm(self, nac, pairs):
+    def propagate_dm(self, gm, ener, vel):
         """
         propagate the state density matrix
         """
         dMdt = np.zeros((self.ns, self.ns), dtype=complex)
+        dR    = -1j*np.diag(ener) - self.tdcm(gm, vel) 
+        dDMdt = dR@DM - DM@dR
 
+        return dDMdt
 
+    # compute the time-derivative coupling matrix
+    def tdcm(self, vel):
+        """
+        compute the time derivative coupling matrix
+        """
+        tdcm = np.zeros((self.ns, self.ns), dtype=float)
+        pairs = [[i,j] for i in range(self.ns) for j in range(i)]
+        nac   = self.surface.coupling(gm, pairs)
+
+        # compute the time-derivative coupling
+        for ind in range(len(pairs)):
+            i,j = pairs[ind][0],pairs[ind][1]
+            tdcm[i,j] =  np.dot(vel, nac[ind])
+            tdcm[j,i] = -tdcm[i,j]
+
+        return tdcm
+
+    #
+    def compute_fssh_hop(self, dt):
+        """
+        compute the FSSH hopping probabilities
+        """
+        # if this is single state, don't bother
+        # with hopping algorithm
+        if self.ns == 1:
+            return self.state
+
+        # compute hopping probabilities
+        vel    = self.p / self.m
+        b      = (-2*np.conjugate(self.dm)*self.tdcm(vel)).real
+        pop    = np.diag(self.dm)
+        t_prob = np.array([max(0., dt*b[j, self.state]/pop[self.state]) 
+                            for j in range(nstate)]) 
+        t_prob[self.state] = 0.
+ 
+        # check whether or not to hop
+        r    = np.random.uniform()
+        st   = 0.
+        prob = 0.
+        while st < self.ns:
+            prob += t_prob[st]
+            if r < prob:
+                return st
+            st += 1
+
+        return self.state
+
+    #
+    def scale_momentum(self, new_state):
+        """
+        following a potential hop, attempt to scale the momentum
+        of the trajectory on the new state. If successful, return
+        'True', else, 'False'
+        """
+        
+        # get coupling direction along which to scale
+        # momentum
+        gm  = np.array([self.x])
+        pair = [self.state, new_state]
+        nac  = self.surface.coupling(gm, [pair])[0]
+        ener = self.surface.evaluate(gm, states=pair)[0]
+
+        # now we solve for the momentum adjustment that conserves
+        # the total energy
+        a = 0.5 * (nac*nac) / self.m
+        b = np.dot(self.p, nac)
+        c = ene[1] - ener[0]
+
+        delta = b**2 - 4*a*c
+
+        # if discriminant less than zero: frustrated hop,
+        # no adjustment that conserves energy
+        if delta < 0:
+            return False
+
+        # since solving quadratic equation, two roots generated,
+        # choose the smaller root
+        else:
+            gamma = (-b + np.sign(b)*np.sqrt(delta))/(2*a)
+
+        delta_p    = gamma * nac / self.m
+        self.p    += delta_p
+        self.state = new_state
+
+        return True
 

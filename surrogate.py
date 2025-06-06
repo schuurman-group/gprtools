@@ -113,7 +113,7 @@ class Adiabat(Surrogate):
             pickle.dump(self.model, fid)    
 
     #
-    def evaluate(self, gms, std=False, cov=False):
+    def evaluate(self, gms, states=None, std=False, cov=False):
         """
         evaluate teh surrogate at gms
         """

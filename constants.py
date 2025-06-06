@@ -1,4 +1,5 @@
 """Module for storing numeric constants"""
+import math
 
 # ENERGY CONVERSIONS
 # convert au to electron volts
@@ -20,3 +21,7 @@ au2debye  = 2.541580
 #MISC CONSTANTS
 fine_str = 1. / 137.0359895
 c_spd    = 1. / fine_str
+
+#TRIG CONSTANTS
+rad2deg  = 180./math.pi
+deg2rad  = math.pi/180.
