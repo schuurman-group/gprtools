@@ -5,6 +5,7 @@ import numpy as np
 from abc import ABC, abstractmethod
 from ase import Atoms
 from dscribe.descriptors import SOAP
+import constants
 
 class Descriptor(ABC):
 
@@ -48,8 +49,8 @@ class Soap(Descriptor):
         natm        = len(self.atoms)
 
         for i in range(gms.shape[0]):
-            molecule   = Atoms(symbols=self.atoms, 
-                               positions=np.reshape(gms[i,:],(natm,3)))
+            gm        = np.reshape(gms[i,:]*constants.bohr2ang,(natm,3))
+            molecule  = Atoms(symbols=self.atoms, positions=gm)
             descriptor = self.generator.create(molecule) 
             descriptors.append(descriptor/np.linalg.norm(descriptor))
 

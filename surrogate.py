@@ -5,8 +5,8 @@ import os as os
 from abc import ABC, abstractmethod
 import numpy as np
 import pickle as pickle
-from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
+import gpr as gpr
 
 class Surrogate(ABC):
 
@@ -63,9 +63,10 @@ class Adiabat(Surrogate):
             os.abort()
 
         self.descriptor = descriptor
-        self.model      = GaussianProcessRegressor(kernel = self.kernel,
-                                     n_restarts_optimizer = nrestart,
-                                               normalize_y = True)
+        self.model      = gpr.GPRegressor(
+                               kernel               = self.kernel,
+                               n_restarts_optimizer = nrestart,
+                               normalize_y          = True)
 
     #
     def create(self, data):

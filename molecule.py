@@ -133,6 +133,7 @@ class Trajectory():
         self.dm[self.state, self.state] = 1.
         t0 = self.time
         y0 = np.concatenate((self.x, self.p, self.dm.ravel()))
+        max_step     = 5
         current_y    = y0
         tseries      = []
         yseries      = []
@@ -141,7 +142,7 @@ class Trajectory():
 
         # propagate outer loop until final itme reached,
         # or we need to update our surface
-        while self.time < t0+dt and not update_surf:
+        while abs(self.time - (t0+dt)) > max_step and not update_surf:
 
             propagator = RK45(
                     fun      = self.step_function, 
@@ -150,19 +151,23 @@ class Trajectory():
                     t_bound  = t0 + dt, 
                     rtol     = rtol,
                     atol     = atol,
-                    max_step = 0.1)
+                    max_step = max_step)
 
             while propagator.status == 'running':
                 self.time = propagator.t
                 ycurrent  = propagator.y
 
                 if chk_func is not None:
-                    chk_vals.append(chk_func(y[:self.nc],
-                                             y[self.nc:2*self.nc],
-                                             self.state))
+                    chk_vals.append(chk_func(ycurrent[:self.nc].real,
+                                    ycurrent[self.nc:2*self.nc].real,
+                                            self.state))
+                    print('chk_val='+str(chk_vals[-1]))
                     if chk_vals[-1] > chk_thresh:
                         update_surf = True
                         break
+
+                #print('self.time='+str(self.time))
+                #print('ycurrent='+str(ycurrent))
 
                 # save current time, position, and momentum
                 if len(tseries) > 0:
@@ -192,7 +197,9 @@ class Trajectory():
                 print('propagation failed.')
                 return None
 
-        return [t, y, chk_vals] 
+        return [np.array(tseries, dtype=float), 
+                np.array(yseries[:2*self.nc], dtype=float), 
+                np.array(chk_vals, dtype=float)] 
 
     #
     def update_surface(self, new_surface):
