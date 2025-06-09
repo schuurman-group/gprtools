@@ -120,6 +120,19 @@ class Trajectory():
             self.surface = surface
 
     #
+    def energy(self):
+        """
+        return the classical energy of the trajectory
+        """
+
+        gm = np.array([self.x], dtype=float)
+        kecoef = 0.5 / self.m
+
+        pot = self.surface.evaluate(gm, states = [self.state])[0,0]
+        kin = np.sum(self.p * self.p * kecoef)
+        return pot + kin
+
+    #
     def propagate(self, dt, tols=None, chk_func=None, chk_thresh=None):
         """
         propagate a trajectory from current time t to t+dt using
@@ -166,7 +179,7 @@ class Trajectory():
                         update_surf = True
                         break
 
-                #print('self.time='+str(self.time))
+                print('self.time, energy='+str(self.time)+','+str(self.energy()))
                 #print('ycurrent='+str(ycurrent))
 
                 # save current time, position, and momentum
@@ -197,8 +210,15 @@ class Trajectory():
                 print('propagation failed.')
                 return None
 
+        # just return position and momentum
+        yvec = np.array(yseries, dtype=float)
+        if len(yvec.shape) == 2:
+            xpvec = yvec[:, :2*self.nc]
+        else:
+            xpvec = None
+
         return [np.array(tseries, dtype=float), 
-                np.array(yseries[:2*self.nc], dtype=float), 
+                xpvec, 
                 np.array(chk_vals, dtype=float)] 
 
     #

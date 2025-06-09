@@ -120,12 +120,19 @@ class Adiabat(Surrogate):
         """
         
         d_data    = self.descriptor.generate(gms)
-        eval_data = self.model.predict( d_data, 
+        eval_data =  self.model.predict( d_data, 
                                         return_std = std, 
                                         return_cov = cov)
 
-        return eval_data
-
+        ngm = gms.shape[0]
+        if isinstance(eval_data, tuple):
+            # reshape the output so that the energy array has dimensions
+            # (ngm, nst), even if nst=1 for Adiabats
+            eners = np.reshape(eval_data[0], (ngm,1))
+            return eners, eval_data[1:]
+        else:
+            eners = np.reshape(eval_data, (ngm,1))
+            return eners
 
     #
     def gradient(self, gms, states = None):
@@ -156,8 +163,8 @@ class Adiabat(Surrogate):
             m2_ener = self.evaluate(disps)
 
             grad = (-p2_ener + 8*p_ener - 8*m_ener + m2_ener ) / (12.*delta)
-            
-            grads[i, 0, :] = grad
+           
+            grads[i, :, :] = grad.T
 
         return grads
             
