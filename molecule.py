@@ -141,23 +141,13 @@ class Trajectory():
 
     # define a class to hold propagation solution
     class propSol():
-        def __init__(self, tlst, ylst, chklst, update, fail):
-            e1  = np.array([], dtype=float)
-            e1i = np.array([], dtype=float)
-            e2  = np.array([[]], dtype=float)
-            if len(tlst) == 0:
-                self.t   = e1
-                self.x   = e2
-                self.p   = e2
-                self.s   = e1i
-                self.chk = e1
-            else:
-                self.t   = np.array(tlst, dtype=float)
-                yarr     = np.array(ylst, dtype=complex)
-                self.x   = yarr[:, :self.nc].real
-                self.p   = yarr[:, self.nc:2*self.nc]
-                self.s   = yarr[:, 2*self.nc+1].real
-                self.chk = np.array(chklst, dtype=float)
+        def __init__(self, nx, tlst, ylst, slst, chklst, update, fail):
+            self.t   = np.array(tlst, dtype=float)
+            yarr     = np.array(ylst, dtype=complex)
+            self.x   = yarr[:, :nx].real
+            self.p   = yarr[:, nx:2*nx].real
+            self.s   = np.array(slst, dtype=int)
+            self.chk = np.array(chklst, dtype=float)
 
             self.update = update
             self.failed = fail
@@ -188,24 +178,23 @@ class Trajectory():
             [rtol, atol] = [1.e-3,1e-6]
 
         nc          = self.nc 
-        dm          = np.array((self.ns, self.ns), dtype=complex)
+        dm          = np.ndarray((self.ns, self.ns), dtype=complex)
         dm[s0, s0]  = 1.
-        snow        = s0
+        self.state  = s0
         tnow        = t0
-        ynow        = np.concatenate((x0, p0, np.array([s0]), 
-                                          self.dm.ravel()))
+        ynow        = np.concatenate((x0, p0, dm.ravel()))
         max_step    = 30. 
         tall        = []
         yall        = []
         chkall      = []
+        stall       = []
         update_surf = False
         failed      = False
         delta_t     = 0.    # classical time step
 
        # propagate outer loop until final itme reached,
         # or we need to update our surface
-        while tnow < (t0+dt) and not update_surf:
-
+        while tnow < (t0+dt-0.2*max_step) and not update_surf:
             # when we change states, we reinitialize the 
             # propagator
             propagator = RK45(
@@ -221,26 +210,27 @@ class Trajectory():
                 tnow = propagator.t
                 ynow = propagator.y
 
+                tall.append(tnow)
+                yall.append(ynow)
+                stall.append(self.state)
+
                 if chk_func is not None:
                     chkall.append(chk_func(
                                         ynow[:nc].real,
                                         ynow[nc:2*nc].real,
-                                        ynow[2*nc+1].real))
+                                        self.state))
                     if chkall[-1] > chk_thresh:
                         update_surf = True
                         break
 
-                tall.append(tnow)
-                yall.append(ynow)
-
                 # compute hopping probability
-                snew = self.compute_fssh_hop(ynow,  delta_t)
+                snew = self.compute_fssh_hop(ynow, delta_t)
 
-                if ynow[2*nc+1].real != snew:
+                if self.state != snew:
                     delta_p = self.scale_momentum(ynow, snew)
                     if delta_p is not None:
                         ynow[nc:2*nc] += delta_p
-                        ynow[2*nc+1]   = snew
+                        self.state     = snew
                         break
 
                 propagator.step()
@@ -253,7 +243,8 @@ class Trajectory():
                 failed = True
                 break
 
-        return propSol(tall, yall, chkall, update_surf, failed)
+        return self.propSol(self.nc, tall, yall, stall, chkall, 
+                                           update_surf, failed)
 
     #
     def update_surface(self, new_surface):
@@ -267,7 +258,6 @@ class Trajectory():
         """
         function to pass to solve_ivp to propagate trajectory
         """
-
         # vector to put dy / dt
         dely = np.zeros(y.shape[0], dtype=complex)
 
@@ -284,7 +274,7 @@ class Trajectory():
 
         # propagate the dm, ns>1 and y has the correct
         # shape
-        if self.ns > 1 and y.shape[0] == (2*self.nc + self.ns**2):
+        if self.ns > 1:
             all_states = [i for i in range(self.ns)]
             ener = self.surface.evaluate(gm, states=all_states)
 
@@ -300,8 +290,8 @@ class Trajectory():
         """
         x  = y[:self.nc].real
         p  = y[self.nc:2*self.nc].real
-        s  = int(y[2*self.nc+1])
-        dm = np.reshape(y[-(self.nc**2)], (self.ns, self.ns))
+        s  = self.state 
+        dm = np.reshape(y[-(self.ns**2)], (self.ns, self.ns))
 
         # if this is single state, don't bother
         # with hopping algorithm
@@ -340,7 +330,7 @@ class Trajectory():
         # momentum
         x = y[:self.nc].real
         p = y[self.nc:2*self.nc].real
-        s = int(y[2*self.nc+1])
+        s = self.state
 
         gm  = np.array([x])
         pair = [s, snew]
