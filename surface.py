@@ -661,7 +661,7 @@ class ChemPotPy(Surface):
             print('g_units='+str(g_units)+' not recognized.')
             os.abort()
 
-        self.ref_geom = self._chempotpygeom(ref_geom.x * self.gconv)
+        self.ref_geom = self._chempotpygeom(ref_geom.x / self.gconv)
 
         self.have_gradients = True
         self.have_coupling  = True

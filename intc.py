@@ -183,12 +183,14 @@ class Cart2int:
         new.intdef   = self.intdef.copy()
         return new
 
+    #
     def cart2intc(self, geom):
         """convert a cartesian geometry into a set of internal
            coordinates"""
 
         return self.make_intc(geom)
 
+    #
     def cart2intg(self, geom, grad):
         """convert a cartesian gradient into a gradient in terms
            of internal coordinates"""
@@ -201,6 +203,7 @@ class Cart2int:
 
         return bbtinv @ bmat @ grad
 
+    #
     def cart2inth(self, geom, hess):
         """convert a cartesian hessian into a hessian in terms of
            internal coordiantes"""
@@ -213,7 +216,7 @@ class Cart2int:
 
         return ginv @ bhbt @ ginv
 
-
+    #
     def dint2cart(self, geom, dqs):
         """convert displacements in internal coordinates into a
            cartesian geometry"""
@@ -258,6 +261,7 @@ class Cart2int:
 
         return dx_all
 
+    #
     def cart2intp(self, geom, momentum):
         """convert mommentum vector from cartesian coordinate to internal coordinate"""
         bmat = self.make_bmat(geom)
@@ -267,6 +271,7 @@ class Cart2int:
         # print("momentum vector shape: {:}".format(momentum.shape))
 
         return momentum_inc
+
     #
     def make_bmat(self, geom):
         """construct a bmatrix at a particular geometry using internal

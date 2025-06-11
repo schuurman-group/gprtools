@@ -18,6 +18,9 @@ ang2bohr  = 1. / bohr2ang
 #CHARGE CONVERSIONS
 au2debye  = 2.541580
 
+# MASS conversions
+amu2au = 1836.152673
+
 #MISC CONSTANTS
 fine_str = 1. / 137.0359895
 c_spd    = 1. / fine_str
