@@ -30,3 +30,7 @@ deg2rad  = math.pi/180.
 # fs to au
 fs2au = 2.418884e-2
 au2fs = 1. / fs2au
+
+
+# MASS conversionsAdd commentMore actions
+amu2au = 1836.152673
