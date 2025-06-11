@@ -2,22 +2,22 @@
 Trajectory class
 """
 import numpy as np
-from scipy.integrate import RK45
+from scipy.integrate import RK45, solve_ivp
 import constants as constants
 import intc as intc
 
-
 ref_masses = {'Ghost': 0, 'X': 0., 'H':1.008, 'He':4.002602,
-              'Li': 6.94, 'Be':9.0121831, 
-              'B':10.81, 'C':12.011, 'N':14.007, 'O':15.999, 
+              'Li': 6.94, 'Be':9.0121831,
+              'B':10.81, 'C':12.011, 'N':14.007, 'O':15.999,
               'F':18.998403163, 'Ne':20.1797,
               'Na':22.98976928, 'Mg':24.305,
-              'Al':26.9815385, 'Si':28.085, 'P':30.973761998, 'S':32.06, 
+              'Al':26.9815385, 'Si':28.085, 'P':30.973761998, 'S':32.06,
               'Cl':35.45, 'Ar':39.948,
               'K':39.0983, 'Ca':40.078,
-              'Sc':44.955908, 'Ti':47.867, 'V':50.9415, 'Cr':51.9961, 
-              'Mn':54.938044, 'Fe':55.845, 'Co':58.933194, 'Ni':58.6934, 
+              'Sc':44.955908, 'Ti':47.867, 'V':50.9415, 'Cr':51.9961,
+              'Mn':54.938044, 'Fe':55.845, 'Co':58.933194, 'Ni':58.6934,
               'Cu':63.546, 'Zn':65.38}
+u2au = 1822.888486 # u to a.u. mass
 
 def writeXYZ(atms, xcrds, file_name):
     """
@@ -81,7 +81,7 @@ class Geometry():
             gm.extend([float(line[j]) for j in range(1,4)])
 
         self.x      = np.asarray(gm, dtype=float) * constants.ang2bohr
-        self.masses = [ref_masses[self.atms[i].capitalize()] 
+        self.masses = [ref_masses[self.atms[i].capitalize()]
                                     for i in range(self.natm)]
 
     #
@@ -96,17 +96,17 @@ class Geometry():
 #
 class Trajectory():
     """
-    Trajectory class, currently not much 
+    Trajectory class, currently not much
     """
     def __init__(self, gm, pi, ns, state, surface=None):
 
-        amass       = [[gm.masses[i]]*3 
+        amass       = [[gm.masses[i]*u2au]*3
                             for i in range(len(gm.masses))]
 
         # self.m is a length 3*N vector of atomic masses
         self.m      = np.array(sum(amass, []), dtype=float)
         self.x      = gm.x
-        self.p      = pi
+        self.p      = pi*self.m
         self.nc     = self.x.shape[0]
         self.ns     = ns
         self.state  = state
@@ -133,6 +133,55 @@ class Trajectory():
         return pot + kin
 
     #
+    def _propagate(self, t_final, tols=None, chk_func=None, chk_thresh=None, debug=False):
+        """
+        implement the propagator using the event function
+        """
+
+        if tols is not None:
+            [rtol, atol] = tols
+        else:
+            [rtol, atol] = [1e-3,1e-6]
+
+        initial_y_tensor = np.concatenate((self.x, self.p, self.dm.ravel()))
+
+        if chk_func is not None:
+            def event_function(t, y):
+                x  = y[:self.nc].real
+                p  = y[self.nc:2*self.nc].real * self.m
+                checkval = chk_func(x, p, self.state)
+                return checkval - chk_thresh
+
+            event_function.terminal = True
+            event_function.direction = 1
+            event = (event_function,)
+        else:
+            event = ()
+
+
+        sol = solve_ivp(
+        fun=self.step_function, # the function we are integrating
+        method = 'RK45', # the integration method we are using
+        first_step = 1e-2, # intial first step
+        y0 = initial_y_tensor, # initial state
+        rtol = rtol, # relative tolerance
+        atol = atol, # absolute tolerance
+        t_span = (self.time,
+                  t_final * constants.fs2au, # boundary time, integration end point
+        ),
+        events = event,
+        dense_output=False,
+        )
+
+        # check energy at each accepted time step
+        if debug:
+            for idx, time in enumerate(sol.t):
+                self.p = sol.y[:,idx][self.nc:2*self.nc].real * self.m
+                self.x = sol.y[:,idx][:self.nc].real
+                print(f'at time step: {time} a.u, total energy: {self.energy()} a.u., angle: {chk_func(self.x, self.p, self.state)}')
+                
+        return sol
+
     def propagate(self, dt, tols=None, chk_func=None, chk_thresh=None):
         """
         propagate a trajectory from current time t to t+dt using
@@ -158,10 +207,10 @@ class Trajectory():
         while abs(self.time - (t0+dt)) > max_step and not update_surf:
 
             propagator = RK45(
-                    fun      = self.step_function, 
+                    fun      = self.step_function,
                     t0       = t0,
                     y0       = y0,
-                    t_bound  = t0 + dt, 
+                    t_bound  = t0 + dt,
                     rtol     = rtol,
                     atol     = atol,
                     max_step = max_step)
@@ -192,8 +241,8 @@ class Trajectory():
 
                 # update the trajectory
                 self.x  = ycurrent[:self.nc].real
-                self.p  = ycurrent[self.nc:2*self.nc].real
-                self.dm = np.reshape(ycurrent[2*self.nc:], 
+                self.p  = ycurrent[self.nc:2*self.nc].real * self.m
+                self.dm = np.reshape(ycurrent[2*self.nc:],
                                          (self.ns, self.ns))
                 new_state = self.compute_fssh_hop(delta_t)
 
@@ -217,9 +266,9 @@ class Trajectory():
         else:
             xpvec = None
 
-        return [np.array(tseries, dtype=float), 
-                xpvec, 
-                np.array(chk_vals, dtype=float)] 
+        return [np.array(tseries, dtype=float),
+                xpvec,
+                np.array(chk_vals, dtype=float)]
 
     #
     def update_surface(self, new_surface):
@@ -242,14 +291,14 @@ class Trajectory():
 
         # evaluate the gradient of the potential at y.x,
         # -grad = F = ma
-        ener = self.surface.evaluate(gm, 
+        ener = self.surface.evaluate(gm,
                                      states=[i for i in range(self.ns)])
         grad = self.surface.gradient(gm, states=[self.state])
         acc = -grad[0,0,:] / self.m
         vel = self.p / self.m
- 
+
         # dx/dt = v = mv/m
-        dely[:self.nc] = vel 
+        dely[:self.nc] = vel
         # dp/dt = -F/m = a
         dely[self.nc:2*self.nc] = acc
 
@@ -260,14 +309,14 @@ class Trajectory():
             dely[2*self.nc:] = ddmdt.ravel()
 
         return dely
-    
+
     #
     def propagate_dm(self, gm, ener, vel):
         """
         propagate the state density matrix
         """
         dMdt = np.zeros((self.ns, self.ns), dtype=complex)
-        dR    = -1j*np.diag(ener) - self.tdcm(gm, vel) 
+        dR    = -1j*np.diag(ener) - self.tdcm(gm, vel)
         dDMdt = dR@DM - DM@dR
 
         return dDMdt
@@ -303,10 +352,10 @@ class Trajectory():
         vel    = self.p / self.m
         b      = (-2*np.conjugate(self.dm)*self.tdcm(vel)).real
         pop    = np.diag(self.dm)
-        t_prob = np.array([max(0., dt*b[j, self.state]/pop[self.state]) 
-                            for j in range(nstate)]) 
+        t_prob = np.array([max(0., dt*b[j, self.state]/pop[self.state])
+                            for j in range(nstate)])
         t_prob[self.state] = 0.
- 
+
         # check whether or not to hop
         r    = np.random.uniform()
         st   = 0.
@@ -326,7 +375,7 @@ class Trajectory():
         of the trajectory on the new state. If successful, return
         'True', else, 'False'
         """
-        
+
         # get coupling direction along which to scale
         # momentum
         gm  = np.array([self.x])
@@ -357,4 +406,3 @@ class Trajectory():
         self.state = new_state
 
         return True
-

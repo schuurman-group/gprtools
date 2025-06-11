@@ -10,7 +10,7 @@ class Sample(ABC):
 
     def __init__(self):
         super().__init__()
-    
+
     @abstractmethod
     def sample(self):
         pass
@@ -49,21 +49,26 @@ class LHS(Sample):
         """
         evaluate the energy at passed geometry, gm
         """
+        # create LHS sampler object
+        num_mode = self.dim
+        sampler = qmc.LatinHypercube(d=num_mode)
+
 
         # generate sampled points on [0, 1)
-        pts = self.lhs.random(n = nsample)
+        pts = sampler.random(n = nsample)
 
         # rescale points to the approproate bounds
-        rnge = np.array([(self.bounds[i,1] - self.bounds[i,0])
-                          for i in range(self.dim)], dtype=float)
-        disps = rnge * (2 * pts  - 1)
- 
-        # if cartesian is True and the displacements are in 
+        # rnge = np.array([(self.bounds[i,0])
+                          # for i in range(self.dim)], dtype=float)
+        rnge = self.bounds[:,0]
+        disps = rnge * pts - self.bounds[ :,1]
+
+        # if cartesian is True and the displacements are in
         # internals, convert to cartesians
         gms = None
         if self.crd == 'intc':
             if cartesian:
-                cdisps = self.ref_gm.c2int.dint2cart(self.ref_gm.x, 
+                cdisps = self.ref_gm.c2int.dint2cart(self.ref_gm.x,
                                                              disps)
                 gms = self.ref_gm.x + cdisps
             else:
@@ -73,5 +78,3 @@ class LHS(Sample):
 
         # return the geometries
         return gms
-
-

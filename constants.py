@@ -25,3 +25,8 @@ c_spd    = 1. / fine_str
 #TRIG CONSTANTS
 rad2deg  = 180./math.pi
 deg2rad  = math.pi/180.
+
+# TIME CONVERSIONS
+# fs to au
+fs2au = 2.418884e-2
+au2fs = 1. / fs2au
