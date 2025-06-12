@@ -20,7 +20,7 @@ class LHS(Sample):
     """
     GRaCI surface evaluator
     """
-    def __init__(self, ref_gm, bounds, seed, crd='cart'):
+    def __init__(self, ref_gm, bounds, seed=None, crd='cart'):
         """
         set the ci object to be evaluated and extract some info
         about the object
@@ -37,11 +37,11 @@ class LHS(Sample):
             os.abort()
 
         self.ref_gm = ref_gm
-        rseed       = np.random.default_rng(seed=seed)
+        # rseed       = np.random.default_rng(seed=seed)
         self.lhs    = qmc.LatinHypercube(d = self.dim,
                                       scramble = True,
-                                      optimization = None,
-                                      seed = rseed)
+                                      optimization = None,)
+                                      # seed = rseed)
         self.bounds = bounds
 
     #
