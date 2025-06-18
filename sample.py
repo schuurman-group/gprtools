@@ -20,7 +20,7 @@ class LHS(Sample):
     """
     GRaCI surface evaluator
     """
-    def __init__(self, ref_gm, bounds, seed, crd='cart'):
+    def __init__(self, ref_gm, seed, crd='cart'):
         """
         set the ci object to be evaluated and extract some info
         about the object
@@ -31,7 +31,7 @@ class LHS(Sample):
         if self.crd == 'cart':
             self.dim = ref_gm.x.shape[0]
         elif self.crd == 'intc':
-            self.dim = ref_gm.q.shape[0]
+            self.dim = ref_gm.qx.shape[0]
         else:
             print('crd='+str(crd)+' not recognized. Exiting...')
             os.abort()
@@ -42,10 +42,26 @@ class LHS(Sample):
                                       scramble = True,
                                       optimization = None,
                                       seed = rseed)
-        self.bounds = bounds
+
+    # 
+    def update_origin(self, ref_gm):
+        """
+        update the ref_gm object
+        """
+        self.ref_gm = ref_gm
 
     #
-    def sample(self, nsample, cartesian=True):
+    def make_bounds(self, disp, scale=[1.,1.]):
+        """
+        return a set of sampling bounds, defined by disp, and scaled
+        in the negative/positive directions by scale[0]/scale[1]
+        """
+        d = [-1., 1.]
+        return np.array([disp*scale[i]*d[i] 
+                               for i in range(2)], dtype=float).T
+
+    #
+    def sample(self, nsample, bounds, cartesian=True):
         """
         evaluate the energy at passed geometry, gm
         """
@@ -54,7 +70,7 @@ class LHS(Sample):
         pts = self.lhs.random(n = nsample)
 
         # rescale points to the approproate bounds
-        rnge = np.array([(self.bounds[i,1] - self.bounds[i,0])
+        rnge = np.array([(bounds[i,1] - bounds[i,0])
                           for i in range(self.dim)], dtype=float)
         disps = rnge * (2 * pts  - 1)
  
@@ -67,7 +83,7 @@ class LHS(Sample):
                                                              disps)
                 gms = self.ref_gm.x + cdisps
             else:
-                gms = self.ref_gm.q + disps
+                gms = self.ref_gm.qx + disps
         elif self.crd == 'cart':
             gms = self.ref_gm.x + disps
 

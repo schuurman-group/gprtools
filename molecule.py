@@ -1,6 +1,7 @@
 """
 Trajectory class
 """
+import copy as copy
 import numpy as np
 from scipy.integrate import RK45
 from scipy.integrate import solve_ivp
@@ -43,7 +44,10 @@ class Geometry():
     """
     store information related to a molecular geometry
     """
-    def __init__(self, xyz_file=None, intc_file=None):
+    def __init__(self, state=None, xyz_file=None, intc_file=None):
+
+        # set the state the geometry lives on
+        self.state = state
 
         # if xyz_file is passed to constructor, parse
         # xyz_file for geometry information
@@ -51,6 +55,7 @@ class Geometry():
             self.from_xyz(xyz_file)
         else:
             self.x      = None
+            self.p      = None
             self.atms   = None
             self.masses = None
             self.natm   = None
@@ -60,10 +65,28 @@ class Geometry():
         if intc_file is not None:
             self.read_intc(intc_file)
         else:
-            self.q      = None
-            self.qlabel = None
-            self.qdef   = None
-            self.c2int  = None
+            self.qx      = None
+            self.qp      = None
+            self.qlabels = None
+            self.qdef    = None
+            self.c2int   = None
+
+    #
+    def copy(self):
+        """
+        return a copy of current object
+        """
+        new = Geometry()
+        var_dict = {key:value for key,value in self.__dict__.items()
+                   if not key.startswith('__') and not callable(key)}
+
+        for key, value in var_dict.items():
+            if hasattr(value, 'copy'):
+                setattr(new, key, value.copy())
+            else:
+                setattr(new, key, copy.deepcopy(value))
+
+        return new
 
     #
     def from_xyz(self, xyz_file):
@@ -76,13 +99,21 @@ class Geometry():
         self.natm = int(xyz[0])
         self.atms = []
         gm        = []
+        mom       = []
 
         for i in range(self.natm):
             line = xyz[i+2].strip().split()
             self.atms.append(line[0])
             gm.extend([float(line[j]) for j in range(1,4)])
+            if len(line) == 7:
+                mom.extend([float(line[j]) for j in range(4,7)])
+            else:
+                mom.extend([0.,0.,0.])
 
-        self.x      = np.asarray(gm, dtype=float) * constants.ang2bohr
+        xconv       = constants.ang2bohr
+        pconv       = constants.ang2bohr / constants.fs2au
+        self.x      = np.array(gm, dtype=float) * xconv
+        self.p      = np.array(mom, dtype=float) * pconv
         self.masses = [ref_masses[
                          self.atms[i].capitalize()] * constants.amu2au 
                                             for i in range(self.natm)]
@@ -93,12 +124,32 @@ class Geometry():
         read an internal coordinate definition file and generate
         internal coordinates
         """
-        self.qdef  = intc.Intdef(intc_file)
-        self.c2int = intc.Cart2int(self.qdef)
-        self.q = self.gen_q(self.x)
+        self.qdef    = intc.Intdef(intc_file)
+        self.c2int   = intc.Cart2int(self.qdef)
+        self.qlabels = self._q_types()
+        self.qx      = self.gen_q(self.x)
+        self.qp      = self.gen_qp(self.x, self.p)
 
     #
-    def q_types(self):
+    def update_gm(self, x):
+        """
+        update the geometry 
+        """
+        self.x = x
+        if self.c2int is not None:
+            self.qx = self.gen_q(self.x)
+
+    #
+    def update_mom(self, p):
+        """
+        update the momentum
+        """
+        self.p = p
+        if self.c2int is not None:
+            self.qp = self.gen_qp(self.x, self.p)
+
+    #
+    def _q_types(self):
         """
         return the internal coordinate type for each coordinate index
         """
@@ -120,6 +171,14 @@ class Geometry():
         """
         return self.c2int.cart2intc(x)
 
+    #
+    def gen_qp(self, x, p):
+        """
+        generate an internal coordinate momentu using the intc
+        definitions
+        """
+        return self.c2int.cart2intp(x, p)
+
 #
 class Trajectory():
     """
@@ -131,8 +190,9 @@ class Trajectory():
                             for i in range(len(gm.masses))]
 
         # self.m is a length 3*N vector of atomic masses
+        self.mol    = gm.copy()
         self.m      = np.array(sum(amass, []), dtype=float)
-        self.ns     = nstate
+        self.ns     = int(nstate)
         self.nc     = gm.x.shape[0]
 
         if surface is not None:
@@ -151,6 +211,12 @@ class Trajectory():
 
             self.update = update
             self.failed = fail
+
+            # return a geometry object initialized to the
+            # current state
+            self.gm  = self.mol().copy()
+            self.gm.update_pos(self.x)
+            self.gm.update_mom(self.p)
 
     #
     def energy(self, x, p, state):

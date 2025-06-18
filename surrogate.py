@@ -77,6 +77,7 @@ class Adiabat(Surrogate):
         self.descriptors = self.descriptor.generate(data[0])
         self.training    = data[1]
         self.model.fit(self.descriptors, self.training)        
+        return np.exp(self.model.kernel_.theta)
 
     #
     def update(self, data):
@@ -95,6 +96,8 @@ class Adiabat(Surrogate):
         self.training[old_size:, :]    = data[1]
 
         self.model.fit(self.descriptors, self.training)
+
+        return np.exp(self.model.kernel_.theta)
 
     #
     def load(self, model_name):

@@ -23,6 +23,17 @@ class Intc:
         self.coefs        = []
         self.atoms        = []
 
+    def copy(self):
+        """
+        return a copy of current object
+        """
+        new = Intc()
+        new.ctypes = self.ctypes.copy()
+        new.coefs = self.coefs.copy()
+        new.atoms = self.atoms.copy()
+
+        return new
+
     def add_prim(self, typ, coef, atms):
         """add a primitive to the coordinate"""
 
@@ -168,11 +179,11 @@ class Intdef:
         return self.intcoords[i].ctypes
 
     def q_coefs(self, i):
-        return self.intcoords[i].coefs
+            return self.intcoords[i].coefs
 
 class Cart2int:
     """Class constructor for cart2int object"""
-    def __init__(self, intc_def):
+    def __init__(self, intc_def=None):
         self.intdef = intc_def
 
     #
