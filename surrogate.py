@@ -69,18 +69,22 @@ class Adiabat(Surrogate):
                                normalize_y          = True)
 
     #
-    def create(self, data):
+    def create(self, data, hparam=None):
         """
         create a surrogate with training data, data
         """
         # generate the descriptors for the data
         self.descriptors = self.descriptor.generate(data[0])
         self.training    = data[1]
+
+        if hparam is not None:
+            self.model.kernel_.theta = hparam
+
         self.model.fit(self.descriptors, self.training)        
-        return np.exp(self.model.kernel_.theta)
+        return self.model.kernel_.theta
 
     #
-    def update(self, data):
+    def update(self, data, hparam=None):
         """
         update the surrogate with additional data
         """
@@ -95,9 +99,12 @@ class Adiabat(Surrogate):
         self.descriptors[old_size:, :] = self.descriptor.generate(data[0])
         self.training[old_size:, :]    = data[1]
 
+        if hparam is not None:
+            self.model.kernel_.theta = hparam
+
         self.model.fit(self.descriptors, self.training)
 
-        return np.exp(self.model.kernel_.theta)
+        return self.model.kernel_.theta
 
     #
     def load(self, model_name):
