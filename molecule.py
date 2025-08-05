@@ -1,6 +1,7 @@
 """
 Trajectory class
 """
+import os
 import copy as copy
 import numpy as np
 from scipy.integrate import RK45
@@ -10,15 +11,15 @@ import intc as intc
 
 
 ref_masses = {'Ghost': 0, 'X': 0., 'H':1.008, 'He':4.002602,
-              'Li': 6.94, 'Be':9.0121831, 
-              'B':10.81, 'C':12.011, 'N':14.007, 'O':15.999, 
+              'Li': 6.94, 'Be':9.0121831,
+              'B':10.81, 'C':12.011, 'N':14.007, 'O':15.999,
               'F':18.998403163, 'Ne':20.1797,
               'Na':22.98976928, 'Mg':24.305,
-              'Al':26.9815385, 'Si':28.085, 'P':30.973761998, 'S':32.06, 
+              'Al':26.9815385, 'Si':28.085, 'P':30.973761998, 'S':32.06,
               'Cl':35.45, 'Ar':39.948,
               'K':39.0983, 'Ca':40.078,
-              'Sc':44.955908, 'Ti':47.867, 'V':50.9415, 'Cr':51.9961, 
-              'Mn':54.938044, 'Fe':55.845, 'Co':58.933194, 'Ni':58.6934, 
+              'Sc':44.955908, 'Ti':47.867, 'V':50.9415, 'Cr':51.9961,
+              'Mn':54.938044, 'Fe':55.845, 'Co':58.933194, 'Ni':58.6934,
               'Cu':63.546, 'Zn':65.38}
 
 def writeXYZ(atms, xcrds, file_name):
@@ -115,7 +116,7 @@ class Geometry():
         self.x      = np.array(gm, dtype=float) * xconv
         self.p      = np.array(mom, dtype=float) * pconv
         self.masses = [ref_masses[
-                         self.atms[i].capitalize()] * constants.amu2au 
+                         self.atms[i].capitalize()] * constants.amu2au
                                             for i in range(self.natm)]
 
     #
@@ -133,7 +134,7 @@ class Geometry():
     #
     def update_gm(self, x):
         """
-        update the geometry 
+        update the geometry
         """
         self.x = x
         if self.c2int is not None:
@@ -182,11 +183,11 @@ class Geometry():
 #
 class Trajectory():
     """
-    Trajectory class, currently not much 
+    Trajectory class, currently not much
     """
-    def __init__(self, gm, nstate, surface=None):
+    def __init__(self, gm, nstate, surrogate=None, surface=None):
 
-        amass       = [[gm.masses[i]]*3 
+        amass       = [[gm.masses[i]]*3
                             for i in range(len(gm.masses))]
 
         # self.m is a length 3*N vector of atomic masses
@@ -196,12 +197,15 @@ class Trajectory():
         self.nc     = gm.x.shape[0]
 
         if surface is not None:
-            self.surface = surface
+            self.surface= surface
+
+        if surrogate is not None:
+            self.surrogate = surrogate
 
 
     # define a class to hold propagation solution
     class propSol():
-        def __init__(self, nx, tlst, ylst, slst, chklst, update, fail):
+        def __init__(self, gm, nx, tlst, ylst, slst, chklst, update, fail):
             self.t   = np.array(tlst, dtype=float)
             yarr     = np.array(ylst, dtype=complex)
             self.x   = yarr[:, :nx].real
@@ -214,9 +218,9 @@ class Trajectory():
 
             # return a geometry object initialized to the
             # current state
-            self.gm  = self.mol().copy()
-            self.gm.update_pos(self.x)
-            self.gm.update_mom(self.p)
+            self.gm  = gm
+            self.gm.update_gm(self.x[-1,:])
+            self.gm.update_mom(self.p[-1,:])
 
     #
     def energy(self, x, p, state):
@@ -227,12 +231,12 @@ class Trajectory():
         gm = np.array([x], dtype=float)
         kecoef = 0.5 / self.m
 
-        pot = self.surface.evaluate(gm, states = [state])[0,0]
+        pot = self.surrogate.evaluate(gm, states = [state])[0,0]
         kin = np.sum(p * p * kecoef)
         return pot + kin
 
     #
-    def propagate(self, x0, p0, s0, t0, dt,  
+    def propagate(self, x0, p0, s0, t0, dt,
                           tols=None, chk_func=None, chk_thresh=None):
         """
         propagate a trajectory from current time t to t+dt using
@@ -243,13 +247,13 @@ class Trajectory():
         else:
             [rtol, atol] = [1.e-3,1e-6]
 
-        nc          = self.nc 
+        nc          = self.nc
         dm          = np.ndarray((self.ns, self.ns), dtype=complex)
         dm[s0, s0]  = 1.
         self.state  = s0
         tnow        = t0
         ynow        = np.concatenate((x0, p0, dm.ravel()))
-        max_step    = 30. 
+        max_step    = 30.
         tall        = []
         yall        = []
         chkall      = []
@@ -261,7 +265,7 @@ class Trajectory():
        # propagate outer loop until final itme reached,
         # or we need to update our surface
         while tnow < (t0+dt-0.2*max_step) and not update_surf:
-            # when we change states, we reinitialize the 
+            # when we change states, we reinitialize the
             # propagator
             propagator = RK45(
                     fun      = self.step_function,
@@ -284,6 +288,8 @@ class Trajectory():
                     chkall.append(chk_func(
                                         ynow[:nc].real,
                                         ynow[nc:2*nc].real,
+                                        self.surface,
+                                        self.surrogate,
                                         self.state))
                     if chkall[-1] > chk_thresh:
                         update_surf = True
@@ -309,7 +315,7 @@ class Trajectory():
                 failed = True
                 break
 
-        return self.propSol(self.nc, tall, yall, stall, chkall, 
+        return self.propSol(self.mol, self.nc, tall, yall, stall, chkall,
                                            update_surf, failed)
 
     #
@@ -317,7 +323,7 @@ class Trajectory():
         """
         replace surrogate potential with new_surrogate
         """
-        self.surface = new_surface
+        self.surrogate = new_surface
 
     #
     def step_function(self, t, y):
@@ -330,11 +336,11 @@ class Trajectory():
         # evaluate the gradient of the potential at y.x,
         # -grad = F = ma
         gm   = np.array([y[:self.nc].real])
-        grad = self.surface.gradient(gm, states=[self.state])
+        grad = self.surrogate.gradient(gm, states=[self.state])
         vel  = y[self.nc:2*self.nc] / self.m
- 
+
         # dx/dt = v = p/m
-        dely[:self.nc]          = vel 
+        dely[:self.nc]          = vel
         # dp/dt = ma = F = -grad
         dely[self.nc:2*self.nc] = -grad[0,0,:]
 
@@ -342,7 +348,7 @@ class Trajectory():
         # shape
         if self.ns > 1:
             all_states = [i for i in range(self.ns)]
-            ener = self.surface.evaluate(gm, states=all_states)
+            ener = self.surrogate.evaluate(gm, states=all_states)
 
             ddmdt = self.propagate_dm(gm, ener, vel)
             dely[2*self.nc:] = ddmdt.ravel()
@@ -356,7 +362,7 @@ class Trajectory():
         """
         x  = y[:self.nc].real
         p  = y[self.nc:2*self.nc].real
-        s  = self.state 
+        s  = self.state
         dm = np.reshape(y[-(self.ns**2)], (self.ns, self.ns))
 
         # if this is single state, don't bother
@@ -400,8 +406,8 @@ class Trajectory():
 
         gm  = np.array([x])
         pair = [s, snew]
-        nac  = self.surface.coupling(gm, [pair])[0]
-        ener = self.surface.evaluate(gm, states=pair)[0]
+        nac  = self.surrogate.coupling(gm, [pair])[0]
+        ener = self.surrogate.evaluate(gm, states=pair)[0]
 
         # now we solve for the momentum adjustment that conserves
         # the total energy
@@ -414,7 +420,7 @@ class Trajectory():
         # if discriminant less than zero: frustrated hop,
         # no adjustment that conserves energy
         if delta < 0:
-            return None 
+            return None
 
         # since solving quadratic equation, two roots generated,
         # choose the smaller root
@@ -423,7 +429,7 @@ class Trajectory():
 
         delta_p    = gamma * nac / self.m
 
-        return delta_p 
+        return delta_p
 
     #
     def propagate_dm(self, gm, ener, vel):
@@ -431,7 +437,7 @@ class Trajectory():
         propagate the state density matrix
         """
         dMdt = np.zeros((self.ns, self.ns), dtype=complex)
-        dR    = -1j*np.diag(ener) - self.tdcm(gm, vel) 
+        dR    = -1j*np.diag(ener) - self.tdcm(gm, vel)
         dDMdt = dR@DM - DM@dR
 
         return dDMdt
@@ -443,7 +449,7 @@ class Trajectory():
         """
         tdcm = np.zeros((self.ns, self.ns), dtype=float)
         pairs = [[i,j] for i in range(self.ns) for j in range(i)]
-        nac   = self.surface.coupling(gm, pairs)
+        nac   = self.surrogate.coupling(gm, pairs)
 
         # compute the time-derivative coupling
         for ind in range(len(pairs)):
@@ -452,4 +458,3 @@ class Trajectory():
             tdcm[j,i] = -tdcm[i,j]
 
         return tdcm
-

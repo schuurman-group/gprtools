@@ -232,7 +232,7 @@ class Cart2int:
         """convert displacements in internal coordinates into a
            cartesian geometry"""
 
-        maxs   = 1. 
+        maxs   = 1.
         maxit  = 40
         maxdq  = 1.e-8
 
