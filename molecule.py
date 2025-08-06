@@ -185,7 +185,7 @@ class Trajectory():
     """
     Trajectory class, currently not much
     """
-    def __init__(self, gm, nstate, surrogate=None, surface=None):
+    def __init__(self, gm, nstate, surface=None):
 
         amass       = [[gm.masses[i]]*3
                             for i in range(len(gm.masses))]
@@ -198,9 +198,6 @@ class Trajectory():
 
         if surface is not None:
             self.surface= surface
-
-        if surrogate is not None:
-            self.surrogate = surrogate
 
 
     # define a class to hold propagation solution
@@ -231,7 +228,7 @@ class Trajectory():
         gm = np.array([x], dtype=float)
         kecoef = 0.5 / self.m
 
-        pot = self.surrogate.evaluate(gm, states = [state])[0,0]
+        pot = self.surface.evaluate(gm, states = [state])[0,0]
         kin = np.sum(p * p * kecoef)
         return pot + kin
 
@@ -289,7 +286,7 @@ class Trajectory():
                                         ynow[:nc].real,
                                         ynow[nc:2*nc].real,
                                         self.surface,
-                                        self.surrogate,
+                                        self.mol,
                                         self.state))
                     if chkall[-1] > chk_thresh:
                         update_surf = True
@@ -323,7 +320,7 @@ class Trajectory():
         """
         replace surrogate potential with new_surrogate
         """
-        self.surrogate = new_surface
+        self.surface = new_surface
 
     #
     def step_function(self, t, y):
@@ -336,7 +333,7 @@ class Trajectory():
         # evaluate the gradient of the potential at y.x,
         # -grad = F = ma
         gm   = np.array([y[:self.nc].real])
-        grad = self.surrogate.gradient(gm, states=[self.state])
+        grad = self.surface.gradient(gm, states=[self.state])
         vel  = y[self.nc:2*self.nc] / self.m
 
         # dx/dt = v = p/m
@@ -348,7 +345,7 @@ class Trajectory():
         # shape
         if self.ns > 1:
             all_states = [i for i in range(self.ns)]
-            ener = self.surrogate.evaluate(gm, states=all_states)
+            ener = self.surface.evaluate(gm, states=all_states)
 
             ddmdt = self.propagate_dm(gm, ener, vel)
             dely[2*self.nc:] = ddmdt.ravel()
@@ -406,8 +403,8 @@ class Trajectory():
 
         gm  = np.array([x])
         pair = [s, snew]
-        nac  = self.surrogate.coupling(gm, [pair])[0]
-        ener = self.surrogate.evaluate(gm, states=pair)[0]
+        nac  = self.surface.coupling(gm, [pair])[0]
+        ener = self.surface.evaluate(gm, states=pair)[0]
 
         # now we solve for the momentum adjustment that conserves
         # the total energy
@@ -449,7 +446,7 @@ class Trajectory():
         """
         tdcm = np.zeros((self.ns, self.ns), dtype=float)
         pairs = [[i,j] for i in range(self.ns) for j in range(i)]
-        nac   = self.surrogate.coupling(gm, pairs)
+        nac   = self.surface.coupling(gm, pairs)
 
         # compute the time-derivative coupling
         for ind in range(len(pairs)):
