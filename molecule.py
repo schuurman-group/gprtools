@@ -203,10 +203,8 @@ class Trajectory():
     # define a class to hold propagation solution
     class propSol():
         def __init__(self, gm, nx, tlst, ylst, slst, chklst, update, fail):
+
             self.t   = np.array(tlst, dtype=float)
-            yarr     = np.array(ylst, dtype=complex)
-            self.x   = yarr[:, :nx].real
-            self.p   = yarr[:, nx:2*nx].real
             self.s   = np.array(slst, dtype=int)
             self.chk = np.array(chklst, dtype=float)
 
@@ -216,6 +214,15 @@ class Trajectory():
             # return a geometry object initialized to the
             # current state
             self.gm  = gm
+
+            if len(tlst) == 0:
+                self.x = np.array([gm.x], dtype=complex).real
+                self.p = np.array([gm.p], dtype=complex).real
+            else:
+                yarr   = np.array(ylst, dtype=complex)
+                self.x = yarr[:, :nx].real
+                self.p = yarr[:, nx:2*nx].real
+
             self.gm.update_gm(self.x[-1,:])
             self.gm.update_mom(self.p[-1,:])
 
