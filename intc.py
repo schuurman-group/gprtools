@@ -240,6 +240,7 @@ class Cart2int:
         q        = self.cart2intc(geom)
         ndq      = dqs.shape[0]
         dx_all   = np.zeros((ndq, geom.shape[0]), dtype=float)
+        fail     = []
 
         for i in range(ndq):
             dqi     = dqs[i,:].copy()
@@ -269,8 +270,9 @@ class Cart2int:
             if nrmerr > maxdq:
                 print('internal to cartesian displacements did not '+
                       ' converge for dq='+str(dqs[i]))
+                fail.append(i) 
 
-        return dx_all
+        return dx_all, fail
 
     #
     def cart2intp(self, geom, momentum):

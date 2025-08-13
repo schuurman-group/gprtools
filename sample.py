@@ -72,16 +72,20 @@ class LHS(Sample):
         # rescale points to the approproate bounds
         rnge = np.array([(bounds[i,1] - bounds[i,0])
                           for i in range(self.dim)], dtype=float)
-        disps = rnge * (2 * pts  - 1)
- 
+        # disps is the displacements in internal coordinates 
+        # shape = [npts, ncoords]
+        disps = bounds[:,0] + pts * rnge
+
         # if cartesian is True and the displacements are in 
         # internals, convert to cartesians
         gms = None
+        nd  = disps.shape[0]
         if self.crd == 'intc':
             if cartesian:
-                cdisps = self.ref_gm.c2int.dint2cart(self.ref_gm.x, 
-                                                             disps)
-                gms = self.ref_gm.x + cdisps
+                cdisps, fail = self.ref_gm.c2int.dint2cart(self.ref_gm.x, 
+                                                                  disps)
+                gms = self.ref_gm.x + cdisps[list(set([i for i in 
+                                               range(nd)]) - set(fail))]
             else:
                 gms = self.ref_gm.qx + disps
         elif self.crd == 'cart':

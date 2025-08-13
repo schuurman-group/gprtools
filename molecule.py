@@ -4,6 +4,7 @@ Trajectory class
 import os
 import copy as copy
 import numpy as np
+from itertools import chain
 from scipy.integrate import RK45
 from scipy.integrate import solve_ivp
 import constants as constants
@@ -57,9 +58,11 @@ class Geometry():
         else:
             self.x      = None
             self.p      = None
+            self.v      = None
             self.atms   = None
             self.masses = None
             self.natm   = None
+            self._mvec  = None
 
         # internal coordinate file is specified, parse
         # intc file for internal coordinate definition
@@ -68,6 +71,7 @@ class Geometry():
         else:
             self.qx      = None
             self.qp      = None
+            self.qv      = None
             self.qlabels = None
             self.qdef    = None
             self.c2int   = None
@@ -115,9 +119,16 @@ class Geometry():
         pconv       = constants.ang2bohr / constants.fs2au
         self.x      = np.array(gm, dtype=float) * xconv
         self.p      = np.array(mom, dtype=float) * pconv
+
+        # mass vector, length N
         self.masses = [ref_masses[
                          self.atms[i].capitalize()] * constants.amu2au
                                             for i in range(self.natm)]
+        # mass vector, length 3N
+        mtmp        = [[self.masses[i]]*3 
+                        for i in range(len(self.masses))]
+        self._mvec  = list(chain.from_iterable(mtmp))
+        self.v      = self.p / self._mvec
 
     #
     def read_intc(self, intc_file):
@@ -130,6 +141,7 @@ class Geometry():
         self.qlabels = self._q_types()
         self.qx      = self.gen_q(self.x)
         self.qp      = self.gen_qp(self.x, self.p)
+        self.qv      = self.gen_q(self.p / self._mvec)
 
     #
     def update_gm(self, x):
@@ -146,8 +158,10 @@ class Geometry():
         update the momentum
         """
         self.p = p
+        self.v = p / self._mvec
         if self.c2int is not None:
             self.qp = self.gen_qp(self.x, self.p)
+            self.qv = self.gen_q(self.p / self._mvec)
 
     #
     def _q_types(self):
@@ -179,6 +193,7 @@ class Geometry():
         definitions
         """
         return self.c2int.cart2intp(x, p)
+
 
 #
 class Trajectory():
@@ -262,13 +277,13 @@ class Trajectory():
         yall        = []
         chkall      = []
         stall       = []
-        update_surf = False
+        update      = False
         failed      = False
         delta_t     = 0.    # classical time step
 
        # propagate outer loop until final itme reached,
         # or we need to update our surface
-        while tnow < (t0+dt-0.2*max_step) and not update_surf:
+        while tnow < (t0+dt-0.2*max_step) and not (update or failed):
             # when we change states, we reinitialize the
             # propagator
             propagator = RK45(
@@ -292,11 +307,10 @@ class Trajectory():
                     chkall.append(chk_func(
                                         ynow[:nc].real,
                                         ynow[nc:2*nc].real,
-                                        self.surface,
-                                        self.mol,
                                         self.state))
+                    #print('chkall='+str(chkall),flush=True)
                     if chkall[-1] > chk_thresh:
-                        update_surf = True
+                        update = True
                         break
 
                 # compute hopping probability
@@ -320,7 +334,7 @@ class Trajectory():
                 break
 
         return self.propSol(self.mol, self.nc, tall, yall, stall, chkall,
-                                           update_surf, failed)
+                                           update, failed)
 
     #
     def update_surface(self, new_surface):

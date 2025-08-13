@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 import numpy as np
 import pickle as pickle
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
+from sklearn import preprocessing
 import gpr as gpr
 
 class Surrogate(ABC):
@@ -80,7 +81,9 @@ class Adiabat(Surrogate):
         if hparam is not None:
             self.model.kernel_.theta = hparam
 
-        self.model.fit(self.descriptors, self.training)        
+        scaler = preprocessing.StandardScaler().fit(self.descriptors)
+        self.model.fit(scaler.transform(self.descriptors), 
+                       self.training)        
         return self.model.kernel_.theta
 
     #
@@ -88,11 +91,18 @@ class Adiabat(Surrogate):
         """
         update the surrogate with additional data
         """
-        new_size = data[0].shape[1]
         old_size = self.descriptors.shape[0]
+        new_size = data[0].shape[0]
         d_size   = self.descriptors.shape[1]
         t_size   = self.training.shape[1]
 
+        #print('old_size='+str(old_size))
+        #print('new_size='+str(new_size))
+        #print('d_size='+str(d_size))
+        #print('t_size='+str(t_size))
+
+        #print('data[0].shape='+str(data[0].shape))
+        #print('data[1].shape='+str(data[1].shape))
         self.descriptors.resize((old_size + new_size, d_size))
         self.training.resize((old_size + new_size, t_size))
 
@@ -100,9 +110,12 @@ class Adiabat(Surrogate):
         self.training[old_size:, :]    = data[1]
 
         if hparam is not None:
+            #print('hparam before, guess='+str(self.model.kernel_.theta)+','+str(hparam))
             self.model.kernel_.theta = hparam
 
-        self.model.fit(self.descriptors, self.training)
+        scaler = preprocessing.StandardScaler().fit(self.descriptors)
+        self.model.fit(scaler.transform(self.descriptors), 
+                       self.training)
 
         return self.model.kernel_.theta
 
@@ -150,7 +163,7 @@ class Adiabat(Surrogate):
         evaluate the gradient of the surrogate at gms
         """
 
-        delta = 0.0001
+        delta = 0.001
         ng    = gms.shape[0]
         nc    = gms.shape[1]
         grads = np.zeros((ng, 1, nc), dtype=float)
