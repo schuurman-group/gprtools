@@ -39,7 +39,7 @@ class Surrogate(ABC):
         pass
 
     @abstractmethod
-    def analytical_gradient(self):
+    def numerical_gradient(self):
         pass
 
     @abstractmethod
@@ -161,7 +161,7 @@ class Adiabat(Surrogate):
             eners = np.reshape(eval_data, (ngm,1))
             return eners
 
-    def analytical_gradient(self, gms, states=None):
+    def gradient(self, gms, states=None):
         """
         evaluate the gradient using analytical expression
         """
@@ -176,17 +176,17 @@ class Adiabat(Surrogate):
 
         # print(ng)
         # print(nc)
-        ana_grad = np.zeros((ng, nc), dtype=float)
+        ana_grad = np.zeros((ng, 1, nc), dtype=float)
         for i in range(ng):
             grad, _  = self.model.predict_grad(d_data[i,: ].reshape(1, -1), compute_grad_var=False)
             grad = np.dot(des_grad[i,: ], grad).squeeze()
-            ana_grad[i,:] = grad
-            print(f"analytical gradient:\n{grad.shape}")
+            ana_grad[i, :, :] = grad
+            # print(f"analytical gradient:\n{grad.shape}")
 
         return ana_grad
 
     #
-    def gradient(self, gms, states = None):
+    def numerical_gradient(self, gms, states = None):
         """
         evaluate the gradient of the surrogate at gms
         """
