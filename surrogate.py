@@ -85,8 +85,10 @@ class Adiabat(Surrogate):
         if hparam is not None:
             self.model.kernel_.theta = hparam
 
-        scaler = preprocessing.StandardScaler().fit(self.descriptors)
-        self.model.fit(scaler.transform(self.descriptors),
+        # scaler = preprocessing.StandardScaler().fit(self.descriptors)
+        # self.model.fit(scaler.transform(self.descriptors),
+                       # self.training)
+        self.model.fit(self.descriptors,
                        self.training)
         return self.model.kernel_.theta
 
