@@ -148,9 +148,9 @@ class Geometry():
         self.qdef    = intc.Intdef(intc_file)
         self.c2int   = intc.Cart2int(self.qdef)
         self.qlabels = self._q_types()
-        self.qx      = self.gen_q(self.x)
+        self.qx      = self.gen_qx(self.x)
         self.qp      = self.gen_qp(self.x, self.p)
-        self.qv      = self.gen_q(self.p / self._mvec)
+        self.qv      = self.gen_qv(self.x, self.v)
 
     # 
     def read_hessian(self, hess_file):
@@ -185,7 +185,7 @@ class Geometry():
         """
         self.x = x
         if self.c2int is not None:
-            self.qx = self.gen_q(self.x)
+            self.qx = self.gen_qx(self.x)
 
     #
     def update_hess(self, hess):
@@ -217,7 +217,7 @@ class Geometry():
         self.v = p / self._mvec
         if self.c2int is not None:
             self.qp = self.gen_qp(self.x, self.p)
-            self.qv = self.gen_q(self.p / self._mvec)
+            self.qv = self.gen_qv(self.x, self.v)
 
     #
     def _q_types(self):
@@ -235,7 +235,7 @@ class Geometry():
         return qtype
 
     #
-    def gen_q(self, x):
+    def gen_qx(self, x):
         """
         generate an internal coordinate geometry using the loaded
         intc definitions
@@ -249,6 +249,14 @@ class Geometry():
         definitions
         """
         return self.c2int.cart2intp(x, p)
+
+    #
+    def gen_qv(self, x, v):
+        """
+        generate an internal coordinate momentu using the intc
+        definitions
+        """
+        return self.c2int.cart2intp(x, v)
 
     #
     def freq(self):
