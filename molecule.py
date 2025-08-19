@@ -23,6 +23,7 @@ ref_masses = {'Ghost': 0, 'X': 0., 'H':1.008, 'He':4.002602,
               'Mn':54.938044, 'Fe':55.845, 'Co':58.933194, 'Ni':58.6934,
               'Cu':63.546, 'Zn':65.38}
 
+#
 def writeXYZ(atms, xcrds, file_name):
     """
     write a standard xyz file for the geometry or geometries
@@ -42,6 +43,7 @@ def writeXYZ(atms, xcrds, file_name):
                 args = [atms[iat]] + geoms[igm,3*iat:3*iat+3].tolist()
                 f.write(fstr.format(*args))
 
+#
 class Geometry():
     """
     store information related to a molecular geometry
@@ -56,13 +58,15 @@ class Geometry():
         if xyz_file is not None:
             self.from_xyz(xyz_file)
         else:
-            self.x      = None
-            self.p      = None
-            self.v      = None
-            self.atms   = None
-            self.masses = None
-            self.natm   = None
-            self._mvec  = None
+            self.x        = None
+            self.p        = None
+            self.v        = None
+            self.atms     = None
+            self.masses   = None
+            self.natm     = None
+            self.gradient = None
+            self.hessian  = None
+            self._mvec    = None
 
         # internal coordinate file is specified, parse
         # intc file for internal coordinate definition
@@ -72,6 +76,8 @@ class Geometry():
             self.qx      = None
             self.qp      = None
             self.qv      = None
+            self.qgrad   = None
+            self.qhess   = None
             self.qlabels = None
             self.qdef    = None
             self.c2int   = None
@@ -115,8 +121,10 @@ class Geometry():
             else:
                 mom.extend([0.,0.,0.])
 
-        xconv       = constants.ang2bohr
-        pconv       = constants.ang2bohr / constants.fs2au
+        #xconv       = constants.ang2bohr
+        #pconv       = constants.ang2bohr / constants.fs2au
+        xconv       = 1.
+        pconv       = 1.
         self.x      = np.array(gm, dtype=float) * xconv
         self.p      = np.array(mom, dtype=float) * pconv
 
@@ -127,7 +135,8 @@ class Geometry():
         # mass vector, length 3N
         mtmp        = [[self.masses[i]]*3 
                         for i in range(len(self.masses))]
-        self._mvec  = list(chain.from_iterable(mtmp))
+        self._mvec  = np.array(list(chain.from_iterable(mtmp)), 
+                               dtype=float)
         self.v      = self.p / self._mvec
 
     #
@@ -143,6 +152,32 @@ class Geometry():
         self.qp      = self.gen_qp(self.x, self.p)
         self.qv      = self.gen_q(self.p / self._mvec)
 
+    # 
+    def read_hessian(self, hess_file):
+        """
+        read a hessian matrix, assumes un-mass-weighted
+        """
+       
+        with open(hess_file, 'r') as f:
+            hess = f.readlines()
+
+        nr = len(hess)
+        nc = len(hess[0].strip().split())
+
+        if nr != nc:
+            print('WARRNING: hessian nr='+str(nr)+', nc='+str(nc))
+
+        if nr != self.x.shape[0] or nc != self.x.shape[0]:
+            print('WARNING: hessian dimensions do not agree with geom')
+
+        self.hessian = np.zeros((nr,nc), dtype=float)
+        for i in range(nr):
+            self.hessian[i,:] = np.array(hess[i].strip().split(), 
+                                         dtype=float)
+
+        if self.c2int is not None:
+            self.qhess = self.c2int.cart2inth(self.x, self.hessian)
+
     #
     def update_gm(self, x):
         """
@@ -151,6 +186,27 @@ class Geometry():
         self.x = x
         if self.c2int is not None:
             self.qx = self.gen_q(self.x)
+
+    #
+    def update_hess(self, hess):
+        """
+        update the hessian matrix
+        """
+        self.hessian  = hess
+        
+        if self.c2int is not None:
+            self.qhess = self.c2int.cart2inth(self.x, self.hessian)
+
+    #
+    def update_grad(self, grad):
+        """
+        update the gradient associated with this 
+        geometry
+        """
+        self.gradient = grad
+
+        if self.c2int is not None:
+            self.qgrad = self.c2int.cart2intg(self.x, self.gradient)
 
     #
     def update_mom(self, p):
@@ -194,6 +250,32 @@ class Geometry():
         """
         return self.c2int.cart2intp(x, p)
 
+    #
+    def freq(self):
+        """
+        compute the vibrational frequencies corresponding to the current
+        hessian
+        """
+
+        # can only compute frequencies if we have a hessian defined
+        if np.any([self.hessian]) == None:
+            return None, None
+
+        # for mass-weighted hessian
+        invmass = np.asarray([1./ np.sqrt(self._mvec[i]) 
+                    for i in range(self._mvec.shape[0])], dtype=float)
+        mw_hess = np.diag(invmass) @ self.hessian @ np.diag(invmass)
+        evals, evecs = np.linalg.eigh(mw_hess)
+
+        freq_cut = 1.e-5
+        freq_list = []
+        mode_list = []
+        for i in range(len(evals)):
+            if evals[i] >= 0 and np.sqrt(evals[i]) >= freq_cut:
+                freq_list.append(np.sqrt(evals[i]))
+                mode_list.append(evecs[:,i].tolist())
+
+        return np.asarray(freq_list), np.asarray(mode_list).transpose()
 
 #
 class Trajectory():

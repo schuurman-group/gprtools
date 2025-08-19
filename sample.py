@@ -15,6 +15,104 @@ class Sample(ABC):
     def sample(self):
         pass
 
+class Wigner(Sample):
+    """
+    Generate position and momenta drawn from a 
+    Wigner distribution. Currently only works in cartesian
+    coordinates
+    """
+    def __init__(self, ref_gm, seed, crd='cart'):
+        super().__init__()
+
+        self.crd = crd
+        if self.crd == 'cart':
+            self.dim = ref_gm.x.shape[0]
+        elif self.crd == 'intc':
+            print('Wigner sampling not currently implemented ' + 
+                  'for internal coordinates')
+            os.abort()
+        else: 
+            print('crd='+str(crd)+' not recognized. Exiting...')
+            os.abort() 
+
+        self.ref_gm = ref_gm 
+        rseed       = np.random.default_rng(seed=seed)
+
+    #
+    def update_origin(self, ref_gm):
+        """
+        update the ref_gm object
+        """
+        self.ref_gm = ref_gm
+
+    #
+    def sample(self, nsample, bounds=None, cartesian=True):
+        """
+        Sample Wigner distribution
+        """
+
+        masses       = self.ref_gm._mvec
+        omega, modes = self.ref_gm.freq()
+        nc = omega.shape[0]
+
+        if np.any([omega])== None or np.any([modes]) == None:
+            return None
+        
+        alpha = 0.5*omega
+        sigma_x = np.sqrt(0.25 / alpha)
+        sigma_p = np.sqrt(alpha)
+
+        dx = np.random.normal(0., sigma_x, (nsample, nc))
+        dp = np.random.normal(0., sigma_p, (nsample, nc))
+
+        if np.any([bounds]) == None:
+            chk_bounds = False
+        elif bounds.shape != (2, 2, nc):
+            print('bounds wrong shape in Wigner.sample -- ignoring.')
+            chk_bounds = False
+        else:
+            chk_bounds = True
+
+        if chk_bounds:
+
+            dist_x = np.zeros((nsample, nc), dtype=float)
+            dist_p = np.zeros((nsample, nc), dtype=float)
+            ipass    = -1
+            while ipass < nsample:
+
+                for i in range(nsample):
+                    dxi = dx[i,:]
+                    dpi = dp[i,:]
+
+                    lowx  = any(dxi < bounds[0,0,:])
+                    highx = any(dxi > bounds[0,1,:])
+                    lowp  = any(dpi < bounds[1,0,:])
+                    highp = any(dpi > bounds[1,1,:])
+                    if (lowx or highx or lowp or highp):
+                        continue
+                    else:
+                        ipass += 1
+                        dist_x[ipass,:] = np.dot(modes, dx) / np.sqrt(masses)
+                        dist_p[ipass,:] = np.dot(modes, dp) * np.sqrt(masses)
+
+                if ipass < nsample:
+                    dx = np.random.normal(0., sigma_x, (nsample, nc))
+                    dp = np.random.normal(0., sigma_p, (nsample, nc))
+
+            dist_x += self.ref_gm.x
+            dist_p += self.ref_gm.p
+
+        else:
+
+            deltax = np.einsum('jn,kn->jk', modes, dx).T / np.sqrt(masses)
+            deltap = np.einsum('jn,kn->jk', modes, dp).T * np.sqrt(masses)
+            dist_x = self.ref_gm.x + deltax
+            dist_p = self.ref_gm.p + deltap
+
+        # dist_x.shape = [nsample, ncart]
+        # dist_p.shape = [nsample, ncart]
+        return dist_x, dist_p
+
 #
 class LHS(Sample):
     """
