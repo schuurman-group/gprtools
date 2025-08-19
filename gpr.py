@@ -1,4 +1,4 @@
-# system import 
+# system import
 import os
 import warnings
 import numpy as np
@@ -20,7 +20,7 @@ class GPRegressor(GaussianProcessRegressor):
 
     def _cal_kernel_gradient(self, X):
         """
-        calculate kernel gradient (dk*/dx*) based on the give model 
+        calculate kernel gradient (dk*/dx*) based on the give model
         hyperparameters and input data
         """
         # get hyper parameters
@@ -28,17 +28,20 @@ class GPRegressor(GaussianProcessRegressor):
         length_scale = hyper_para[1]
 
         diff = X.copy() - self.X_train_.copy()
-        kernel_gradient = np.einsum('ai,a->ai', -(diff/length_scale**2), 
+        # print(diff.shape)
+        # print(self.kernel_(X, self.X_train_).squeeze().shape)
+        # os._exit(0)
+        kernel_gradient = np.einsum('ai,a->ai', -(diff/length_scale**2),
                                self.kernel_(X, self.X_train_).squeeze())
 
-        # check if the kernel formula is consitent with the 
+        # check if the kernel formula is consitent with the
         #built-in function
         if debug:
             print(diff.shape)
             print(X.shape)
             print(self.X_train_.shape)
             print(self.alpha_.shape)
-            dists = cdist(X / length_scale, self.X_train_ / 
+            dists = cdist(X / length_scale, self.X_train_ /
                           length_scale, metric="sqeuclidean")
             kernel = hyper_para[0]*np.exp(-0.5*dists)
             kernel_test = self.kernel_(X, self.X_train_)
@@ -49,13 +52,13 @@ class GPRegressor(GaussianProcessRegressor):
 
     def _cal_kernel_hessian(self, X):
         """
-        calculate kernel hessian (dk*^2/dx*_idx_j) based on the give 
+        calculate kernel hessian (dk*^2/dx*_idx_j) based on the give
         model hyperparameters and input data
         """
         # get hyper-parameters
         hyper_para     = np.exp(self.kernel_.theta)
         num_feature    = X.shape[1]
-        kernel_hessian = (hyper_para[0] / 
+        kernel_hessian = (hyper_para[0] /
                           hyper_para[1]**2) * np.eye(num_feature)
 
         if debug: # print for debug
@@ -81,14 +84,16 @@ class GPRegressor(GaussianProcessRegressor):
         else:
             dtype, ensure_2d = None, False
 
-        X = validate_data(self, X, ensure_2d=ensure_2d, 
-                                      dtype=dtype, reset=False)
+        # print(X.shape)
+        # X = self._validate_data(self, X, ensure_2d=ensure_2d,
+                                      # dtype=dtype, reset=False)
 
-
-        # calcuate analytical gradient of the target fucntion 
+        # calcuate analytical gradient of the target fucntion
         # according 2.100 of McHutchon PhD thesis
         kernel_gradient = self._cal_kernel_gradient(X)
 
+        # print(kernel_gradient.shape)
+        # print(self.alpha_.shape)
         y_grad = kernel_gradient.transpose() @ self.alpha_
 
         # undo normalisation
@@ -96,28 +101,28 @@ class GPRegressor(GaussianProcessRegressor):
 
         # if we don't need to compute the variance,
         # exit here.
-        if not return_grad_var:
+        if not compute_grad_var:
             return y_grad, None
 
         kernel_hessian = self._cal_kernel_hessian(X)
 
-        # using Cholesky decomposition of efficiently evaluate the 
+        # using Cholesky decomposition of efficiently evaluate the
         # second term in gradient variance expression
-        V = solve_triangular(self.L_, kernel_gradient, 
-                            lower=GPR_CHOLESKY_LOWER, 
+        V = solve_triangular(self.L_, kernel_gradient,
+                            lower=GPR_CHOLESKY_LOWER,
                              check_finite=False)
         temp = V.T @ V
 
-        # calcuate gradient variance 
+        # calcuate gradient variance
         # (in analogy of how to calcuate variance)
         y_grad_var = kernel_hessian - temp
 
         # undo normalization
-        y_grad_var = np.outer(y_grad_var, 
+        y_grad_var = np.outer(y_grad_var,
                         self._y_train_std**2).reshape(
                                     *y_grad_var.shape, -1)
 
-        # if y_cov has shape (n_samples, n_samples, 1), 
+        # if y_cov has shape (n_samples, n_samples, 1),
         # reshape to (n_samples, n_samples)
         if y_grad_var.shape[2] == 1:
             y_grad_var = np.squeeze(y_grad_var, axis=2)
