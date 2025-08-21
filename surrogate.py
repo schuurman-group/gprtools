@@ -59,7 +59,7 @@ class Adiabat(Surrogate):
                                            hparam=[0.1, 0.1]):
         super().__init__()
         if kernel == 'RBF':
-            self.kernel = C(hparam[0]) * RBF(hparam[1])
+            self.kernel = C(hparam[0]) * RBF(hparam[1], length_scale_bounds=(1, 1e3))
         elif kernel == 'WhiteNoise':
             self.kernel = C(hparam[0]) * RBF(hparam[1]) + WhiteKernel(
                                                 noise_level=hparam[2])
@@ -85,10 +85,10 @@ class Adiabat(Surrogate):
         if hparam is not None:
             self.model.kernel_.theta = hparam
 
-        #scaler = preprocessing.StandardScaler().fit(self.descriptors)
-        #self.model.fit(scaler.transform(self.descriptors), 
-        #               self.training)        
-        self.model.fit(self.descriptors, 
+        # scaler = preprocessing.StandardScaler().fit(self.descriptors)
+        # self.model.fit(scaler.transform(self.descriptors),
+                      # self.training)
+        self.model.fit(self.descriptors,
                        self.training)
 
         return self.model.kernel_.theta
@@ -121,9 +121,10 @@ class Adiabat(Surrogate):
             self.model.kernel_.theta = hparam
 
         #scaler = preprocessing.StandardScaler().fit(self.descriptors)
-        #self.model.fit(scaler.transform(self.descriptors), 
+        #self.model.fit(scaler.transform(self.descriptors),
         #               self.training)
-        self.model.fit(self.descriptors, 
+        print(f"training size:{old_size+new_size}")
+        self.model.fit(self.descriptors,
                        self.training)
 
         return self.model.kernel_.theta
