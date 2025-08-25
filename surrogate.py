@@ -8,6 +8,41 @@ import pickle as pickle
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
 from sklearn import preprocessing
 import gpr as gpr
+from sklearn.gaussian_process.kernels import Kernel
+
+class FeatureSliceKernel(Kernel):
+    """Wrapper kernel that applies another kernel to a subset of features."""
+    def __init__(self, base_kernel, feature_indices):
+        self.base_kernel = base_kernel
+        self.feature_indices = np.atleast_1d(feature_indices)
+
+    def __call__(self, X, Y=None, eval_gradient=False):
+        X_sub = X[:, self.feature_indices]
+        Y_sub = None if Y is None else Y[:, self.feature_indices]
+        return self.base_kernel(X_sub, Y_sub, eval_gradient=eval_gradient)
+
+    def diag(self, X):
+        return self.base_kernel.diag(X[:, self.feature_indices])
+
+    def is_stationary(self):
+        return self.base_kernel.is_stationary()
+
+    # Expose hyperparameters of the base kernel
+    @property
+    def hyperparameters(self):
+        return self.base_kernel.hyperparameters
+
+    @property
+    def theta(self):
+        return self.base_kernel.theta
+
+    @theta.setter
+    def theta(self, theta):
+        self.base_kernel.theta = theta
+
+    @property
+    def bounds(self):
+        return self.base_kernel.bounds
 
 class Surrogate(ABC):
 
@@ -56,13 +91,25 @@ class Adiabat(Surrogate):
     Adiabatic surface surrogate
     """
     def __init__(self, descriptor, kernel='RBF', nrestart=50,
-                                           hparam=[0.1, 0.1]):
+                                           hparam=[0.1, 0.1], groups=None):
         super().__init__()
         if kernel == 'RBF':
             self.kernel = C(hparam[0]) * RBF(hparam[1], length_scale_bounds=(1, 1e3))
         elif kernel == 'WhiteNoise':
             self.kernel = C(hparam[0]) * RBF(hparam[1]) + WhiteKernel(
                                                 noise_level=hparam[2])
+        elif kernel == "anisotropic RBF":
+
+            group_kernel = FeatureSliceKernel(RBF(length_scale=hparam[1],length_scale_bounds=(1e-3, 1e3)), groups[0])
+            self.kernel = group_kernel
+
+            for idx, gp in enumerate(groups):
+                if idx !=0:
+                    group_kernel = FeatureSliceKernel(RBF(length_scale=hparam[idx+1],length_scale_bounds=(1e-3, 1e3)), gp)
+                    self.kernel += group_kernel
+
+            self.kernel *= C(hparam[0])
+
         else:
             print('Kernel: '+str(kernel)+' not recognized.')
             os.abort()
@@ -88,6 +135,9 @@ class Adiabat(Surrogate):
         # scaler = preprocessing.StandardScaler().fit(self.descriptors)
         # self.model.fit(scaler.transform(self.descriptors),
                       # self.training)
+        print(self.descriptors.shape)
+        print(self.training.shape)
+        # os._exit(0)
         self.model.fit(self.descriptors,
                        self.training)
 

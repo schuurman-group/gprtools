@@ -133,9 +133,9 @@ class Geometry():
                          self.atms[i].capitalize()] * constants.amu2au
                                             for i in range(self.natm)]
         # mass vector, length 3N
-        mtmp        = [[self.masses[i]]*3 
+        mtmp        = [[self.masses[i]]*3
                         for i in range(len(self.masses))]
-        self._mvec  = np.array(list(chain.from_iterable(mtmp)), 
+        self._mvec  = np.array(list(chain.from_iterable(mtmp)),
                                dtype=float)
         self.v      = self.p / self._mvec
 
@@ -152,12 +152,12 @@ class Geometry():
         self.qp      = self.gen_qp(self.x, self.p)
         self.qv      = self.gen_qv(self.x, self.v)
 
-    # 
+    #
     def read_hessian(self, hess_file):
         """
         read a hessian matrix, assumes un-mass-weighted
         """
-       
+
         with open(hess_file, 'r') as f:
             hess = f.readlines()
 
@@ -172,7 +172,7 @@ class Geometry():
 
         self.hessian = np.zeros((nr,nc), dtype=float)
         for i in range(nr):
-            self.hessian[i,:] = np.array(hess[i].strip().split(), 
+            self.hessian[i,:] = np.array(hess[i].strip().split(),
                                          dtype=float)
 
         if self.c2int is not None:
@@ -193,14 +193,14 @@ class Geometry():
         update the hessian matrix
         """
         self.hessian  = hess
-        
+
         if self.c2int is not None:
             self.qhess = self.c2int.cart2inth(self.x, self.hessian)
 
     #
     def update_grad(self, grad):
         """
-        update the gradient associated with this 
+        update the gradient associated with this
         geometry
         """
         self.gradient = grad
@@ -270,7 +270,7 @@ class Geometry():
             return None, None
 
         # for mass-weighted hessian
-        invmass = np.asarray([1./ np.sqrt(self._mvec[i]) 
+        invmass = np.asarray([1./ np.sqrt(self._mvec[i])
                     for i in range(self._mvec.shape[0])], dtype=float)
         mw_hess = np.diag(invmass) @ self.hessian @ np.diag(invmass)
         evals, evecs = np.linalg.eigh(mw_hess)
@@ -551,7 +551,7 @@ class Trajectory():
         return dDMdt
 
     # compute the time-derivative coupling matrix
-    def tdcm(self, vel):
+    def tdcm(self, gm, vel):
         """
         compute the time derivative coupling matrix
         """
