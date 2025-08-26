@@ -56,7 +56,7 @@ class Adiabat(Surrogate):
     Adiabatic surface surrogate
     """
     def __init__(self, descriptor, kernel='RBF', nrestart=50,
-                                           hparam=[2., 0.1]):
+                                           hparam=[0.1, 2]):
         super().__init__()
         if kernel == 'RBF':
             self.kernel = C(hparam[0]) * RBF(hparam[1], 

@@ -105,6 +105,14 @@ class Geometry():
         gm        = []
         mom       = []
 
+        # we're going to assume that units are in Angstrom
+        # and femtoseconds unless we're told otherwise
+        xconv   = constants.ang2bohr
+        pconv   = constants.ang2bohr / constants.fs2au
+        if 'units' in xyz[1].lower() and 'bohr' in xyz[1].lower():
+            xconv = 1
+            pconv = 1
+
         for i in range(self.natm):
             line = xyz[i+2].strip().split()
             self.atms.append(line[0])
@@ -114,12 +122,8 @@ class Geometry():
             else:
                 mom.extend([0.,0.,0.])
 
-        xconv       = constants.ang2bohr
-        pconv       = constants.ang2bohr / constants.fs2au
-        #xconv       = 1.
-        #pconv       = 1.
-        self.x    = np.array(gm, dtype=float) * xconv
-        self.p    = np.array(mom, dtype=float) * pconv
+        self.x  = np.array(gm, dtype=float) * xconv
+        self.p  = np.array(mom, dtype=float) * pconv
 
         # mass vector, length N
         self.masses = [ref_masses[
