@@ -56,10 +56,11 @@ class Adiabat(Surrogate):
     Adiabatic surface surrogate
     """
     def __init__(self, descriptor, kernel='RBF', nrestart=50,
-                                           hparam=[0.1, 0.1]):
+                                           hparam=[2., 0.1]):
         super().__init__()
         if kernel == 'RBF':
-            self.kernel = C(hparam[0]) * RBF(hparam[1])
+            self.kernel = C(hparam[0]) * RBF(hparam[1], 
+                                             length_scale_bounds=(1, 1e3))
         elif kernel == 'WhiteNoise':
             self.kernel = C(hparam[0]) * RBF(hparam[1]) + WhiteKernel(
                                                 noise_level=hparam[2])

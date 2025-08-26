@@ -5,8 +5,6 @@ import os
 import copy as copy
 import numpy as np
 from itertools import chain
-from scipy.integrate import RK45
-from scipy.integrate import solve_ivp
 import constants as constants
 import intc as intc
 
@@ -48,19 +46,15 @@ class Geometry():
     """
     store information related to a molecular geometry
     """
-    def __init__(self, state=None, xyz_file=None, intc_file=None):
-
-        # set the state the geometry lives on
-        self.state = state
+    def __init__(self, xyz_file=None, intc_file=None):
 
         # if xyz_file is passed to constructor, parse
         # xyz_file for geometry information
         if xyz_file is not None:
             self.from_xyz(xyz_file)
         else:
-            self.x        = None
-            self.p        = None
-            self.v        = None
+            self.x      = None
+            self.p      = None
             self.atms     = None
             self.masses   = None
             self.natm     = None
@@ -75,7 +69,6 @@ class Geometry():
         else:
             self.qx      = None
             self.qp      = None
-            self.qv      = None
             self.qgrad   = None
             self.qhess   = None
             self.qlabels = None
@@ -121,12 +114,12 @@ class Geometry():
             else:
                 mom.extend([0.,0.,0.])
 
-        #xconv       = constants.ang2bohr
-        #pconv       = constants.ang2bohr / constants.fs2au
-        xconv       = 1.
-        pconv       = 1.
-        self.x      = np.array(gm, dtype=float) * xconv
-        self.p      = np.array(mom, dtype=float) * pconv
+        xconv       = constants.ang2bohr
+        pconv       = constants.ang2bohr / constants.fs2au
+        #xconv       = 1.
+        #pconv       = 1.
+        self.x    = np.array(gm, dtype=float) * xconv
+        self.p    = np.array(mom, dtype=float) * pconv
 
         # mass vector, length N
         self.masses = [ref_masses[
@@ -137,7 +130,6 @@ class Geometry():
                         for i in range(len(self.masses))]
         self._mvec  = np.array(list(chain.from_iterable(mtmp)), 
                                dtype=float)
-        self.v      = self.p / self._mvec
 
     #
     def read_intc(self, intc_file):
@@ -150,7 +142,6 @@ class Geometry():
         self.qlabels = self._q_types()
         self.qx      = self.gen_qx(self.x)
         self.qp      = self.gen_qp(self.x, self.p)
-        self.qv      = self.gen_qv(self.x, self.v)
 
     # 
     def read_hessian(self, hess_file):
@@ -179,45 +170,46 @@ class Geometry():
             self.qhess = self.c2int.cart2inth(self.x, self.hessian)
 
     #
-    def update_gm(self, x):
+    def set(self, var, value):
         """
-        update the geometry
+        update a variable. We use set to ensure this is done
+        consistently, i.e. cartesians/internals
         """
-        self.x = x
-        if self.c2int is not None:
-            self.qx = self.gen_qx(self.x)
 
-    #
-    def update_hess(self, hess):
-        """
-        update the hessian matrix
-        """
-        self.hessian  = hess
-        
-        if self.c2int is not None:
-            self.qhess = self.c2int.cart2inth(self.x, self.hessian)
+        def update_x(x):
+            self.pos = x
+            if self.c2int is not None:
+                self.qx = self.gen_qx(self.x)
 
-    #
-    def update_grad(self, grad):
-        """
-        update the gradient associated with this 
-        geometry
-        """
-        self.gradient = grad
+        def update_p(p):
+            self.mom = p
+            if self.c2int is not None:
+                self.qp = self.gen_qp(self.x, self.p)
 
-        if self.c2int is not None:
-            self.qgrad = self.c2int.cart2intg(self.x, self.gradient)
+        def update_hess(hess):
+            self.hessian  = hess
+  
+            if self.c2int is not None:
+                self.qhess = self.c2int.cart2inth(self.x, self.hessian)
 
-    #
-    def update_mom(self, p):
-        """
-        update the momentum
-        """
-        self.p = p
-        self.v = p / self._mvec
-        if self.c2int is not None:
-            self.qp = self.gen_qp(self.x, self.p)
-            self.qv = self.gen_qv(self.x, self.v)
+        def update_grad(grad):
+            self.gradient = grad
+
+            if self.c2int is not None:
+                self.qgrad = self.c2int.cart2intg(self.x, self.gradient)
+
+
+        setfunc = {'x': update_x,
+                   'p': update_p,
+                   'gradient': update_grad,
+                   'hessian': update_hess}
+
+
+        if var in setfunc:
+            setfunc[var](value)
+        else:
+            print('WARNING: variable ' + str(var) + 
+                  ' cannot be set in Geometry.')
 
     #
     def _q_types(self):
@@ -240,7 +232,10 @@ class Geometry():
         generate an internal coordinate geometry using the loaded
         intc definitions
         """
-        return self.c2int.cart2intc(x)
+        if self.c2int != None:
+            return self.c2int.cart2intc(x)
+        else:
+            return None
 
     #
     def gen_qp(self, x, p):
@@ -248,7 +243,10 @@ class Geometry():
         generate an internal coordinate momentu using the intc
         definitions
         """
-        return self.c2int.cart2intp(x, p)
+        if self.c2int != None:
+            return self.c2int.cart2intp(x, p)
+        else:
+            return None
 
     #
     def gen_qv(self, x, v):
@@ -256,7 +254,10 @@ class Geometry():
         generate an internal coordinate momentu using the intc
         definitions
         """
-        return self.c2int.cart2intp(x, v)
+        if self.c2int != None:
+            return self.c2int.cart2intp(x, v)
+        else:
+            return None
 
     #
     def freq(self):
@@ -290,279 +291,162 @@ class Trajectory():
     """
     Trajectory class, currently not much
     """
-    def __init__(self, gm, nstate, surface=None):
-
-        amass       = [[gm.masses[i]]*3
-                            for i in range(len(gm.masses))]
+    def __init__(self, geom, time, state):
 
         # self.m is a length 3*N vector of atomic masses
-        self.mol    = gm.copy()
-        self.m      = np.array(sum(amass, []), dtype=float)
-        self.ns     = int(nstate)
-        self.nc     = gm.x.shape[0]
+        self.nincr = 100
+        self.geom  = geom.copy()
+        self.nc    = geom.x.shape[0]
+        self.st    = np.zeros((self.nincr), dtype=int)
+        self.time  = np.zeros((self.nincr), dtype=float)
+        self.xt    = np.zeros((self.nincr, self.nc), dtype=float)
+        self.pt    = np.zeros((self.nincr, self.nc), dtype=float)
 
-        if surface is not None:
-            self.surface= surface
+        amass       = [[geom.masses[i]]*3
+                            for i in range(len(geom.masses))]
 
-
-    # define a class to hold propagation solution
-    class propSol():
-        def __init__(self, gm, nx, tlst, ylst, slst, chklst, update, fail):
-
-            self.t   = np.array(tlst, dtype=float)
-            self.s   = np.array(slst, dtype=int)
-            self.chk = np.array(chklst, dtype=float)
-
-            self.update = update
-            self.failed = fail
-
-            # return a geometry object initialized to the
-            # current state
-            self.gm  = gm
-
-            if len(tlst) == 0:
-                self.x = np.array([gm.x], dtype=complex).real
-                self.p = np.array([gm.p], dtype=complex).real
-            else:
-                yarr   = np.array(ylst, dtype=complex)
-                self.x = yarr[:, :nx].real
-                self.p = yarr[:, nx:2*nx].real
-
-            self.gm.update_gm(self.x[-1,:])
-            self.gm.update_mom(self.p[-1,:])
+        self.cnt             = 0
+        self.xt[self.cnt, :] = self.geom.x
+        self.pt[self.cnt, :] = self.geom.p
+        self.time[self.cnt]  = time
+        self.st[self.cnt]    = state
 
     #
-    def energy(self, x, p, state):
+    def x(self):
         """
         return the classical energy of the trajectory
         """
+        return self.xt[self.cnt,:]
 
-        gm = np.array([x], dtype=float)
-        kecoef = 0.5 / self.m
+    def x_t(self):
+        """
+        return all positions
+        """
+        return self.xt[:self.cnt,:]
 
-        pot = self.surface.evaluate(gm, states = [state])[0,0]
-        kin = np.sum(p * p * kecoef)
-        return pot + kin
+    # 
+    def qx(self):
+        """
+        return position in internal coordinates, if defined
+        """
+        return self.geom.gen_qx(self.x())
+    
+    # 
+    def p(self):
+        """
+        return the classical momentum
+        """
+        return self.pt[self.cnt,:]
 
     #
-    def propagate(self, x0, p0, s0, t0, dt,
-                          tols=None, chk_func=None, chk_thresh=None):
+    def p_t(self):
         """
-        propagate a trajectory from current time t to t+dt using
-        the surrogate
+        return all momenta
         """
-        if tols is not None:
-            [rtol, atol] = tols
+        return self.pt[:self.cnt,:]
+
+    #
+    def qp(self):
+        """
+        return the momentum in internal coords, if they're defined
+        """
+        return self.geom.gen_qp(self.x(), self.p())
+
+    #
+    def qv(self):
+        """
+        return the velocity in internal coordinates, if they're defined
+        """
+        return self.geom.gen_qv(self.x(), self.v())
+
+    #
+    def m(self):
+        """
+        mass vector
+        """
+        return self.geom._mvec
+
+    #
+    def v(self):
+        """
+        return the cartesian velocity of the trajectory
+        """
+        return self.pt[self.cnt,:] / self.m()
+
+    #
+    def t(self):
+        """
+        return the current time
+        """
+        return self.time[self.cnt]
+
+    #
+    def t_all(self):
+        """
+        return all times
+        """
+        return self.time[:self.cnt]
+
+    #
+    def state(self):
+        """
+        return the current state
+        """
+        return self.st[self.cnt]
+
+    #
+    def state_t(self):
+        """
+        return the active state at each time
+        """
+        return self.st[:self.cnt]
+
+    #
+    def update_geom(self, x, p):
+        """
+        update the reference geometry
+        """
+        self.geom.set('x', x)
+        self.geom.set('p', p)
+
+    #
+    def update(self, values):
+        """
+        update the trajectory position/momentum
+        """
+
+        def update_x(x):
+            self.xt[self.cnt, :] = x
+
+        def update_p(p):
+            self.pt[self.cnt, :] = p
+
+        def update_time(time):
+            self.time[self.cnt] = time
+
+        def update_state(s):
+            self.st[self.cnt] = s
+
+        setfunc = {'x': update_x,
+                   'p': update_p,
+                   'time': update_time,
+                   'state': update_state}
+
+        allowed = list(setfunc.keys())
+
+        if all([key in allowed for key in list(values.keys())]):
+            self.cnt += 1
+            # grow the arrays by nincr
+            if self.cnt % self.nincr == 0:
+                np.pad(self.time, (0, self.nincr), 'constant', (0.,0.))
+                np.pad(self.st, (0, self.nincr), 'constant', (0,0))
+                np.pad(self.xt, ((0, self.nincr),(0,0), 
+                                'constant', ((0.,0.),(0.,0.))))
+                np.pad(self.pt, ((0, self.nincr),(0,0),
+                                'constant', ((0.,0.),(0.,0.))))
+            for key in values:
+                setfunc[key](values[key])
         else:
-            [rtol, atol] = [1.e-3,1e-6]
+            print('WARNING: variable ' + str(values.keys()) +
+                  ' cannot be set in Trajectory.')
 
-        nc          = self.nc
-        dm          = np.ndarray((self.ns, self.ns), dtype=complex)
-        dm[s0, s0]  = 1.
-        self.state  = s0
-        tnow        = t0
-        ynow        = np.concatenate((x0, p0, dm.ravel()))
-        max_step    = 30.
-        tall        = []
-        yall        = []
-        chkall      = []
-        stall       = []
-        update      = False
-        failed      = False
-        delta_t     = 0.    # classical time step
-
-       # propagate outer loop until final itme reached,
-        # or we need to update our surface
-        while tnow < (t0+dt-0.2*max_step) and not (update or failed):
-            # when we change states, we reinitialize the
-            # propagator
-            propagator = RK45(
-                    fun      = self.step_function,
-                    t0       = tnow,
-                    y0       = ynow,
-                    t_bound  = t0 + dt,
-                    rtol     = rtol,
-                    atol     = atol,
-                    max_step = max_step)
-
-            while propagator.status == 'running':
-                tnow = propagator.t
-                ynow = propagator.y
-
-                tall.append(tnow)
-                yall.append(ynow)
-                stall.append(self.state)
-
-                if chk_func is not None:
-                    chkall.append(chk_func(
-                                        ynow[:nc].real,
-                                        ynow[nc:2*nc].real,
-                                        self.state))
-                    #print('chkall='+str(chkall),flush=True)
-                    if chkall[-1] > chk_thresh:
-                        update = True
-                        break
-
-                # compute hopping probability
-                snew = self.compute_fssh_hop(ynow, delta_t)
-
-                if self.state != snew:
-                    delta_p = self.scale_momentum(ynow, snew)
-                    if delta_p is not None:
-                        ynow[nc:2*nc] += delta_p
-                        self.state     = snew
-                        break
-
-                propagator.step()
-                delta_t = propagator.t - tnow
-
-            # if we got here because the propagator failed not b/c
-            # of a hop or surface update, end propagation
-            if propagator.status == 'failed':
-                print('propagation failed.')
-                failed = True
-                break
-
-        return self.propSol(self.mol, self.nc, tall, yall, stall, chkall,
-                                           update, failed)
-
-    #
-    def update_surface(self, new_surface):
-        """
-        replace surrogate potential with new_surrogate
-        """
-        self.surface = new_surface
-
-    #
-    def step_function(self, t, y):
-        """
-        function to pass to solve_ivp to propagate trajectory
-        """
-        # vector to put dy / dt
-        dely = np.zeros(y.shape[0], dtype=complex)
-
-        # evaluate the gradient of the potential at y.x,
-        # -grad = F = ma
-        gm   = np.array([y[:self.nc].real])
-        grad = self.surface.gradient(gm, states=[self.state])
-        vel  = y[self.nc:2*self.nc] / self.m
-
-        # dx/dt = v = p/m
-        dely[:self.nc]          = vel
-        # dp/dt = ma = F = -grad
-        dely[self.nc:2*self.nc] = -grad[0,0,:]
-
-        # propagate the dm, ns>1 and y has the correct
-        # shape
-        if self.ns > 1:
-            all_states = [i for i in range(self.ns)]
-            ener = self.surface.evaluate(gm, states=all_states)
-
-            ddmdt = self.propagate_dm(gm, ener, vel)
-            dely[2*self.nc:] = ddmdt.ravel()
-
-        return dely
-
-    #
-    def compute_fssh_hop(self, y, dt):
-        """
-        compute the FSSH hopping probabilities
-        """
-        x  = y[:self.nc].real
-        p  = y[self.nc:2*self.nc].real
-        s  = self.state
-        dm = np.reshape(y[-(self.ns**2)], (self.ns, self.ns))
-
-        # if this is single state, don't bother
-        # with hopping algorithm
-        if self.ns == 1:
-            return s
-
-        # compute hopping probabilities
-        vel    = p / self.m
-        b      = (-2*np.conjugate(dm)*self.tdcm(vel)).real
-        pop    = np.diag(dm)
-        t_prob = np.array([max(0., dt*b[j, s]/pop[s])
-                            for j in range(self.ns)])
-        t_prob[s] = 0.
-
-        # check whether or not to hop
-        r    = np.random.uniform()
-        st   = 0.
-        prob = 0.
-        while st < self.ns:
-            prob += t_prob[st]
-            if r < prob:
-                return st
-            st += 1
-
-        return s
-
-    #
-    def scale_momentum(self, y, snew):
-        """
-        following a potential hop, attempt to scale the momentum
-        of the trajectory on the new state. If successful, return
-        'True', else, 'False'
-        """
-
-        # get coupling direction along which to scale
-        # momentum
-        x = y[:self.nc].real
-        p = y[self.nc:2*self.nc].real
-        s = self.state
-
-        gm  = np.array([x])
-        pair = [s, snew]
-        nac  = self.surface.coupling(gm, [pair])[0]
-        ener = self.surface.evaluate(gm, states=pair)[0]
-
-        # now we solve for the momentum adjustment that conserves
-        # the total energy
-        a = 0.5 * (nac*nac) / self.m
-        b = np.dot(p, nac)
-        c = ener[1] - ener[0]
-
-        delta = b**2 - 4*a*c
-
-        # if discriminant less than zero: frustrated hop,
-        # no adjustment that conserves energy
-        if delta < 0:
-            return None
-
-        # since solving quadratic equation, two roots generated,
-        # choose the smaller root
-        else:
-            gamma = (-b + np.sign(b)*np.sqrt(delta))/(2*a)
-
-        delta_p    = gamma * nac / self.m
-
-        return delta_p
-
-    #
-    def propagate_dm(self, gm, ener, vel):
-        """
-        propagate the state density matrix
-        """
-        dMdt = np.zeros((self.ns, self.ns), dtype=complex)
-        dR    = -1j*np.diag(ener) - self.tdcm(gm, vel)
-        dDMdt = dR@DM - DM@dR
-
-        return dDMdt
-
-    # compute the time-derivative coupling matrix
-    def tdcm(self, vel):
-        """
-        compute the time derivative coupling matrix
-        """
-        tdcm = np.zeros((self.ns, self.ns), dtype=float)
-        pairs = [[i,j] for i in range(self.ns) for j in range(i)]
-        nac   = self.surface.coupling(gm, pairs)
-
-        # compute the time-derivative coupling
-        for ind in range(len(pairs)):
-            i,j = pairs[ind][0],pairs[ind][1]
-            tdcm[i,j] =  np.dot(vel, nac[ind])
-            tdcm[j,i] = -tdcm[i,j]
-
-        return tdcm
