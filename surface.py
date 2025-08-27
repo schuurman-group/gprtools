@@ -68,7 +68,7 @@ class Graci(Surface):
             self.graci_scf = self.graci_ci.scf.copy()
         self.graci_scf.verbose = False
 
-        # set the Molecule object 
+        # set the Molecule object
         if mol_obj is not None:
             self.graci_mol = mol_obj.copy()
         else:
@@ -116,7 +116,7 @@ class Graci(Surface):
         ci_guess  = None
         for i in range(len(ordr)):
             geom = gms[ordr[i],:]
- 
+
             # update the geometry
             self.graci_mol.set_geometry(atms, geom.reshape(natm,3))
             self.graci_mol.run()
@@ -142,7 +142,7 @@ class Graci(Surface):
             if conv:
                 energies[ordr[i],:] = np.asarray(self.graci_ci.energy(
                                      range(self.nroots)), dtype=float)
-                # if we're propagating the CI reference space, 
+                # if we're propagating the CI reference space,
                 # update the ci_guess
                 if propagate:
                     ci_guess = self.graci_ci.copy()
@@ -182,10 +182,10 @@ class Graci(Surface):
         gms = np.vstack([origin, geoms])
 
         # construct tensor that is all unique differences
-        r,c = np.triu_indices(gms.shape[0], 1)       
+        r,c = np.triu_indices(gms.shape[0], 1)
         dif = gms[r,:] - gms[c,:]
 
-        # compute the distances between all unique pairs of geoms 
+        # compute the distances between all unique pairs of geoms
         dist = np.sqrt(np.einsum('ij,ij->i',dif, dif))
 
         # construct the distance matrix
@@ -194,7 +194,7 @@ class Graci(Surface):
 
         # order the geometries so each step takes you to closest
         # unique geometry
-        ordr    = []       
+        ordr    = []
         ndist   = []
         current = 0
         for i in range(geoms.shape[0]):
@@ -202,19 +202,19 @@ class Graci(Surface):
             nearest = valid[dmat[current, valid].argmin()]
             mindist = dmat[current, nearest]
             ndist.append(mindist)
-            # decrement closest by 1: first geometry is the origin 
+            # decrement closest by 1: first geometry is the origin
             ordr.append(nearest-1)
             # remove this pair as a future possibility
             dmat[current, :] = dmat[:, current] = -1
             # move to next geometry
             current = nearest
-          
+
         # if something goes wrong, return just sequential ordering
         if len(set(ordr)) != geoms.shape[0]:
-            print('error sorting geometries: ' + str(len(set(ordr))) + 
+            print('error sorting geometries: ' + str(len(set(ordr))) +
                   ' != '+str(geoms.shape[0]))
             ordr = [i for i in range(geoms.shape[0])]
- 
+
         return ordr, ndist
 
 #
@@ -223,7 +223,7 @@ class Kdc(Surface):
     KDC Vibronic surface evaluator
     """
     def __init__(self):
-        super().__init__() 
+        super().__init__()
         self.ham            = Kdc_ham()
         self.nmodes         = None
         self.nstates        = None
@@ -242,7 +242,7 @@ class Kdc(Surface):
     #
     def evaluate(self, gms, n_s=None, rep='adiabatic'):
         """
-        Evaluate the energies  energies 
+        Evaluate the energies  energies
         """
         if n_s is not None and n_s <= self.ham.nstates:
             nst = n_s
@@ -279,7 +279,7 @@ class Kdc_ham():
         """
 
         # might as well initialize to the constant values
-        h = self.cfs[0].copy() 
+        h = self.cfs[0].copy()
 
         for n in range(1, len(self.cfs)):
             if len(self.terms[n]) > 0:
@@ -290,7 +290,7 @@ class Kdc_ham():
                         tensor = np.outer(tensor, np.power(gm, exps[i]))
 
                     h += np.einsum('ij...,...->ij',
-                                       self.cfs[n][:,:,ordr,...], 
+                                       self.cfs[n][:,:,ordr,...],
                                        tensor, optimize=True)
 
         return h
@@ -313,7 +313,7 @@ class Kdc_ham():
     #
     def parse_op_file(self, op_file):
         """
-        static method for parsing quantics input file, return a 
+        static method for parsing quantics input file, return a
         kdc_ham object
         """
 
@@ -341,11 +341,11 @@ class Kdc_ham():
         # initialize the coefficient arrays
         self.cfs = []
         for n in range(n_max+1):
-            dim     = (nst, nst) 
+            dim     = (nst, nst)
             if len(self.terms[n]) > 0:
                 dim += (len(self.terms[n]),)
                 dim += (nq,)*n
-            self.cfs.append(np.zeros(dim, dtype=float))            
+            self.cfs.append(np.zeros(dim, dtype=float))
 
         # now we parse the file again and fill in all the
         # non-zero terms
@@ -369,12 +369,12 @@ class Kdc_ham():
                     read_ham   = False
                     ham_done   = True
                 elif 'hamiltonian-section' in line and not ham_done:
-                    read_ham   = True 
+                    read_ham   = True
 
-                # store all the parameters in a dictionary 
+                # store all the parameters in a dictionary
                 if read_param and not param_done:
                     key, value, units = self.parse_param_line(line)
-                    
+
                     # if we couldn't parse this line, move on
                     if key is not None:
                         #..else set the parameter
@@ -391,13 +391,13 @@ class Kdc_ham():
                             for ind in indices:
                                 self.cfs[n][ind] += num * kdc_params[key] / fac
                         else:
-                            print('ERROR: term not found -- STATES=' + 
+                            print('ERROR: term not found -- STATES=' +
                                   str(stlst) + ' Q=' + str(qlst))
 
                 line = f.readline()
-                  
+
         #print('cfs='+str(self.cfs),flush=True)
- 
+
         return
 
     #
@@ -436,7 +436,7 @@ class Kdc_ham():
 
                 # we're using unrestricted summations`
                 for perm in crd_perm:
-                    inds.append(ind+perm) 
+                    inds.append(ind+perm)
 
             else:
                 inds.append(ind)
@@ -490,19 +490,19 @@ class Kdc_ham():
                             el = crd_lst.index('el')
 
                     else:
-                        num, key, qlst, slst = self.parse_term_line(line,el)    
+                        num, key, qlst, slst = self.parse_term_line(line,el)
                         if num != None:
                             ordr = len(qlst)
                             nm   = len(set(qlst))
                             if nm > nmode_max:
                                 nmode_max = nm
                             if ordr > ordr_max[nm]:
-                                ordr_max[nm] = ordr         
+                                ordr_max[nm] = ordr
 
                 line = f.readline()
 
         nq = len(crd_lst) - crd_lst.count('el')
-        return nstates, nq, nmode_max, ordr_max[:nmode_max+1], el 
+        return nstates, nq, nmode_max, ordr_max[:nmode_max+1], el
 
     #
     def parse_param_line(self, line):
@@ -524,7 +524,7 @@ class Kdc_ham():
 
         else:
             return None, None, None
-        
+
     #
     def parse_term_line(self, line, el):
         """
@@ -544,8 +544,8 @@ class Kdc_ham():
 
             # in this case, electronic states
             # are explicitly given
-            crds   = []                
-            states = [] 
+            crds   = []
+            states = []
 
             parsed = line
             ncrds = line.count('|')
@@ -555,10 +555,10 @@ class Kdc_ham():
                 crdi   = int(cdef[0])-1
 
                 # if current coordinate is electronic coord,
-                # append to the states list  
+                # append to the states list
                 if crdi == el:
                     sts = cdef[1].replace('S','').strip().split('&')
-                    # states run from 0..ns-1         
+                    # states run from 0..ns-1
                     states = [int(st)-1 for st in sts]
 
                 # else this is a vibrational coord -- determine
@@ -570,13 +570,13 @@ class Kdc_ham():
                         cnt = 1
                     # coord indices run from 0..nq-1
                     crds += [crdi]*cnt
-                
-            return num, key, crds, states 
+
+            return num, key, crds, states
 
         #
         else:
             return None, None, None, None
-   
+
     #
     def gen_partition(self, k, n):
         """
@@ -646,7 +646,7 @@ class ChemPotPy(Surface):
         self.atms     = ref_geom.atms
 
         if e_units.lower() == 'ev':
-            self.econv = constants.ev2au 
+            self.econv = constants.ev2au
         elif e_units.lower() == 'au':
             self.econv = 1.
         else:
@@ -654,7 +654,7 @@ class ChemPotPy(Surface):
             os.abort()
 
         if g_units.lower() == 'angstrom':
-            self.gconv = constants.ang2bohr 
+            self.gconv = constants.ang2bohr
         elif g_units.lower() == 'bohr':
             self.gconv = 1.
         else:
@@ -684,7 +684,7 @@ class ChemPotPy(Surface):
         energies = np.zeros((ngm, nst), dtype=float)
 
         for i in range(ngm):
-            gm             = self._chempotpygeom(gms[i,:] / self.gconv) 
+            gm             = self._chempotpygeom(gms[i,:] / self.gconv)
             cppsurf        = chempotpy.p(self.molecule, self.surface, gm)
             energies[i, :] = cppsurf[[states]]
 
@@ -759,9 +759,9 @@ class ChemPotPy(Surface):
 
         for i in range(ngm):
             gm        = self._chempotpygeom(gms[i,:] / self.gconv)
-            cppsurf   = chempotpy.pgd(self.molecule, self.surface, gm) 
+            cppsurf   = chempotpy.pgd(self.molecule, self.surface, gm)
             for j in range(npair):
-                nacs[i,j,:] = cppsurf[2][pairs[j][0], pairs[j][1],:]
+                nacs[i,j,:] = cppsurf[2][pairs[j][0], pairs[j][1],:].ravel()
 
         nacs    *= (self.econv / self.gconv)
 
@@ -777,4 +777,3 @@ class ChemPotPy(Surface):
             xyz = gm[3*i:3*i+3].tolist()
             cgm.append([self.atms[i]] + xyz)
         return cgm
-

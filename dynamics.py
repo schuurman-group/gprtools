@@ -13,7 +13,7 @@ class Dynamics(ABC):
 
     def __init__(self):
         super().__init__()
-    
+
     @abstractmethod
     def propagate(self):
         pass
@@ -51,7 +51,7 @@ class SingleState(Dynamics):
         chk_vals    = []
 
         print('shape of grad training = '+str(self.grad.training.shape))
- 
+
        # propagate outer loop until final itme reached,
         # or we need to update our surface
         while traj.t() < (t0+dt-0.2*max_step) and not (update or failed):
@@ -163,7 +163,7 @@ class FSSH(Dynamics):
             propagator = RK45(
                     fun      = self.step_function,
                     t0       = traj.t(),
-                    y0       = np.concatenate((traj.x(), traj.p(), 
+                    y0       = np.concatenate((traj.x(), traj.p(),
                                                dm.ravel())),
                     t_bound  = t0 + dt,
                     rtol     = rtol,
@@ -175,7 +175,7 @@ class FSSH(Dynamics):
                 t_new   = propagator.t
                 x_new   = propagator.y[:self.nc].real
                 p_new   = propagator.y[self.nc:2*self.nc].real
-                dm_new  = np.reshape(propagator.y[-(self.ns**2)], 
+                dm_new  = np.reshape(propagator.y[2*self.nc:],
                                      (self.ns, self.ns))
                 delta_t = t_new - traj.t()
 
@@ -187,11 +187,11 @@ class FSSH(Dynamics):
                         break
 
                 # compute hopping probability
-                s_new = self.compute_fssh_hop(x_new, p_new, dm_new, 
+                s_new = self.compute_fssh_hop(x_new, p_new, dm_new,
                                               traj.state(), delta_t)
 
                 if traj.state() != s_new:
-                    delta_p = self.scale_momentum(x_new, p_new, 
+                    delta_p = self.scale_momentum(x_new, p_new,
                                                   traj.state(), s_new)
                     # we can scale momentum: hope to new state
                     if delta_p is not None:
@@ -219,7 +219,7 @@ class FSSH(Dynamics):
         if chk_func is not None:
             return update, failed, chk_vals
         else:
-            return failed  
+            return failed
 
     #
     def step_function(self, t, y):
@@ -244,9 +244,10 @@ class FSSH(Dynamics):
         # shape
         if self.ns > 1:
             all_states = [i for i in range(self.ns)]
-            ener = self.grad.evaluate(gm, states=all_states)
+            dm = y[2*self.nc: ].reshape(self.ns, self.ns)
 
-            ddmdt = self.propagate_dm(gm, ener, vel)
+            ener = self.grad.evaluate(gm, states=all_states)
+            ddmdt = self.propagate_dm(dm, gm, ener, vel)
             dely[2*self.nc:] = ddmdt.ravel()
 
         return dely
@@ -259,7 +260,7 @@ class FSSH(Dynamics):
 
         # compute hopping probabilities
         vel    = p / self.m
-        b      = (-2*np.conjugate(dm)*self.tdcm(vel)).real
+        b      = (-2*np.conjugate(dm)*self.tdcm(np.array([x]),vel)).real
         pop    = np.diag(dm)
         t_prob = np.array([max(0., dt*b[j, s]/pop[s])
                             for j in range(self.ns)])
@@ -270,7 +271,7 @@ class FSSH(Dynamics):
         st   = 0.
         prob = 0.
         while st < self.ns:
-            prob += t_prob[st]
+            prob += t_prob[int(st)]
             if r < prob:
                 return st
             st += 1
@@ -313,7 +314,7 @@ class FSSH(Dynamics):
         return delta_p
 
     #
-    def propagate_dm(self, gm, ener, vel):
+    def propagate_dm(self, DM,  gm, ener, vel):
         """
         propagate the state density matrix
         """
@@ -324,19 +325,18 @@ class FSSH(Dynamics):
         return dDMdt
 
     # compute the time-derivative coupling matrix
-    def tdcm(self, vel):
+    def tdcm(self, gm, vel):
         """
         compute the time derivative coupling matrix
         """
-        tdcm  = np.zeros((self.ns, self.ns), dtype=float)
+        tdcm  = np.zeros((self.ns, self.ns), dtype=complex)
         pairs = [[i,j] for i in range(self.ns) for j in range(i)]
         nac   = self.coup.coupling(gm, pairs)
 
         # compute the time-derivative coupling
         for ind in range(len(pairs)):
             i,j       =  pairs[ind][0],pairs[ind][1]
-            tdcm[i,j] =  np.dot(vel, nac[ind])
+            tdcm[i,j] =  np.dot(vel, nac[ind].squeeze())
             tdcm[j,i] = -tdcm[i,j]
 
         return tdcm
-
