@@ -442,14 +442,15 @@ class Trajectory():
             self.cnt += 1
             # grow the arrays by nincr
             if self.cnt == self.time.shape[0]:
-                np.pad(self.time, (0, self.nincr), 'constant', 
-                                   constant_values=(0.,0.))
-                np.pad(self.st, (0, self.nincr), 'constant', 
-                                   constant_values=(0,0))
-                np.pad(self.xt, ((0, self.nincr),(0, 0)), 'constant', 
-                                   constant_values=((0.,0.),(0.,0.)))
-                np.pad(self.pt, ((0, self.nincr), (0, 0)), 'constant', 
-                                   constant_values=((0.,0.),(0.,0.)))
+                self.time = np.concatenate((self.time, 
+                                np.zeroes(self.nincr, dtype=float))
+                self.st   = np.concatenate(self.st,
+                                np.zeroes(self.nincr, dtype=int))
+                self.xt   = np.concatenate(self.xt,
+                            np.zeroes((self.nincr,self.nc) dtype=float))
+                self.pt   = np.concatenate(self.pt,
+                            np.zeroes((self.nincr,self.nc) dtype=float))
+
             for key in values:
                 setfunc[key](values[key])
         else:
