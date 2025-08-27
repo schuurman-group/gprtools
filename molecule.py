@@ -443,13 +443,13 @@ class Trajectory():
             # grow the arrays by nincr
             if self.cnt % self.nincr == 0:
                 np.pad(self.time, (0, self.nincr), 'constant', 
-                                   constant_values = (0.,0.))
+                                   constant_values=(0.,0.))
                 np.pad(self.st, (0, self.nincr), 'constant', 
-                                   constant_values = (0,0))
-                np.pad(self.xt, ((0, self.nincr),(0,0), 'constant', 
-                                   constant_values = ((0.,0.),(0.,0.))))
-                np.pad(self.pt, ((0, self.nincr),(0,0), 'constant', 
-                                   constant_values = ((0.,0.),(0.,0.))))
+                                   constant_values=(0,0))
+                np.pad(self.xt, ((0, self.nincr),(0, 0)), 'constant', 
+                                   constant_values=((0.,0.),(0.,0.)))
+                np.pad(self.pt, ((0, self.nincr), (0, 0)), 'constant', 
+                                   constant_values=((0.,0.),(0.,0.)))
             for key in values:
                 setfunc[key](values[key])
         else:
