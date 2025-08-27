@@ -50,7 +50,7 @@ class SingleState(Dynamics):
         failed      = False
         chk_vals    = []
 
-        print('shape of grad training = '+str(self.grad.training.shape))
+        # print('shape of grad training = '+str(self.grad.training.shape))
 
        # propagate outer loop until final itme reached,
         # or we need to update our surface
