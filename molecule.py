@@ -441,7 +441,7 @@ class Trajectory():
         if all([key in allowed for key in list(values.keys())]):
             self.cnt += 1
             # grow the arrays by nincr
-            if self.cnt % self.nincr == 0:
+            if (self.cnt+1) % self.nincr == 0:
                 np.pad(self.time, (0, self.nincr), 'constant', 
                                    constant_values=(0.,0.))
                 np.pad(self.st, (0, self.nincr), 'constant', 
