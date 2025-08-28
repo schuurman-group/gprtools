@@ -8,7 +8,87 @@ import pickle as pickle
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
 from sklearn import preprocessing
 import gpr as gpr
-from sklearn.gaussian_process.kernels import Kernel
+from sklearn.gaussian_process.kernels import Kernel, Hyperparameter
+
+class ScaledMultiBlockRBF(Kernel):
+    """Kernel = Constant * MultiBlock RBF Kernel"""
+
+    def __init__(self, block_sizes, length_scales=None, constant=1.0,
+                 length_scale_bounds=(1e-5, 1e5), constant_bounds=(1e-5, 1e5)):
+        self.block_sizes = tuple(block_sizes)
+        self.n_blocks = len(block_sizes)
+        self.length_scale_bounds = length_scale_bounds
+        self.constant_bounds = constant_bounds
+        self.constant = constant
+
+        if length_scales is None:
+            self.length_scales = np.ones(self.n_blocks)
+        else:
+            self.length_scales = np.asarray(length_scales)
+
+        if len(self.length_scales) != self.n_blocks:
+            raise ValueError("Length of length_scales must match number of blocks")
+
+    @property
+    def hyperparameter_length_scales(self):
+        return Hyperparameter("length_scales", "numeric", self.length_scale_bounds, len(self.length_scales))
+
+    @property
+    def hyperparameter_constant(self):
+        return Hyperparameter("constant", "numeric", self.constant_bounds)
+
+    def __call__(self, X, Y=None, eval_gradient=False):
+        X = np.atleast_2d(X)
+        Y = np.atleast_2d(X if Y is None else Y)
+
+        if X.shape[1] != sum(self.block_sizes):
+            raise ValueError("Input feature size does not match sum of block sizes")
+
+        indices = np.cumsum((0,) + self.block_sizes)
+
+        total_dist = np.zeros((X.shape[0], Y.shape[0]))
+        gradients = []
+
+        for b in range(self.n_blocks):
+            start, end = indices[b], indices[b + 1]
+            Xb = X[:, start:end]
+            Yb = Y[:, start:end]
+
+            dists = np.sum((Xb[:, np.newaxis, :] - Yb[np.newaxis, :, :]) ** 2, axis=2)
+            scaled_dists = dists / (self.length_scales[b] ** 2)
+            total_dist += scaled_dists
+
+        K_base = np.exp(-0.5 * total_dist)
+        K = self.constant * K_base
+
+        if eval_gradient:
+            # Gradients w.r.t. each length scale
+            for b in range(self.n_blocks):
+                start, end = indices[b], indices[b + 1]
+                Xb = X[:, start:end]
+                Yb = Y[:, start:end]
+                dists = np.sum((Xb[:, np.newaxis, :] - Yb[np.newaxis, :, :]) ** 2, axis=2)
+                grad_b = self.constant * K_base * dists / (self.length_scales[b] ** 2)
+                gradients.append(grad_b)
+
+            # Gradient w.r.t. constant
+            grad_const = K
+            gradients.insert(0, grad_const)  # constant is first in hyperparameter list
+
+            gradient = np.stack(gradients, axis=2)
+            return K, gradient
+        else:
+            return K
+
+    def diag(self, X):
+        return np.full(X.shape[0], self.constant)
+
+    def is_stationary(self):
+        return True
+
+    def __repr__(self):
+        return (f"ScaledMultiBlockRBF(block_sizes={self.block_sizes}, "
+                f"length_scales={self.length_scales}, constant={self.constant})")
 
 class FeatureSliceKernel(Kernel):
     """Wrapper kernel that applies another kernel to a subset of features."""
@@ -91,14 +171,14 @@ class Adiabat(Surrogate):
     Adiabatic surface surrogate
     """
     def __init__(self, descriptor, kernel='RBF', nrestart=50,
-                                           hparam=[0.1, 0.1], groups=None):
+                                           hparam=[0.1, 0.1], blocks=None):
         super().__init__()
         if kernel == 'RBF':
             self.kernel = C(hparam[0]) * RBF(hparam[1], length_scale_bounds=(1, 1e3))
         elif kernel == 'WhiteNoise':
             self.kernel = C(hparam[0]) * RBF(hparam[1]) + WhiteKernel(
                                                 noise_level=hparam[2])
-        elif kernel == "anisotropic RBF":
+        elif kernel == "sum RBF":
 
             group_kernel = FeatureSliceKernel(RBF(length_scale=hparam[1],length_scale_bounds=(1e-3, 1e3)), groups[0])
             self.kernel = group_kernel
@@ -109,6 +189,10 @@ class Adiabat(Surrogate):
                     self.kernel += group_kernel
 
             self.kernel *= C(hparam[0])
+
+        elif kernel == "anisotropic RBF":
+            self.kernel = ScaledMultiBlockRBF(block_sizes=blocks, length_scales=hparam[1:], constant=hparam[0],
+                         length_scale_bounds=(1e0, 1e5), constant_bounds=(1e-5, 1e5) )
 
         else:
             print('Kernel: '+str(kernel)+' not recognized.')
