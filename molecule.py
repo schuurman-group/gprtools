@@ -447,9 +447,9 @@ class Trajectory():
                 self.st   = np.concatenate((self.st,
                           np.zeroes(self.nincr, dtype=int)))
                 self.xt   = np.concatenate((self.xt,
-                          np.zeroes((self.nincr,self.nc) dtype=float)))
+                          np.zeroes((self.nincr,self.nc), dtype=float)))
                 self.pt   = np.concatenate((self.pt,
-                          np.zeroes((self.nincr,self.nc) dtype=float)))
+                          np.zeroes((self.nincr,self.nc), dtype=float)))
 
             for key in values:
                 setfunc[key](values[key])

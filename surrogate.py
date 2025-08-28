@@ -55,9 +55,10 @@ class Adiabat(Surrogate):
     """
     Adiabatic surface surrogate
     """
-    def __init__(self, descriptor, kernel='RBF', nrestart=50,
+    def __init__(self, nstates, descriptor, kernel='RBF', nrestart=50,
                                            hparam=[0.1, 2]):
         super().__init__()
+
         if kernel == 'RBF':
             self.kernel = C(hparam[0]) * RBF(hparam[1], 
                                              length_scale_bounds=(1, 1e3))
@@ -68,74 +69,107 @@ class Adiabat(Surrogate):
             print('Kernel: '+str(kernel)+' not recognized.')
             os.abort()
 
+        self.nstates    = nstates
         self.descriptor = descriptor
-        self.model      = gpr.GPRegressor(
-                               kernel               = self.kernel,
-                               n_restarts_optimizer = nrestart,
-                               normalize_y          = True)
+        self.models     = [gpr.GPRegressor(
+                             kernel               = self.kernel,
+                             n_restarts_optimizer = nrestart,
+                             normalize_y          = True)]*self.nstates
 
     #
-    def create(self, data, hparam=None):
+    def create(self, data, states=[], hparam=None):
         """
         create a surrogate with training data, data
         """
+
+        # assumes energies for each state are in columns
+        nst = data[0].shape[0]
+        npt = data[0].shape[1]
+
+        # if states is not given, but the data is for all
+        # states, set the eval_states to be all states
+        if nst == self.nstates and len(states)==0:
+            eval_st = [i for i in range(self.nstates)]
+        else:
+            eval_st = states
+
+        if len(eval_st) != nst or max(eval_st) > self.nstates:
+            print('Cannot create surrogates for states: '+str(eval_st))
+            return None
+
+        # initialize the training and descriptor arrays
+        self.descriptors = [[]]*self.nstates
+        self.training    = [[]]*self.nstates
+
         # generate the descriptors for the data
-        self.descriptors = self.descriptor.generate(data[0])
-        self.training    = data[1]
+        self.descriptors = [[]]*self.nstates
+        for i in range(nst):
+            st = eval_st[i]
+            self.descriptors[st] = self.descriptor.generate(data[0][i,:,:])
+            self.training[st]    = data[1][i,:].copy()
+        
+        # generate the initial models
+        for st in eval_st:
+            if hparam is not None:
+                self.models[st].kernel_.theta = hparam[st]
 
-        if hparam is not None:
-            self.model.kernel_.theta = hparam
+            self.models[st].fit(self.descriptors[st], 
+                                self.training[st])
 
-        #scaler = preprocessing.StandardScaler().fit(self.descriptors)
-        #self.model.fit(scaler.transform(self.descriptors), 
-        #               self.training)        
-        self.model.fit(self.descriptors, 
-                       self.training)
-
-        return self.model.kernel_.theta
+        return [model.kernel_.theta for model in self.models]
 
     #
-    def update(self, data, hparam=None):
+    def update(self, data, states=[], hparam=None):
         """
         update the surrogate with additional data
         """
-        old_size = self.descriptors.shape[0]
-        new_size = data[0].shape[0]
-        d_size   = self.descriptors.shape[1]
-        t_size   = self.training.shape[1]
 
-        #print('old_size='+str(old_size))
-        #print('new_size='+str(new_size))
-        #print('d_size='+str(d_size))
-        #print('t_size='+str(t_size))
+        # assumes energies for each state are in columns
+        nst = data[0].shape[0]
+        npt = data[0].shape[1]
 
-        #print('data[0].shape='+str(data[0].shape))
-        #print('data[1].shape='+str(data[1].shape))
-        self.descriptors.resize((old_size + new_size, d_size))
-        self.training.resize((old_size + new_size, t_size))
+        # if states is not given, but the data is for all
+        # states, set the eval_states to be all states
+        if nst == self.nstates and len(states)==0:
+            eval_st = [i for i in range(self.nstates)]
+        else:
+            eval_st = states
 
-        self.descriptors[old_size:, :] = self.descriptor.generate(data[0])
-        self.training[old_size:, :]    = data[1]
+        if len(eval_st) != nst or max(eval_st) > self.nstates:
+            print('Cannot update surrogates for states: '+str(eval_st))
+            return None
 
-        if hparam is not None:
-            #print('hparam before, guess='+str(self.model.kernel_.theta)+','+str(hparam))
-            self.model.kernel_.theta = hparam
+        d_size    = self.descriptors[0].shape[1]
 
-        #scaler = preprocessing.StandardScaler().fit(self.descriptors)
-        #self.model.fit(scaler.transform(self.descriptors), 
-        #               self.training)
-        self.model.fit(self.descriptors, 
-                       self.training)
+        for i in range(nst):
+            st = eval_st[i]
 
-        return self.model.kernel_.theta
+            old = self.descriptors[st].shape[0]
+            new = data[0][i,:,:].shape[0]
+
+            self.descriptors[st].resize((old + new, d_size))
+            self.training[st].resize((old + new))
+
+            self.descriptors[st][old:, :] = self.descriptor.generate(data[0][i,:,:])
+            self.training[st][old:]       = data[1][i,:].copy()
+
+            if hparam is not None:
+                self.models[st].kernel_.theta = hparam[st]
+
+            self.models[st].fit(self.descriptors[st], 
+                                self.training[st])
+
+        return [model.kernel_.theta for model in self.models]
 
     #
     def load(self, model_name):
         """
         load a gpr model from file
         """
-        with open(str(model_name)+'.pkl', 'rb') as f:
-            self.model = pickle.load(f)
+        for i in range(self.nstates):
+            with open(str(model_name) + '_st' + str(i) 
+                                           + '.pkl', 'rb') as f:
+                self.models[i] = pickle.load(f)
 
     #
     def save(self, model_name):
@@ -143,8 +177,10 @@ class Adiabat(Surrogate):
         write a gpr model to file
         """
         # save the classifier
-        with open(str(model_name)+'.pkl', 'wb') as fid:
-            pickle.dump(self.model, fid)
+        for i in range(self.nstates):
+            with open(str(model_name) + '_st' + str(i) 
+                                         + '.pkl', 'wb') as fid:
+                pickle.dump(self.models[i], fid)
 
     #
     def evaluate(self, gms, states=None, std=False, cov=False):
@@ -152,27 +188,46 @@ class Adiabat(Surrogate):
         evaluate teh surrogate at gms
         """
 
+        # if no specific states are requested, return all state
+        # energies
+        if states == None:
+            eval_st = [i for i in range(self.nstates)]
+        else:
+            eval_st = states
+
         d_data    = self.descriptor.generate(gms)
-        eval_data =  self.model.predict( d_data,
-                                        return_std = std,
-                                        return_cov = cov)
+
+        # return as numpy array
+        eval_data = np.array([self.models[st].predict( d_data,
+                                             return_std = std,
+                                             return_cov = cov)
+                              for st in eval_st], dtype=float)
 
         ngm = gms.shape[0]
-        if isinstance(eval_data, tuple):
+        return eval_data
+
+        #if isinstance(eval_data, tuple):
             # reshape the output so that the energy array has dimensions
             # (ngm, nst), even if nst=1 for Adiabats
-            eners = np.reshape(eval_data[0], (ngm,1))
-            return eners, eval_data[1:]
-        else:
-            eners = np.reshape(eval_data, (ngm,1))
-            return eners
+        #    eners = np.reshape(eval_data[0], (ngm,1))
+        #    return eners, eval_data[1:]
+        #else:
+        #    eners = np.reshape(eval_data, (ngm,1))
+        #    return eners
 
     def gradient(self, gms, states=None):
         """
         evaluate the gradient using analytical expression
         """
-        d_data    = self.descriptor.generate(gms)
 
+        # if no specific states are requested, return all state
+        # energies
+        if states == None:
+            eval_st = [i for i in range(self.nstates)]
+        else:
+            eval_st = states
+
+        d_data   = self.descriptor.generate(gms)
         des_grad = self.descriptor.descriptor_gradient(gms, d_data)
 
         # print(des_grad.shape)
@@ -182,12 +237,15 @@ class Adiabat(Surrogate):
 
         # print(ng)
         # print(nc)
-        ana_grad = np.zeros((ng, 1, nc), dtype=float)
-        for i in range(ng):
-            grad, _  = self.model.predict_grad(d_data[i,: ].reshape(1, -1), compute_grad_var=False)
-            grad = np.dot(des_grad[i,: ], grad).squeeze()
-            ana_grad[i, :, :] = grad
-            # print(f"analytical gradient:\n{grad.shape}")
+        ana_grad = np.zeros((len(eval_st), ng, nc), dtype=float)
+        for st in eval_st:
+            for i in range(ng):
+                grad, _  = self.models[st].predict_grad(
+                                     d_data[i, :].reshape(1, -1), 
+                                     compute_grad_var=False)
+                grad = np.dot(des_grad[i,: ], grad).squeeze()
+                ana_grad[st, i, :] = grad
+               # print(f"analytical gradient:\n{grad.shape}")
 
         return ana_grad
 
@@ -197,31 +255,38 @@ class Adiabat(Surrogate):
         evaluate the gradient of the surrogate at gms
         """
 
+        # if no specific states are requested, return all state
+        # energies
+        if states == None:
+            eval_st = [i for i in range(self.nstates)]
+        else:
+            eval_st = states
+
         delta = 0.001
         ng    = gms.shape[0]
         nc    = gms.shape[1]
-        grads = np.zeros((ng, 1, nc), dtype=float)
+        grads = np.zeros((len(eval_st), ng, nc), dtype=float)
 
-        o_ener    = self.evaluate(gms)
+        o_ener    = self.evaluate(gms, eval_st)
         for i in range(ng):
 
-            origin = np.tile(gms[i,:], (nc, 1))
+            origin = np.tile(gms[i,:], (len(eval_st), nc))
 
             disps   = origin + np.diag(np.array([delta]*nc))
-            p_ener  = self.evaluate(disps)
+            p_ener  = self.evaluate(disps, states=eval_st)
 
             disps   = origin + 2. * np.diag(np.array([delta]*nc))
-            p2_ener = self.evaluate(disps)
+            p2_ener = self.evaluate(disps, states=eval_st)
 
             disps   = origin - np.diag(np.array([delta]*nc))
-            m_ener  = self.evaluate(disps)
+            m_ener  = self.evaluate(disps, states=eval_st)
 
             disps   = origin - 2. * np.diag(np.array([delta]*nc))
-            m2_ener = self.evaluate(disps)
+            m2_ener = self.evaluate(disps, states=eval_st)
 
             grad = (-p2_ener + 8*p_ener - 8*m_ener + m2_ener ) / (12.*delta)
 
-            grads[i, :, :] = grad.T
+            grads[:, i, :] = grad.T
 
         return grads
 
@@ -231,27 +296,34 @@ class Adiabat(Surrogate):
         compute the hessian by gradient differences
         """
 
+        # if no specific states are requested, return all state
+        # energies
+        if states == None:
+            eval_st = [i for i in range(self.nstates)]
+        else:
+            eval_st = states
+
         delta   = 0.0001
-        np      = gms.shape[0]
+        ng      = gms.shape[0]
         nc      = gms.shape[1]
-        hessall = np.zeros((np, nc, nc), dtype=float)
+        hessall = np.zeros((len(eval_st), ng, nc, nc), dtype=float)
 
-        for i in range(np):
+        for i in range(ng):
 
-            origin = np.tile(gms[i,:], (nc, 1))
+            origin = np.tile(gms[i,:], (len(eval_st), nc))
 
             disps   = origin + np.diag(np.array([delta]*nc))
-            p_grad  = self.gradient(disps)
+            p_grad  = self.gradient(disps, states=eval_st)
 
             disps   = origin - np.diag(np.array([delta]*nc))
-            m_grad  = self.evaluate(disps)
+            m_grad  = self.evaluate(disps, states=eval_st)
 
             hess    = (p_grad - m_grad ) / (2.*delta)
 
             hess += hess.T
             hess *= 0.5
 
-            hessall[i,:,:] = hess
+            hessall[:, i, :, :] = hess
 
         return hessall
 

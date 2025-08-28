@@ -23,13 +23,13 @@ class SingleState(Dynamics):
     Propagate a trajectory in a single electronic state, while
     periodically checking the accuracy of the underlying suface
     """
-    def __init__(self, grad_func=None):
+    def __init__(self, surrogate=None):
         super().__init__()
 
-        self.grad = grad_func
+        self.surrogate = surrogate
         # mass of each coordinate
-        self.m    = None
-        self.nc   = None
+        self.m        = None
+        self.nc       = None
 
     #
     def propagate(self, traj, dt, tols=None, chk_func=None, chk_thresh=None):
@@ -49,8 +49,6 @@ class SingleState(Dynamics):
         update      = False
         failed      = False
         chk_vals    = []
-
-        print('shape of grad training = '+str(self.grad.training.shape))
 
        # propagate outer loop until final itme reached,
         # or we need to update our surface
@@ -105,7 +103,7 @@ class SingleState(Dynamics):
         # evaluate the gradient of the potential at y.x,
         # -grad = F = ma
         gm   = np.array([y[:self.nc]])
-        grad = self.grad.gradient(gm, states=[0])
+        grad = self.surrogate.gradient(gm, states=[0])
         vel  = y[self.nc:] / self.m
 
         # dx/dt = v = p/m
@@ -122,15 +120,15 @@ class FSSH(Dynamics):
     Perform a FSSH propagation, periodically checking the accuracy
     of the surface being propagated on
     """
-    def __init__(self, nstates, grad_func=None, coup_func=None):
+    def __init__(self, nstates, surrogate=None, surface=None):
         super().__init__()
 
-        self.ns    = nstates
-        self.grad  = grad_func
-        self.coup  = coup_func
-        self.m     = None
-        self.state = None
-        self.nc    = None
+        self.ns        = nstates
+        self.surrogate = surrogate
+        self.surface   = surface
+        self.m         = None
+        self.state     = None
+        self.nc        = None
 
     #
     def propagate(self, traj, dt, tols=None, chk_func=None, chk_thresh=None):
@@ -232,7 +230,7 @@ class FSSH(Dynamics):
         # evaluate the gradient of the potential at y.x,
         # -grad = F = ma
         gm   = np.array([y[:self.nc].real])
-        grad = self.grad.gradient(gm, states=[self.state])
+        grad = self.surrogate.gradient(gm, states=[self.state])
         vel  = y[self.nc:2*self.nc] / self.m
 
         # dx/dt = v = p/m
@@ -246,7 +244,7 @@ class FSSH(Dynamics):
             all_states = [i for i in range(self.ns)]
             dm = y[2*self.nc: ].reshape(self.ns, self.ns)
 
-            ener = self.grad.evaluate(gm, states=all_states)
+            ener = self.surface.evaluate(gm, states=all_states)
             ddmdt = self.propagate_dm(dm, gm, ener, vel)
             dely[2*self.nc:] = ddmdt.ravel()
 
@@ -288,8 +286,8 @@ class FSSH(Dynamics):
 
         gm  = np.array([x])
         pair = [s, snew]
-        nac  = self.coup.coupling(gm, [pair])[0]
-        ener = self.grad.evaluate(gm, states=pair)[0]
+        nac  = self.surface.coupling(gm, [pair])[0]
+        ener = self.surface.evaluate(gm, states=pair)[0]
 
         # now we solve for the momentum adjustment that conserves
         # the total energy
@@ -331,7 +329,7 @@ class FSSH(Dynamics):
         """
         tdcm  = np.zeros((self.ns, self.ns), dtype=complex)
         pairs = [[i,j] for i in range(self.ns) for j in range(i)]
-        nac   = self.coup.coupling(gm, pairs)
+        nac   = self.surface.coupling(gm, pairs)
 
         # compute the time-derivative coupling
         for ind in range(len(pairs)):
