@@ -130,9 +130,9 @@ class Geometry():
                          self.atms[i].capitalize()] * constants.amu2au
                                             for i in range(self.natm)]
         # mass vector, length 3N
-        mtmp        = [[self.masses[i]]*3 
+        mtmp        = [[self.masses[i]]*3
                         for i in range(len(self.masses))]
-        self._mvec  = np.array(list(chain.from_iterable(mtmp)), 
+        self._mvec  = np.array(list(chain.from_iterable(mtmp)),
                                dtype=float)
 
     #
@@ -147,12 +147,12 @@ class Geometry():
         self.qx      = self.gen_qx(self.x)
         self.qp      = self.gen_qp(self.x, self.p)
 
-    # 
+    #
     def read_hessian(self, hess_file):
         """
         read a hessian matrix, assumes un-mass-weighted
         """
-       
+
         with open(hess_file, 'r') as f:
             hess = f.readlines()
 
@@ -167,7 +167,7 @@ class Geometry():
 
         self.hessian = np.zeros((nr,nc), dtype=float)
         for i in range(nr):
-            self.hessian[i,:] = np.array(hess[i].strip().split(), 
+            self.hessian[i,:] = np.array(hess[i].strip().split(),
                                          dtype=float)
 
         if self.c2int is not None:
@@ -192,7 +192,7 @@ class Geometry():
 
         def update_hess(hess):
             self.hessian  = hess
-  
+
             if self.c2int is not None:
                 self.qhess = self.c2int.cart2inth(self.x, self.hessian)
 
@@ -212,7 +212,7 @@ class Geometry():
         if var in setfunc:
             setfunc[var](value)
         else:
-            print('WARNING: variable ' + str(var) + 
+            print('WARNING: variable ' + str(var) +
                   ' cannot be set in Geometry.')
 
     #
@@ -275,7 +275,7 @@ class Geometry():
             return None, None
 
         # for mass-weighted hessian
-        invmass = np.asarray([1./ np.sqrt(self._mvec[i]) 
+        invmass = np.asarray([1./ np.sqrt(self._mvec[i])
                     for i in range(self._mvec.shape[0])], dtype=float)
         mw_hess = np.diag(invmass) @ self.hessian @ np.diag(invmass)
         evals, evecs = np.linalg.eigh(mw_hess)
@@ -328,14 +328,14 @@ class Trajectory():
         """
         return self.xt[:self.cnt,:]
 
-    # 
+    #
     def qx(self):
         """
         return position in internal coordinates, if defined
         """
         return self.geom.gen_qx(self.x())
-    
-    # 
+
+    #
     def p(self):
         """
         return the classical momentum
@@ -442,18 +442,17 @@ class Trajectory():
             self.cnt += 1
             # grow the arrays by nincr
             if self.cnt == self.time.shape[0]:
-                self.time = np.concatenate((self.time, 
-                          np.zeroes(self.nincr, dtype=float)))
+                self.time = np.concatenate((self.time,
+                          np.zeros(self.nincr, dtype=float)))
                 self.st   = np.concatenate((self.st,
-                          np.zeroes(self.nincr, dtype=int)))
+                          np.zeros(self.nincr, dtype=int)))
                 self.xt   = np.concatenate((self.xt,
-                          np.zeroes((self.nincr,self.nc), dtype=float)))
+                          np.zeros((self.nincr,self.nc), dtype=float)))
                 self.pt   = np.concatenate((self.pt,
-                          np.zeroes((self.nincr,self.nc), dtype=float)))
+                          np.zeros((self.nincr,self.nc), dtype=float)))
 
             for key in values:
                 setfunc[key](values[key])
         else:
             print('WARNING: variable ' + str(values.keys()) +
                   ' cannot be set in Trajectory.')
-
