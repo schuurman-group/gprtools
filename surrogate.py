@@ -7,6 +7,7 @@ import numpy as np
 import pickle as pickle
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
 from sklearn import preprocessing
+from sklearn.gaussian_process import GaussianProcessRegressor
 import gpr as gpr
 
 class Surrogate(ABC):
@@ -60,8 +61,9 @@ class Adiabat(Surrogate):
         super().__init__()
 
         if kernel == 'RBF':
-            self.kernel = C(hparam[0]) * RBF(hparam[1], 
-                                             length_scale_bounds=(1, 1e3))
+            #self.kernel = C(hparam[0]) * RBF(hparam[1], 
+            #                                 length_scale_bounds=(0.1, 1e3))
+            self.kernel = C(hparam[0]) * RBF(hparam[1])
         elif kernel == 'WhiteNoise':
             self.kernel = C(hparam[0]) * RBF(hparam[1]) + WhiteKernel(
                                                 noise_level=hparam[2])
@@ -69,12 +71,15 @@ class Adiabat(Surrogate):
             print('Kernel: '+str(kernel)+' not recognized.')
             os.abort()
 
+        #print('self.kernel='+str(self.kernel))
         self.nstates    = nstates
         self.descriptor = descriptor
-        self.models     = [gpr.GPRegressor(
+        self.models     = []
+        for i in range(self.nstates):
+            self.models.append(gpr.GPRegressor(
                              kernel               = self.kernel,
                              n_restarts_optimizer = nrestart,
-                             normalize_y          = True)]*self.nstates
+                             normalize_y          = True))
 
     #
     def create(self, data, states=[], hparam=None):
@@ -107,11 +112,11 @@ class Adiabat(Surrogate):
             st = eval_st[i]
             self.descriptors[st] = self.descriptor.generate(data[0][i,:,:])
             self.training[st]    = data[1][i,:].copy()
-        
+
         # generate the initial models
         for st in eval_st:
-            if hparam is not None:
-                self.models[st].kernel_.theta = hparam[st]
+            #if hparam is not None:
+            #    self.models[st].kernel.theta = hparam[st]
 
             self.models[st].fit(self.descriptors[st], 
                                 self.training[st])
@@ -154,7 +159,7 @@ class Adiabat(Surrogate):
             self.training[st][old:]       = data[1][i,:].copy()
 
             if hparam is not None:
-                self.models[st].kernel_.theta = hparam[st]
+                self.models[st].kernel.theta = hparam[st]
 
             self.models[st].fit(self.descriptors[st], 
                                 self.training[st])
@@ -238,13 +243,14 @@ class Adiabat(Surrogate):
         # print(ng)
         # print(nc)
         ana_grad = np.zeros((len(eval_st), ng, nc), dtype=float)
-        for st in eval_st:
-            for i in range(ng):
+        for i in range(len(eval_st)):
+            st = eval_st[i]
+            for j in range(ng):
                 grad, _  = self.models[st].predict_grad(
-                                     d_data[i, :].reshape(1, -1), 
+                                     d_data[j, :].reshape(1, -1), 
                                      compute_grad_var=False)
-                grad = np.dot(des_grad[i,: ], grad).squeeze()
-                ana_grad[st, i, :] = grad
+                grad = np.dot(des_grad[j,: ], grad).squeeze()
+                ana_grad[i, j, :] = grad
                # print(f"analytical gradient:\n{grad.shape}")
 
         return ana_grad

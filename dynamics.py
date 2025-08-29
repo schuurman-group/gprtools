@@ -50,7 +50,7 @@ class SingleState(Dynamics):
         failed      = False
         chk_vals    = []
 
-       # propagate outer loop until final itme reached,
+        # propagate outer loop until final itme reached,
         # or we need to update our surface
         while traj.t() < (t0+dt-0.2*max_step) and not (update or failed):
             # when we change states, we reinitialize the
@@ -244,7 +244,8 @@ class FSSH(Dynamics):
             all_states = [i for i in range(self.ns)]
             dm = y[2*self.nc: ].reshape(self.ns, self.ns)
 
-            ener = self.surface.evaluate(gm, states=all_states)
+            ener = self.surface.evaluate(gm, 
+                                         states=all_states).flatten()
             ddmdt = self.propagate_dm(dm, gm, ener, vel)
             dely[2*self.nc:] = ddmdt.ravel()
 
@@ -287,7 +288,7 @@ class FSSH(Dynamics):
         gm  = np.array([x])
         pair = [s, snew]
         nac  = self.surface.coupling(gm, [pair])[0]
-        ener = self.surface.evaluate(gm, states=pair)[0]
+        ener = self.surface.evaluate(gm, states=pair).flatten()
 
         # now we solve for the momentum adjustment that conserves
         # the total energy
