@@ -444,7 +444,11 @@ class Trajectory():
         # evaluate the gradient of the potential at y.x,
         # -grad = F = ma
         gm   = np.array([y[:self.nc].real])
-        grad = self.surface.gradient(gm, states=[self.state])
+        if False:
+            grad = self.surface.gradient(gm, states=[self.state])
+        else: # using numerical gradient for anisotropic kernel
+            grad = self.surface.numerical_gradient(gm, states=[self.state])
+
         vel  = y[self.nc:2*self.nc] / self.m
 
         # dx/dt = v = p/m
