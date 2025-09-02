@@ -45,6 +45,7 @@ class SingleState(Dynamics):
         self.m      = traj.m()
         self.nc     = traj.nc
         t0          = traj.t()
+        self.state  = traj.state()
         max_step    = 30.
         update      = False
         failed      = False
@@ -103,7 +104,7 @@ class SingleState(Dynamics):
         # evaluate the gradient of the potential at y.x,
         # -grad = F = ma
         gm   = np.array([y[:self.nc]])
-        grad = self.surrogate.gradient(gm, states=[0])
+        grad = self.surrogate.gradient(gm, states=[self.state])
         vel  = y[self.nc:] / self.m
 
         # dx/dt = v = p/m
@@ -204,7 +205,8 @@ class FSSH(Dynamics):
                            'p': propagator.y[self.nc:2*self.nc].real}
                 traj.update(tupdate)
                 self.state = traj.state()
-
+                print(f"state:{self.state}")
+                print(f"time:{traj.t()/41.334}")
                 propagator.step()
 
             # if we got here because the propagator failed not b/c
@@ -244,7 +246,7 @@ class FSSH(Dynamics):
             all_states = [i for i in range(self.ns)]
             dm = y[2*self.nc: ].reshape(self.ns, self.ns)
 
-            ener = self.surface.evaluate(gm, 
+            ener = self.surface.evaluate(gm,
                                          states=all_states).flatten()
             ddmdt = self.propagate_dm(dm, gm, ener, vel)
             dely[2*self.nc:] = ddmdt.ravel()
@@ -263,7 +265,7 @@ class FSSH(Dynamics):
         pop    = np.diag(dm)
         t_prob = np.array([max(0., dt*b[j, s]/pop[s])
                             for j in range(self.ns)])
-        t_prob[s] = 0.
+        # t_prob[s] = 0.
 
         # check whether or not to hop
         r    = np.random.uniform()
@@ -272,10 +274,12 @@ class FSSH(Dynamics):
         while st < self.ns:
             prob += t_prob[int(st)]
             if r < prob:
-                return st
+                return int(st)
             st += 1
-
-        return s
+        print(f"r:{r}")
+        print(f"prob:{prob}")
+        print(f"prop:{pop}")
+        return int(s)
 
     #
     def scale_momentum(self, x, p, s, snew):
@@ -286,17 +290,19 @@ class FSSH(Dynamics):
         """
 
         gm  = np.array([x])
-        pair = [s, snew]
-        nac  = self.surface.coupling(gm, [pair])[0]
+        pair = [int(s), int(snew)]
+        nac  = self.surface.coupling(gm, [pair])[0].squeeze()
         ener = self.surface.evaluate(gm, states=pair).flatten()
 
         # now we solve for the momentum adjustment that conserves
         # the total energy
-        a = 0.5 * (nac*nac) / self.m
-        b = np.dot(p, nac)
+        a = 0.5 * np.dot(nac/self.m, nac)
+        b = np.dot(p/self.m, nac)
         c = ener[1] - ener[0]
 
         delta = b**2 - 4*a*c
+
+        print(f"delta:{delta.shape}")
 
         # if discriminant less than zero: frustrated hop,
         # no adjustment that conserves energy
@@ -317,9 +323,10 @@ class FSSH(Dynamics):
         """
         propagate the state density matrix
         """
-        dMdt  = np.zeros((self.ns, self.ns), dtype=complex)
+        dDMdt  = np.zeros((self.ns, self.ns), dtype=complex)
         dR    = -1j*np.diag(ener) - self.tdcm(gm, vel)
-        dDMdt = dR@DM - DM@dR
+        dDMdt += dR@DM
+        dDMdt -= DM@dR
 
         return dDMdt
 
@@ -330,6 +337,7 @@ class FSSH(Dynamics):
         """
         tdcm  = np.zeros((self.ns, self.ns), dtype=complex)
         pairs = [[i,j] for i in range(self.ns) for j in range(i)]
+
         nac   = self.surface.coupling(gm, pairs)
 
         # compute the time-derivative coupling
@@ -337,5 +345,5 @@ class FSSH(Dynamics):
             i,j       =  pairs[ind][0],pairs[ind][1]
             tdcm[i,j] =  np.dot(vel, nac[ind].squeeze())
             tdcm[j,i] = -tdcm[i,j]
-
+        # print(f'tdcm:{tdcm}')
         return tdcm

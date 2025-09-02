@@ -741,7 +741,7 @@ class ChemPotPy(Surface):
             for j in range(natm):
                 gm  = self._chempotpygeom(gms[i,:] / self.gconv)
                 cppsurf = chempotpy.pg(self.molecule, self.surface, gm)
-                hessian[:,i,:,:] = np.reshape(cppsurf[1][[states]], 
+                hessian[:,i,:,:] = np.reshape(cppsurf[1][[states]],
                                                    (nst, 3*nat, 3*nat))
 
         return hessian
@@ -764,7 +764,7 @@ class ChemPotPy(Surface):
             for j in range(npair):
                 nacs[j,i,:] = cppsurf[2][pairs[j][0], pairs[j][1],:].ravel()
 
-        nacs    *= (self.econv / self.gconv)
+        nacs  /= self.gconv
 
         return nacs
 

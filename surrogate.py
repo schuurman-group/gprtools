@@ -61,9 +61,9 @@ class Adiabat(Surrogate):
         super().__init__()
 
         if kernel == 'RBF':
-            #self.kernel = C(hparam[0]) * RBF(hparam[1], 
-            #                                 length_scale_bounds=(0.1, 1e3))
-            self.kernel = C(hparam[0]) * RBF(hparam[1])
+            self.kernel = C(hparam[0]) * RBF(hparam[1],
+                                            length_scale_bounds=(1, 1e3))
+            # self.kernel = C(hparam[0]) * RBF(hparam[1])
         elif kernel == 'WhiteNoise':
             self.kernel = C(hparam[0]) * RBF(hparam[1]) + WhiteKernel(
                                                 noise_level=hparam[2])
@@ -118,7 +118,7 @@ class Adiabat(Surrogate):
             #if hparam is not None:
             #    self.models[st].kernel.theta = hparam[st]
 
-            self.models[st].fit(self.descriptors[st], 
+            self.models[st].fit(self.descriptors[st],
                                 self.training[st])
 
         return [model.kernel_.theta for model in self.models]
@@ -161,7 +161,7 @@ class Adiabat(Surrogate):
             if hparam is not None:
                 self.models[st].kernel.theta = hparam[st]
 
-            self.models[st].fit(self.descriptors[st], 
+            self.models[st].fit(self.descriptors[st],
                                 self.training[st])
 
         return [model.kernel_.theta for model in self.models]
@@ -172,7 +172,7 @@ class Adiabat(Surrogate):
         load a gpr model from file
         """
         for i in range(self.nstates):
-            with open(str(model_name) + '_st' + str(i) 
+            with open(str(model_name) + '_st' + str(i)
                                            + '.pkl', 'rb') as f:
                 self.models[i] = pickle.load(f)
 
@@ -183,7 +183,7 @@ class Adiabat(Surrogate):
         """
         # save the classifier
         for i in range(self.nstates):
-            with open(str(model_name) + '_st' + str(i) 
+            with open(str(model_name) + '_st' + str(i)
                                          + '.pkl', 'wb') as fid:
                 pickle.dump(self.models[i], fid)
 
@@ -247,7 +247,7 @@ class Adiabat(Surrogate):
             st = eval_st[i]
             for j in range(ng):
                 grad, _  = self.models[st].predict_grad(
-                                     d_data[j, :].reshape(1, -1), 
+                                     d_data[j, :].reshape(1, -1),
                                      compute_grad_var=False)
                 grad = np.dot(des_grad[j,: ], grad).squeeze()
                 ana_grad[i, j, :] = grad
