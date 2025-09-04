@@ -205,8 +205,8 @@ class FSSH(Dynamics):
                            'p': propagator.y[self.nc:2*self.nc].real}
                 traj.update(tupdate)
                 self.state = traj.state()
-                print(f"state:{self.state}")
-                print(f"time:{traj.t()/41.334}")
+                # print(f"state:{self.state}")
+                # print(f"time:{traj.t()/41.334}")
                 propagator.step()
 
             # if we got here because the propagator failed not b/c
@@ -265,7 +265,7 @@ class FSSH(Dynamics):
         pop    = np.diag(dm)
         t_prob = np.array([max(0., dt*b[j, s]/pop[s])
                             for j in range(self.ns)])
-        # t_prob[s] = 0.
+        t_prob[s] = 0.
 
         # check whether or not to hop
         r    = np.random.uniform()
@@ -276,9 +276,6 @@ class FSSH(Dynamics):
             if r < prob:
                 return int(st)
             st += 1
-        print(f"r:{r}")
-        print(f"prob:{prob}")
-        print(f"prop:{pop}")
         return int(s)
 
     #
@@ -302,7 +299,7 @@ class FSSH(Dynamics):
 
         delta = b**2 - 4*a*c
 
-        print(f"delta:{delta.shape}")
+        # print(f"delta:{delta}")
 
         # if discriminant less than zero: frustrated hop,
         # no adjustment that conserves energy
@@ -314,7 +311,10 @@ class FSSH(Dynamics):
         else:
             gamma = (-b + np.sign(b)*np.sqrt(delta))/(2*a)
 
-        delta_p = gamma * nac / self.m
+        delta_p = gamma * nac
+
+        print(f"delta p:{delta_p}")
+
 
         return delta_p
 

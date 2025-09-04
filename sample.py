@@ -10,14 +10,14 @@ class Sample(ABC):
 
     def __init__(self):
         super().__init__()
-    
+
     @abstractmethod
     def sample(self):
         pass
 
 class Wigner(Sample):
     """
-    Generate position and momenta drawn from a 
+    Generate position and momenta drawn from a
     Wigner distribution. Currently only works in cartesian
     coordinates
     """
@@ -28,15 +28,16 @@ class Wigner(Sample):
         if self.crd == 'cart':
             self.dim = ref_gm.x.shape[0]
         elif self.crd == 'intc':
-            print('Wigner sampling not currently implemented ' + 
+            print('Wigner sampling not currently implemented ' +
                   'for internal coordinates')
             os.abort()
-        else: 
+        else:
             print('crd='+str(crd)+' not recognized. Exiting...')
-            os.abort() 
+            os.abort()
 
-        self.ref_gm = ref_gm 
-        rseed       = np.random.default_rng(seed=seed)
+        self.ref_gm = ref_gm
+        np.random.seed(seed)  # set  seed for reproducibility
+
 
     #
     def update_origin(self, ref_gm):
@@ -57,7 +58,7 @@ class Wigner(Sample):
 
         if np.any([omega])== None or np.any([modes]) == None:
             return None
-        
+
         alpha = 0.5*omega
         sigma_x = np.sqrt(0.25 / alpha)
         sigma_p = np.sqrt(alpha)
@@ -96,8 +97,8 @@ class Wigner(Sample):
                         dist_p[ipass,:] = np.dot(modes, dp) * np.sqrt(masses)
 
                 if ipass < nsample:
-                    dx = np.random.normal(0., sigma_x, (nsample, nc))
-                    dp = np.random.normal(0., sigma_p, (nsample, nc))
+                    dx = self.rseed.normal(0., sigma_x, (nsample, nc))
+                    dp = self.rseed.normal(0., sigma_p, (nsample, nc))
 
             dist_x += self.ref_gm.x
             dist_p += self.ref_gm.p
@@ -141,7 +142,7 @@ class LHS(Sample):
                                       optimization = None,
                                       seed = rseed)
 
-    # 
+    #
     def update_origin(self, ref_gm):
         """
         update the ref_gm object
@@ -155,7 +156,7 @@ class LHS(Sample):
         in the negative/positive directions by scale[0]/scale[1]
         """
         d = [-1., 1.]
-        return np.array([disp*scale[i]*d[i] 
+        return np.array([disp*scale[i]*d[i]
                                for i in range(2)], dtype=float).T
 
     #
@@ -170,19 +171,19 @@ class LHS(Sample):
         # rescale points to the approproate bounds
         rnge = np.array([(bounds[i,1] - bounds[i,0])
                           for i in range(self.dim)], dtype=float)
-        # disps is the displacements in internal coordinates 
+        # disps is the displacements in internal coordinates
         # shape = [npts, ncoords]
         disps = bounds[:,0] + pts * rnge
 
-        # if cartesian is True and the displacements are in 
+        # if cartesian is True and the displacements are in
         # internals, convert to cartesians
         gms = None
         nd  = disps.shape[0]
         if self.crd == 'intc':
             if cartesian:
-                cdisps, fail = self.ref_gm.c2int.dint2cart(self.ref_gm.x, 
+                cdisps, fail = self.ref_gm.c2int.dint2cart(self.ref_gm.x,
                                                                   disps)
-                gms = self.ref_gm.x + cdisps[list(set([i for i in 
+                gms = self.ref_gm.x + cdisps[list(set([i for i in
                                                range(nd)]) - set(fail))]
             else:
                 gms = self.ref_gm.qx + disps
@@ -191,5 +192,3 @@ class LHS(Sample):
 
         # return the geometries
         return gms
-
-

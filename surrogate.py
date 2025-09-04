@@ -152,6 +152,8 @@ class Adiabat(Surrogate):
             old = self.descriptors[st].shape[0]
             new = data[0][i,:,:].shape[0]
 
+            print(f"Update surrogate: state {st}, training data size={old+new}")
+
             self.descriptors[st].resize((old + new, d_size))
             self.training[st].resize((old + new))
 
@@ -163,7 +165,7 @@ class Adiabat(Surrogate):
 
             self.models[st].fit(self.descriptors[st],
                                 self.training[st])
-
+        print(f"Update surrogate: training data size={old+new}")
         return [model.kernel_.theta for model in self.models]
 
     #
@@ -302,34 +304,41 @@ class Adiabat(Surrogate):
         compute the hessian by gradient differences
         """
 
-        # if no specific states are requested, return all state
-        # energies
-        if states == None:
-            eval_st = [i for i in range(self.nstates)]
+        if states is None:
+            eval_st = list(range(self.nstates))
         else:
             eval_st = states
 
-        delta   = 0.0001
-        ng      = gms.shape[0]
-        nc      = gms.shape[1]
-        hessall = np.zeros((len(eval_st), ng, nc, nc), dtype=float)
+        delta = 1e-4
+        ng = gms.shape[0]  # number of geometries
+        nc = gms.shape[1]  # number of coordinates
+        nstates = len(eval_st)
+
+        hessall = np.zeros((nstates, ng, nc, nc), dtype=float)
 
         for i in range(ng):
+            # gms[i,:] shape: (nc,)
+            for k in range(nc):
+                # Prepare displaced geometries for plus and minus displacement
+                disp_plus = np.array(gms[i,:], copy=True)
+                disp_minus = np.array(gms[i,:], copy=True)
 
-            origin = np.tile(gms[i,:], (len(eval_st), nc))
+                disp_plus[k] += delta
+                disp_minus[k] -= delta
 
-            disps   = origin + np.diag(np.array([delta]*nc))
-            p_grad  = self.gradient(disps, states=eval_st)
+                # Get gradients at displaced points for all eval_st states
+                # Assuming self.gradient returns shape: (nstates, nc)
+                p_grad = self.gradient(disp_plus.reshape(1, -1), states=eval_st)  # shape (nstates, nc)
+                m_grad = self.gradient(disp_minus.reshape(1, -1), states=eval_st)  # shape (nstates, nc)
 
-            disps   = origin - np.diag(np.array([delta]*nc))
-            m_grad  = self.evaluate(disps, states=eval_st)
+                # Central difference to approximate second derivative w.r.t coordinate k
+                # For each state, calculate second derivative matrix element for k-th column
+                # hessall[:, i, :, k] = (p_grad - m_grad) / (2 * delta)
+                hessall[:, i, :, k] = (p_grad - m_grad) / (2 * delta)
 
-            hess    = (p_grad - m_grad ) / (2.*delta)
-
-            hess += hess.T
-            hess *= 0.5
-
-            hessall[:, i, :, :] = hess
+            # Symmetrize Hessian for each state and geometry
+            for s in range(nstates):
+                hessall[s, i] = 0.5 * (hessall[s, i] + hessall[s, i].T)
 
         return hessall
 
