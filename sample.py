@@ -5,6 +5,7 @@ import os as os
 import numpy as np
 from abc import ABC, abstractmethod
 from scipy.stats import qmc
+import constants
 
 class Sample(ABC):
 
@@ -47,11 +48,28 @@ class Wigner(Sample):
         self.ref_gm = ref_gm
 
     #
-    def sample(self, nsample, bounds=None, cartesian=True):
+    def sample(self, nsample, T=0., bounds=None, cartesian=True):
         """
-        Sample Wigner distribution
+        Sample Wigner distribution.
+
+        If T == 0, sample the ground vibrational state, with a Wigner
+        function given by:
+
+        rho(x,p)=exp[ -2 * alpha(x-x0)^2 -((p-p_0)^2)/ (2* alpha)
+
+        where x,p are position,momentum and alpha is mu*omega/2.
+        However, this routine currently assumes sampling is in normal
+        modes, where are weighted by sqrt(mu), so alpha is simply
+        omega/2.
+
+        If the tepmerature, T, is not zero, than alpha_x is given
+        by:
+        alpha = (omega/2)*Tanh(Beta*omega/2) where Beta=1/(KbT)
+
+        T is in degrees K.
         """
 
+        machine_reg  = 1.e-16 # regularizatio for finite temperature
         masses       = self.ref_gm._mvec
         omega, modes = self.ref_gm.freq()
         nc = omega.shape[0]
@@ -60,6 +78,8 @@ class Wigner(Sample):
             return None
 
         alpha = 0.5*omega
+        alpha *= np.tanh(omega / (2 * constants.kB * T + machine_reg))
+
         sigma_x = np.sqrt(0.25 / alpha)
         sigma_p = np.sqrt(alpha)
 
