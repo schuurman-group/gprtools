@@ -316,6 +316,16 @@ class Trajectory():
         self.st[self.cnt]    = state
 
     #
+    def current_geom(self):
+        """
+        return a geom object updated to be the current
+        position and momentum
+        """
+        cgeom = self.geom.copy()
+        cgeom.set({'x':self.x(), 'p':self.p()})
+        return cgeom
+
+    #
     def x(self):
         """
         return the classical energy of the trajectory
