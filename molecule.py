@@ -322,7 +322,8 @@ class Trajectory():
         position and momentum
         """
         cgeom = self.geom.copy()
-        cgeom.set({'x':self.x(), 'p':self.p()})
+        cgeom.set('x', self.x())
+        cgeom.set('p', self.p())
         return cgeom
 
     #
