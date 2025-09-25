@@ -18,6 +18,18 @@ class GPRegressor(GaussianProcessRegressor):
         """
         super().__init__(**kwargs)
 
+        def _constrained_optimization(self, obj_func, initial_theta, bounds):
+            def new_optimizer(obj_func, initial_theta, bounds):
+                return scipy.optimize.minimize(
+                    obj_func,
+                    initial_theta,
+                    method="L-BFGS-B",
+                    jac=True,
+                    bounds=bounds,
+                    max_iter=25000)
+            self.optimizer = new_optimizer
+            return super()._constrained_optimization(obj_func, initial_theta, bounds)
+
     def _cal_kernel_gradient(self, X):
         """
         calculate kernel gradient (dk*/dx*) based on the give model

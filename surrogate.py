@@ -40,7 +40,7 @@ class Surrogate(ABC):
         pass
 
     @abstractmethod
-    def numerical_gradient(self):
+    def num_gradient(self):
         pass
 
     @abstractmethod
@@ -62,7 +62,7 @@ class Adiabat(Surrogate):
 
         if kernel == 'RBF':
             self.kernel = C(hparam[0]) * RBF(hparam[1],
-                                            length_scale_bounds=(1, 1e3))
+                                            length_scale_bounds=(5, 1e3))
             # self.kernel = C(hparam[0]) * RBF(hparam[1])
         elif kernel == 'WhiteNoise':
             self.kernel = C(hparam[0]) * RBF(hparam[1]) + WhiteKernel(
@@ -76,10 +76,12 @@ class Adiabat(Surrogate):
         self.descriptor = descriptor
         self.models     = []
         for i in range(self.nstates):
-            self.models.append(gpr.GPRegressor(
+            gpregress = gpr.GPRegressor(
                              kernel               = self.kernel,
                              n_restarts_optimizer = nrestart,
-                             normalize_y          = True))
+                             normalize_y          = True,
+                             optimizer            = 'fmin_l_bfgs_b')
+            self.models.append(gpregress)
 
     #
     def create(self, data, states=[], hparam=None):
@@ -115,13 +117,16 @@ class Adiabat(Surrogate):
 
         # generate the initial models
         for st in eval_st:
-            #if hparam is not None:
-            #    self.models[st].kernel.theta = hparam[st]
-
+            if hparam is not None:
+                self.models[st].kernel.theta = hparam[st]
+            #scaler = preprocessing.StandardScaler()
+            #xscaled = scaler.fit_transform(self.descriptors[st])
+            #self.models[st].fit(xscaled,
+            #                    self.training[st])
             self.models[st].fit(self.descriptors[st],
                                 self.training[st])
 
-        return [model.kernel_.theta for model in self.models]
+        return [model.kernel.theta for model in self.models]
 
     #
     def update(self, data, states=[], hparam=None):
@@ -152,7 +157,7 @@ class Adiabat(Surrogate):
             old = self.descriptors[st].shape[0]
             new = data[0][i,:,:].shape[0]
 
-            print(f"Update surrogate: state {st}, training data size={old+new}")
+            #print(f"Update surrogate: state {st}, training data size={old+new}")
 
             self.descriptors[st].resize((old + new, d_size))
             self.training[st].resize((old + new))
@@ -160,12 +165,24 @@ class Adiabat(Surrogate):
             self.descriptors[st][old:, :] = self.descriptor.generate(data[0][i,:,:])
             self.training[st][old:]       = data[1][i,:].copy()
 
+            #print('surrogate.training.shape='+str(self.training[0].shape))
+            #print('surrogate.descriptors.shape='+str(self.descriptors[0].shape))
+
             if hparam is not None:
                 self.models[st].kernel.theta = hparam[st]
 
+            #scaler = preprocessing.StandardScaler()
+            #xscaled = scaler.fit_transform(self.descriptors[st])
+            #self.models[st].fit(xscaled,
+            #                    self.training[st])
+
             self.models[st].fit(self.descriptors[st],
                                 self.training[st])
-        print(f"Update surrogate: training data size={old+new}")
+        print("Update surrogate: training data size={old+new}")
+        #print('models[0].kernel_.theta = '+str(self.models[0].kernel_.theta))
+        #print('models[0].kernel.theta = '+str(self.models[0].kernel.theta))
+        #print('models[0].kernel_.get_params() = '+str(self.models[0].kernel_.get_params()))
+        #print('models[0].kernel_.get_params() = '+str(self.models[0].kernel.get_params()))
         return [model.kernel_.theta for model in self.models]
 
     #
@@ -203,6 +220,8 @@ class Adiabat(Surrogate):
             eval_st = states
 
         d_data    = self.descriptor.generate(gms)
+        #scaler = preprocessing.StandardScaler()
+        #xscaled = scaler.fit_transform(d_data)
 
         # return as numpy array
         eval_data = np.array([self.models[st].predict( d_data,
@@ -258,7 +277,7 @@ class Adiabat(Surrogate):
         return ana_grad
 
     #
-    def numerical_gradient(self, gms, states = None):
+    def num_gradient(self, gms, states = None):
         """
         evaluate the gradient of the surrogate at gms
         """

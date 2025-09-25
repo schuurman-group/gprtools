@@ -181,12 +181,12 @@ class Geometry():
         """
 
         def update_x(x):
-            self.pos = x
+            self.x = x
             if self.c2int is not None:
                 self.qx = self.gen_qx(self.x)
 
         def update_p(p):
-            self.mom = p
+            self.p = p
             if self.c2int is not None:
                 self.qp = self.gen_qp(self.x, self.p)
 
