@@ -3,6 +3,7 @@ import os
 import warnings
 import numpy as np
 from sklearn.gaussian_process import GaussianProcessRegressor
+from scipy.linalg import solve_triangular, cholesky
 
 GPR_CHOLESKY_LOWER = True
 debug = False
@@ -163,3 +164,49 @@ class GPRegressor(GaussianProcessRegressor):
             print(f'shape of gradient variance:{y_grad_var.shape}')
 
         return y_grad, y_grad_var
+
+
+    def append_block(self, X_new, y_new):
+        """implement block Cholesky update"""
+        X_new = np.atleast_2d(X_new)
+        y_new = np.atleast_1d(y_new).ravel()
+
+        if not hasattr(self, 'X_train_') or self.X_train_ is None:
+            # First batch
+            self.X_train_ = X_new
+            self.y_train_ = y_new
+            K = self.kernel_(X_new)
+            K[np.diag_indices_from(K)] += getattr(self, 'alpha', 1e-10) + self.jitter
+            self.L_ = cholesky(K, lower=True)
+            self.alpha_ = solve_triangular(self.L_.T, solve_triangular(self.L_, y_new, lower=True), lower=False)
+            self.log_marginal_likelihood_value_ = self._compute_log_marginal_likelihood_from_cholesky(self.L_, y_new)
+            return self
+
+        # Compute kernel blocks
+        K_cross = self.kernel_(self.X_train_, X_new)
+        K_new = self.kernel_(X_new, X_new)
+        noise_level = getattr(self, 'alpha', 1e-10)
+        if hasattr(self.kernel, 'k2') and isinstance(self.kernel.k2, WhiteKernel):
+            noise_level += getattr(self.kernel.k2, 'noise_level', 0.0)
+        K_new += (noise_level + self.jitter) * np.eye(len(X_new))
+
+        # block Cholesky update
+        L11 = self.L_
+        L21 = solve_triangular(L11, K_cross, lower=True, check_finite=False)
+        S = K_new - L21.T @ L21
+        L22 = cholesky(S, lower=True, check_finite=False)
+
+        n_old = L11.shape[0]
+        n_new = L22.shape[0]
+        L_new = np.zeros((n_old+n_new, n_old+n_new))
+        L_new[:n_old, :n_old] = L11
+        L_new[n_old:, :n_old] = L21.T
+        L_new[n_old:, n_old:] = L22
+
+        self.L_ = L_new
+        self.X_train_ = np.vstack([self.X_train_, X_new])
+        self.y_train_ = np.concatenate([self.y_train_, y_new])
+        self.alpha_ = solve_triangular(L_new.T, solve_triangular(L_new, self.y_train_, lower=True), lower=False)
+        # self.log_marginal_likelihood_value_ = self._compute_log_marginal_likelihood_from_cholesky(self.L_, self.y_train_)
+
+        return self
