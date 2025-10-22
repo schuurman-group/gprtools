@@ -305,7 +305,7 @@ class Trajectory():
         self.time  = np.zeros((self.nincr), dtype=float)
         self.xt    = np.zeros((self.nincr, self.nc), dtype=float)
         self.pt    = np.zeros((self.nincr, self.nc), dtype=float)
-
+        self.checkvals = np.zeros((self.nincr), dtype=float)
         amass       = [[geom.masses[i]]*3
                             for i in range(len(geom.masses))]
 
@@ -402,6 +402,19 @@ class Trajectory():
         """
         return self.time[:self.cnt]
 
+    def vals(self):
+        """
+        return the check values
+        """
+        return self.checkvals[self.cnt]
+
+    #
+    def vals_all(self):
+        """
+        return all checkvalues
+        """
+        return self.checkvals[:self.cnt]
+
     #
     def state(self):
         """
@@ -442,10 +455,14 @@ class Trajectory():
         def update_state(s):
             self.st[self.cnt] = s
 
+        def update_error_metric(val):
+            self.checkvals[self.cnt] = val
+
         setfunc = {'x': update_x,
                    'p': update_p,
                    'time': update_time,
-                   'state': update_state}
+                   'state': update_state,
+                   'checkvals': update_error_metric}
 
         allowed = list(setfunc.keys())
 
@@ -457,6 +474,8 @@ class Trajectory():
                           np.zeros(self.nincr, dtype=float)))
                 self.st   = np.concatenate((self.st,
                           np.zeros(self.nincr, dtype=int)))
+                self.checkvals = np.concatenate((self.checkvals,
+                          np.zeros(self.nincr, dtype=float)))
                 self.xt   = np.concatenate((self.xt,
                           np.zeros((self.nincr,self.nc), dtype=float)))
                 self.pt   = np.concatenate((self.pt,

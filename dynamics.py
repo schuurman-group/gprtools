@@ -77,6 +77,9 @@ class SingleState(Dynamics):
                         break
 
                 tupdate = {'time': t_new, 'x': x_new, 'p': p_new}
+                if chk_func is not None:
+                    tupdate['checkvals'] = chk_vals[-1]
+                    
                 traj.update(tupdate)
 
                 propagator.step()

@@ -693,7 +693,7 @@ class ChemPotPy(Surface):
         return energies
 
     #
-    def gradient(self, gms, states = None):
+    def gradient(self, gms, states = None, numerical=False):
         """
         evaluate the gradients at the passed geometries. Geometries
         are assumed to be a 2D numpy array
@@ -711,17 +711,45 @@ class ChemPotPy(Surface):
         ngm = gms.shape[0]
         grads    = np.zeros((nst, ngm, 3*nat), dtype=float)
 
-        for i in range(ngm):
-            gm           = self._chempotpygeom(gms[i,:] / self.gconv)
-            cppsurf      = chempotpy.pg(self.molecule, self.surface, gm)
-            grads[:,i,:] = np.reshape(cppsurf[1][[states]], (nst, 3*nat))
+        if numerical:
+            delta = 1e-4
+            if states is None:
+                eval_st = list(range(self.nstates))
+            else:
+                eval_st = states
+            for i in range(ngm):
+                # gms[i,:] shape: (nc,)
+                for k in range(3*nat):
+                    # Prepare displaced geometries for plus and minus displacement
+                    disp_plus = np.array(gms[i,:], copy=True)
+                    disp_minus = np.array(gms[i,:], copy=True)
+
+                    disp_plus[k] += delta
+                    disp_minus[k] -= delta
+
+                    # Get energies at displaced points for all eval_st states
+                    # Assuming self.gradient returns shape: (nstates, nc)
+                    p_energy = self.evaluate(disp_plus.reshape(1, -1), states=eval_st)  # shape (nstates)
+                    m_energy = self.evaluate(disp_minus.reshape(1, -1), states=eval_st)  # shape (nstates)
+
+                    # Central difference to approximate second derivative w.r.t coordinate k
+                    # For each state, calculate second derivative matrix element for k-th column
+                    # hessall[:, i, :, k] = (p_grad - m_grad) / (2 * delta)
+                    grads[:, i, k] = (p_energy - m_energy) / (2 * delta)
+
+        else:
+            for i in range(ngm):
+                gm           = self._chempotpygeom(gms[i,:] / self.gconv)
+                cppsurf      = chempotpy.pg(self.molecule, self.surface, gm)
+                grads[:,i,:] = np.reshape(cppsurf[1][[states]], (nst, 3*nat))
+
 
         grads    *= (self.econv / self.gconv)
 
         return grads
 
     #
-    def hessian(self, gms, states = None):
+    def hessian(self, gms, states = None, numerical_gradient=False):
         """
         compute the hessian by gradient differences
         """
@@ -750,8 +778,8 @@ class ChemPotPy(Surface):
 
                 # Get gradients at displaced points for all eval_st states
                 # Assuming self.gradient returns shape: (nstates, nc)
-                p_grad = self.gradient(disp_plus.reshape(1, -1), states=eval_st)  # shape (nstates, nc)
-                m_grad = self.gradient(disp_minus.reshape(1, -1), states=eval_st)  # shape (nstates, nc)
+                p_grad = self.gradient(disp_plus.reshape(1, -1), states=eval_st, numerical=numerical_gradient)  # shape (nstates, nc)
+                m_grad = self.gradient(disp_minus.reshape(1, -1), states=eval_st, numerical=numerical_gradient)  # shape (nstates, nc)
 
                 # Central difference to approximate second derivative w.r.t coordinate k
                 # For each state, calculate second derivative matrix element for k-th column
