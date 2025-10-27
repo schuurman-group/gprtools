@@ -6,7 +6,7 @@ import shutil
 import numpy as np
 import itertools
 from abc import ABC, abstractmethod
-import graci.core.libs as libs
+# import graci.core.libs as libs
 import chempotpy
 import constants as constants
 

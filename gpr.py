@@ -128,7 +128,7 @@ class GPRegressor(GaussianProcessRegressor):
 
         # calcuate gradient variance
         # (in analogy of how to calcuate variance)
-        y_grad_var = kernel_hessian - temp
+        y_grad_var = -temp
 
         # undo normalization
         y_grad_var = np.outer(y_grad_var,
@@ -140,7 +140,7 @@ class GPRegressor(GaussianProcessRegressor):
         if y_grad_var.shape[2] == 1:
             y_grad_var = np.squeeze(y_grad_var, axis=2)
 
-        if debug: # print for debug
+        if True: # print for debug
             # check if Cholecky decomposition is performed correctly
             K_test = self.kernel_(self.X_train_)
             k_star = self.kernel_(X, self.X_train_)
