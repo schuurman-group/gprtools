@@ -178,7 +178,7 @@ class Adiabat(Surrogate):
 
             self.models[st].fit(self.descriptors[st],
                                 self.training[st])
-        print("Update surrogate: training data size={old+new}")
+        print(f"Update surrogate: training data size={old+new}")
         #print('models[0].kernel_.theta = '+str(self.models[0].kernel_.theta))
         #print('models[0].kernel.theta = '+str(self.models[0].kernel.theta))
         #print('models[0].kernel_.get_params() = '+str(self.models[0].kernel_.get_params()))
@@ -241,7 +241,7 @@ class Adiabat(Surrogate):
         #    eners = np.reshape(eval_data, (ngm,1))
         #    return eners
 
-    def gradient(self, gms, states=None):
+    def gradient(self, gms, states=None, cal_variance=False):
         """
         evaluate the gradient using analytical expression
         """
@@ -264,17 +264,24 @@ class Adiabat(Surrogate):
         # print(ng)
         # print(nc)
         ana_grad = np.zeros((len(eval_st), ng, nc), dtype=float)
+        ana_grad_var = np.zeros_like(ana_grad)
         for i in range(len(eval_st)):
             st = eval_st[i]
             for j in range(ng):
-                grad, _  = self.models[st].predict_grad(
+                grad, grad_var_soap  = self.models[st].predict_grad(
                                      d_data[j, :].reshape(1, -1),
-                                     compute_grad_var=False)
+                                     compute_grad_var=cal_variance)
                 grad = np.dot(des_grad[j,: ], grad).squeeze()
                 ana_grad[i, j, :] = grad
-               # print(f"analytical gradient:\n{grad.shape}")
+                # print(f"analytical gradient:\n{grad.shape}")
+                if cal_variance:
+                    grad_var = np.diag(des_grad[j,:] @ grad_var_soap @ des_grad[j,:].T)
+                    ana_grad_var[i, j,: ] = grad_var
 
-        return ana_grad
+        if cal_variance:
+            return ana_grad, ana_grad_var
+        else:
+            return ana_grad
 
     #
     def num_gradient(self, gms, states = None):
