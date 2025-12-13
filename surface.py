@@ -662,6 +662,7 @@ class ChemPotPy(Surface):
             os.abort()
 
         self.ref_geom = self._chempotpygeom(ref_geom.x / self.gconv)
+        print('chempotpy refgeom='+str(self.ref_geom))
 
         self.have_gradients = True
         self.have_coupling  = True
@@ -713,7 +714,7 @@ class ChemPotPy(Surface):
 
         for i in range(ngm):
             gm           = self._chempotpygeom(gms[i,:] / self.gconv)
-            cppsurf      = chempotpy.pg(self.molecule, self.surface, gm)
+            cppsurf      = chempotpy.pn(self.molecule, self.surface, gm)
             grads[:,i,:] = np.reshape(cppsurf[1][[states]], (nst, 3*nat))
 
         grads    *= (self.econv / self.gconv)
@@ -756,7 +757,7 @@ class ChemPotPy(Surface):
                 # Central difference to approximate second derivative w.r.t coordinate k
                 # For each state, calculate second derivative matrix element for k-th column
                 # hessall[:, i, :, k] = (p_grad - m_grad) / (2 * delta)
-                hessall[:, i, :, k] = (p_grad - m_grad) / (2 * delta)
+                hessall[0, i, :, k] = (p_grad - m_grad) / (2 * delta)
 
             # Symmetrize Hessian for each state and geometry
             for s in range(nstates):

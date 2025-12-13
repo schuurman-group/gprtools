@@ -231,6 +231,19 @@ class Geometry():
         return qtype
 
     #
+    def cart_list(self):
+        """
+        return the geometry as a nested list of cartesian coordinates
+        and atomic symbols
+        """
+
+        clst = []
+        for i in range(len(self.atms)):
+            clst.append([self.atms[i]] + 
+                        [self.x[3*i+j] for j in range(3)])
+        return clst
+
+    #
     def gen_qx(self, x):
         """
         generate an internal coordinate geometry using the loaded
