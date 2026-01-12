@@ -4,6 +4,7 @@ Trajectory class
 import os
 import copy as copy
 import numpy as np
+import scipy.interpolate as sp_interpolate
 from itertools import chain
 import constants as constants
 import intc as intc
@@ -58,9 +59,11 @@ class Geometry():
             self.atms     = None
             self.masses   = None
             self.natm     = None
-            self.gradient = None
-            self.hessian  = None
             self._mvec    = None
+
+        # these quantities are not taken from xyz file
+        self.gradient = None
+        self.hessian  = None
 
         # internal coordinate file is specified, parse
         # intc file for internal coordinate definition
@@ -287,7 +290,7 @@ class Geometry():
         if np.any([self.hessian]) == None:
             return None, None
 
-        # for mass-weighted hessian
+        # form mass-weighted hessian
         invmass = np.asarray([1./ np.sqrt(self._mvec[i])
                     for i in range(self._mvec.shape[0])], dtype=float)
         mw_hess = np.diag(invmass) @ self.hessian @ np.diag(invmass)
@@ -340,13 +343,35 @@ class Trajectory():
         return cgeom
 
     #
-    def x(self):
+    def rewind(self, t0):
+        """
+        rewind the trajectory to time t0
+        """
+        idx = np.searchsorted(self.time[:self.cnt], t0, side='right')
+        self.cnt = idx
+
+        # probably not necessary, but safer to zero them out
+        self.st[idx+1:]        = 0
+        self.time[idx+1:]      = 0.
+        self.xt[idx+1:,:]      = 0.
+        self.pt[idx+1:,:]      = 0.
+        self.checkvals[idx+1:] = 0.
+        print('rewinding, t0='+str(t0)+', idx='+str(idx))
+
+    #
+    def x(self, t=None):
         """
         return the classical energy of the trajectory
         """
-        return self.xt[self.cnt,:]
 
-    def x_t(self):
+        # if time not specified, return current position
+        if t == None:
+            return self.xt[self.cnt,:]
+        else:
+            return self.interpolated_value(self.xt, t)
+
+    #
+    def x_all(self):
         """
         return all positions
         """
@@ -360,14 +385,19 @@ class Trajectory():
         return self.geom.gen_qx(self.x())
 
     #
-    def p(self):
+    def p(self, t=None):
         """
         return the classical momentum
         """
-        return self.pt[self.cnt,:]
+
+        # if time not specified, return current momentum
+        if t == None:
+            return self.pt[self.cnt,:]
+        else:
+            return self.interpoalted_value(self.pt, t)
 
     #
-    def p_t(self):
+    def p_all(self):
         """
         return all momenta
         """
@@ -415,11 +445,15 @@ class Trajectory():
         """
         return self.time[:self.cnt]
 
-    def vals(self):
+    def vals(self, t=None):
         """
         return the check values
         """
-        return self.checkvals[self.cnt]
+        # if time not specified, return current chkval
+        if t == None:
+            return self.checkvals[self.cnt]
+        else:
+            return self.interpolated_value(self.checkvals, t)
 
     #
     def vals_all(self):
@@ -441,6 +475,22 @@ class Trajectory():
         return the active state at each time
         """
         return self.st[:self.cnt]
+
+    # 
+    def interpolated_value(self, data, time):
+        """
+        return the interpolated value of the data
+        """
+        # not sure how many points to include
+        npt  = 5
+        idx  = np.searchsorted(self.time[:self.cnt], time)
+        bnds = [max(0, idx-npt), min(self.cnt, idx+npt)]
+        
+        x    = self.time.take(indices=range(bnds[0], bnds[1]))
+        y    = data.take(indices=range(bnds[0], bnds[1]), axis=0)
+
+        cs   = sp_interpolate.CubicSpline(x, y)
+        return cs([time])[0]
 
     #
     def update_geom(self, x, p):

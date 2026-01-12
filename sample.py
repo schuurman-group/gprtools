@@ -86,7 +86,7 @@ class Wigner(Sample):
         dx = np.random.normal(0., sigma_x, (nsample, nc))
         dp = np.random.normal(0., sigma_p, (nsample, nc))
 
-        if np.any([bounds]) == None:
+        if bounds == None:
             chk_bounds = False
         elif bounds.shape != (2, 2, nc):
             print('bounds wrong shape in Wigner.sample -- ignoring.')
@@ -167,7 +167,7 @@ class LHS(Sample):
         """
         update the ref_gm object
         """
-        self.ref_gm = ref_gm
+        self.ref_gm = ref_gm.copy()
 
     #
     def make_bounds(self, disp, scale=[1.,1.]):
@@ -176,8 +176,10 @@ class LHS(Sample):
         in the negative/positive directions by scale[0]/scale[1]
         """
         d = [-1., 1.]
-        return np.array([disp*scale[i]*d[i]
-                               for i in range(2)], dtype=float).T
+
+        return np.array([sorted([disp[j]*scale[i]*d[i]
+                        for i in range(2)])
+                        for j in range(len(disp))], dtype=float)
 
     #
     def sample(self, nsample, bounds, cartesian=True):

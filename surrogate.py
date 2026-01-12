@@ -40,10 +40,6 @@ class Surrogate(ABC):
         pass
 
     @abstractmethod
-    def num_gradient(self):
-        pass
-
-    @abstractmethod
     def hessian(self):
         pass
 
@@ -56,35 +52,50 @@ class Adiabat(Surrogate):
     """
     Adiabatic surface surrogate
     """
-    def __init__(self, nstates, descriptor, kernel='RBF', nrestart=50,
-                                           hparam=[0.1, 2]):
+    def __init__(self, nstates, 
+                       descriptor, 
+                       kernel='RBF', 
+                       hparam=[10, 1]):
         super().__init__()
 
         if kernel == 'RBF':
-            self.kernel = C(hparam[0]) * RBF(hparam[1],
-                                            length_scale_bounds=(5, 1e3))
+            self.kernel = C(hparam[0], 
+                            constant_value_bounds=(1e-5, 1e5)) * \
+                          RBF(hparam[1],
+                            length_scale_bounds=(1e-3, 1e3))
             # self.kernel = C(hparam[0]) * RBF(hparam[1])
         elif kernel == 'WhiteNoise':
-            self.kernel = C(hparam[0]) * RBF(hparam[1]) + WhiteKernel(
+            self.kernel = C(hparam[0]) * RBF(hparam[1],
+                          length_scale_bounds=(1, 1e3)) + WhiteKernel(
                                                 noise_level=hparam[2])
         else:
             print('Kernel: '+str(kernel)+' not recognized.')
             os.abort()
 
         #print('self.kernel='+str(self.kernel))
-        self.nstates    = nstates
-        self.descriptor = descriptor
-        self.models     = []
+        self.nstates        = nstates
+        self.descriptor     = descriptor
+        self.models         = []
+        self.descriptors    = [[]]*nstates
+        self.training       = [[]]*nstates
         for i in range(self.nstates):
             gpregress = gpr.GPRegressor(
                              kernel               = self.kernel,
-                             n_restarts_optimizer = nrestart,
+                             n_restarts_optimizer = 50,
                              normalize_y          = True,
                              optimizer            = 'fmin_l_bfgs_b')
             self.models.append(gpregress)
 
     #
-    def create(self, data, states=[], hparam=None):
+    def training_size(self):
+        """
+        return the dimension of the kernel matrix
+        """
+        return [self.training[st].shape[0] 
+                              for st in range(self.nstates)]
+
+    #
+    def create(self, data, states=[], hparam=None, nrestart=None):
         """
         create a surrogate with training data, data
         """
@@ -109,7 +120,6 @@ class Adiabat(Surrogate):
         self.training    = [[]]*self.nstates
 
         # generate the descriptors for the data
-        self.descriptors = [[]]*self.nstates
         for i in range(nst):
             st = eval_st[i]
             self.descriptors[st] = self.descriptor.generate(data[0][i,:,:])
@@ -117,8 +127,13 @@ class Adiabat(Surrogate):
 
         # generate the initial models
         for st in eval_st:
+
             if hparam is not None:
                 self.models[st].kernel.theta = hparam[st]
+
+            if nrestart is not None:
+                self.models[st].set_params(n_restarts_optimizer = 
+                                                            nrestart)
             #scaler = preprocessing.StandardScaler()
             #xscaled = scaler.fit_transform(self.descriptors[st])
             #self.models[st].fit(xscaled,
@@ -126,10 +141,10 @@ class Adiabat(Surrogate):
             self.models[st].fit(self.descriptors[st],
                                 self.training[st])
 
-        return [model.kernel.theta for model in self.models]
+        return [model.kernel_.theta for model in self.models]
 
     #
-    def update(self, data, states=[], hparam=None):
+    def update(self, data, states=[], hparam=None, nrestart=None):
         """
         update the surrogate with additional data
         """
@@ -170,6 +185,11 @@ class Adiabat(Surrogate):
 
             if hparam is not None:
                 self.models[st].kernel.theta = hparam[st]
+                self.models[st].kernel_.theta = hparam[st]
+ 
+            if nrestart is not None:
+                self.models[st].set_params(n_restarts_optimizer =
+                                                            nrestart)
 
             #scaler = preprocessing.StandardScaler()
             #xscaled = scaler.fit_transform(self.descriptors[st])
@@ -178,11 +198,7 @@ class Adiabat(Surrogate):
 
             self.models[st].fit(self.descriptors[st],
                                 self.training[st])
-        print(f"Update surrogate: training data size={old+new}")
-        #print('models[0].kernel_.theta = '+str(self.models[0].kernel_.theta))
-        #print('models[0].kernel.theta = '+str(self.models[0].kernel.theta))
-        #print('models[0].kernel_.get_params() = '+str(self.models[0].kernel_.get_params()))
-        #print('models[0].kernel_.get_params() = '+str(self.models[0].kernel.get_params()))
+
         return [model.kernel_.theta for model in self.models]
 
     #
@@ -193,8 +209,10 @@ class Adiabat(Surrogate):
         for i in range(self.nstates):
             with open(str(model_name) + '_st' + str(i)
                                            + '.pkl', 'rb') as f:
-                self.models[i] = pickle.load(f)
-
+                self.models[i]      = pickle.load(f)
+                self.descriptors[i] = self.models[i].X_train_
+                self.training[i]    = self.models[i].y_train_
+        
     #
     def save(self, model_name):
         """
@@ -220,31 +238,36 @@ class Adiabat(Surrogate):
             eval_st = states
 
         d_data    = self.descriptor.generate(gms)
-        #scaler = preprocessing.StandardScaler()
-        #xscaled = scaler.fit_transform(d_data)
 
         # return as numpy array
-        eval_data = np.array([self.models[st].predict( d_data,
-                                             return_std = std,
-                                             return_cov = cov)
-                              for st in eval_st], dtype=float)
+        evals  = []
+        stdcov = []
+        for st in eval_st:
+            edata = self.models[st].predict( d_data, 
+                                            return_std = std, 
+                                            return_cov = cov)
+            if std or cov:
+                evals.append(edata[0])
+                stdcov.append(edata[1])
+            else:
+                evals.append(edata)
 
-        ngm = gms.shape[0]
-        return eval_data
+        if std or cov:
+            return np.array(evals, dtype=float), np.array(stdcov, dtype=float)
+        else:
+            return np.array(evals, dtype=float)
+        
 
-        #if isinstance(eval_data, tuple):
-            # reshape the output so that the energy array has dimensions
-            # (ngm, nst), even if nst=1 for Adiabats
-        #    eners = np.reshape(eval_data[0], (ngm,1))
-        #    return eners, eval_data[1:]
-        #else:
-        #    eners = np.reshape(eval_data, (ngm,1))
-        #    return eners
-
-    def gradient(self, gms, states=None, cal_variance=False):
+    #
+    def gradient(self, gms, states=None, variance=False, 
+                 numerical=False):
         """
         evaluate the gradient using analytical expression
         """
+
+        # if numerical, call numerical gradient routine
+        if numerical:
+            return self._num_gradient(self, gms, states)
 
         # if no specific states are requested, return all state
         # energies
@@ -270,59 +293,18 @@ class Adiabat(Surrogate):
             for j in range(ng):
                 grad, grad_var_soap  = self.models[st].predict_grad(
                                      d_data[j, :].reshape(1, -1),
-                                     compute_grad_var=cal_variance)
+                                     compute_grad_var=variance)
                 grad = np.dot(des_grad[j,: ], grad).squeeze()
                 ana_grad[i, j, :] = grad
                 # print(f"analytical gradient:\n{grad.shape}")
-                if cal_variance:
+                if variance:
                     grad_var = np.diag(des_grad[j,:] @ grad_var_soap @ des_grad[j,:].T)
                     ana_grad_var[i, j,: ] = grad_var
 
-        if cal_variance:
+        if variance:
             return ana_grad, ana_grad_var
         else:
             return ana_grad
-
-    #
-    def num_gradient(self, gms, states = None):
-        """
-        evaluate the gradient of the surrogate at gms
-        """
-
-        # if no specific states are requested, return all state
-        # energies
-        if states == None:
-            eval_st = [i for i in range(self.nstates)]
-        else:
-            eval_st = states
-
-        delta = 0.001
-        ng    = gms.shape[0]
-        nc    = gms.shape[1]
-        grads = np.zeros((len(eval_st), ng, nc), dtype=float)
-
-        o_ener    = self.evaluate(gms, eval_st)
-        for i in range(ng):
-
-            origin = np.tile(gms[i,:], (len(eval_st), nc))
-
-            disps   = origin + np.diag(np.array([delta]*nc))
-            p_ener  = self.evaluate(disps, states=eval_st)
-
-            disps   = origin + 2. * np.diag(np.array([delta]*nc))
-            p2_ener = self.evaluate(disps, states=eval_st)
-
-            disps   = origin - np.diag(np.array([delta]*nc))
-            m_ener  = self.evaluate(disps, states=eval_st)
-
-            disps   = origin - 2. * np.diag(np.array([delta]*nc))
-            m2_ener = self.evaluate(disps, states=eval_st)
-
-            grad = (-p2_ener + 8*p_ener - 8*m_ener + m2_ener ) / (12.*delta)
-
-            grads[:, i, :] = grad.T
-
-        return grads
 
     #
     def hessian(self, gms, states = None):
@@ -377,6 +359,47 @@ class Adiabat(Surrogate):
         os.abort()
 
         return None
+
+    #
+    def _num_gradient(self, gms, states = None):
+        """
+        evaluate the gradient of the surrogate at gms
+        """
+
+        # if no specific states are requested, return all state
+        # energies
+        if states == None:
+            eval_st = [i for i in range(self.nstates)]
+        else:
+            eval_st = states
+
+        delta = 0.001
+        ng    = gms.shape[0]
+        nc    = gms.shape[1]
+        grads = np.zeros((len(eval_st), ng, nc), dtype=float)
+
+        o_ener    = self.evaluate(gms, eval_st)
+        for i in range(ng):
+
+            origin = np.tile(gms[i,:], (len(eval_st), nc))
+
+            disps   = origin + np.diag(np.array([delta]*nc))
+            p_ener  = self.evaluate(disps, states=eval_st)
+
+            disps   = origin + 2. * np.diag(np.array([delta]*nc))
+            p2_ener = self.evaluate(disps, states=eval_st)
+
+            disps   = origin - np.diag(np.array([delta]*nc))
+            m_ener  = self.evaluate(disps, states=eval_st)
+
+            disps   = origin - 2. * np.diag(np.array([delta]*nc))
+            m2_ener = self.evaluate(disps, states=eval_st)
+
+            grad = (-p2_ener + 8*p_ener - 8*m_ener + m2_ener ) / (12.*delta)
+
+            grads[:, i, :] = grad.T
+
+        return grads
 
 #
 class CP(Surrogate):

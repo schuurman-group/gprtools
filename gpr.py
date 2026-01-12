@@ -140,7 +140,7 @@ class GPRegressor(GaussianProcessRegressor):
         if y_grad_var.shape[2] == 1:
             y_grad_var = np.squeeze(y_grad_var, axis=2)
 
-        if True: # print for debug
+        if debug: # print for debug
             # check if Cholecky decomposition is performed correctly
             K_test = self.kernel_(self.X_train_)
             k_star = self.kernel_(X, self.X_train_)

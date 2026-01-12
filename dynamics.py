@@ -32,7 +32,7 @@ class SingleState(Dynamics):
         self.nc       = None
 
     #
-    def propagate(self, traj, dt, tols=None, chk_func=None, chk_thresh=None):
+    def propagate(self, traj, t_final, tols=None, chk_func=None, chk_thresh=None):
         """
         propagate a trajectory from current time t to t+dt using
         the surrogate
@@ -51,38 +51,36 @@ class SingleState(Dynamics):
         failed      = False
         chk_vals    = []
 
-        # propagate outer loop until final itme reached,
-        # or we need to update our surface
-        while traj.t() < (t0+dt-0.2*max_step) and not (update or failed):
-            # when we change states, we reinitialize the
-            # propagator
-            propagator = RK45(
-                    fun      = self.step_function,
-                    t0       = traj.t(),
-                    y0       = np.concatenate((traj.x(), traj.p())),
-                    t_bound  = t0 + dt,
-                    rtol     = rtol,
-                    atol     = atol,
-                    max_step = max_step)
+        # when we change states, we reinitialize the
+        # propagator
+        propagator = RK45(
+                fun      = self.step_function,
+                t0       = traj.t(),
+                y0       = np.concatenate((traj.x(), traj.p())),
+                t_bound  = t_final,
+                rtol     = rtol,
+                atol     = atol,
+                max_step = max_step)
 
-            while propagator.status == 'running':
-                t_new   = propagator.t
-                x_new   = propagator.y[:self.nc].real
-                p_new   = propagator.y[self.nc:2*self.nc].real
+        while propagator.status == 'running':
 
-                if chk_func is not None:
-                    chk_vals.append(chk_func(x_new, p_new))
-                    if chk_vals[-1] > chk_thresh:
-                        update = True
-                        break
+            t_new   = propagator.t
+            x_new   = propagator.y[:self.nc].real
+            p_new   = propagator.y[self.nc:2*self.nc].real
 
+            if chk_func is not None:
+                chk_vals.append(chk_func(t_new, x_new, p_new))
+                if chk_vals[-1] > chk_thresh:
+                    update = True
+                    break
+            
+            if t_new > t0:
                 tupdate = {'time': t_new, 'x': x_new, 'p': p_new}
                 if chk_func is not None:
                     tupdate['checkvals'] = chk_vals[-1]
-                    
                 traj.update(tupdate)
 
-                propagator.step()
+            propagator.step()
 
             # if we got here because the propagator failed not b/c
             # of a hop or surface update, end propagation
@@ -94,7 +92,7 @@ class SingleState(Dynamics):
         if chk_func is not None:
             return update, failed, chk_vals
         else:
-            return update, failed
+            return failed
 
     #
     def step_function(self, t, y):
@@ -135,7 +133,7 @@ class FSSH(Dynamics):
         self.nc        = None
 
     #
-    def propagate(self, traj, dt, tols=None, chk_func=None, chk_thresh=None):
+    def propagate(self, traj, t_final, tols=None, chk_func=None, chk_thresh=None):
         """
         propagate a trajectory from current time t to t+dt using
         the surrogate
@@ -154,70 +152,67 @@ class FSSH(Dynamics):
 
         max_step    = 30.
         chk_vals    = []
-        update      = False
+        update      = False 
         failed      = False
 
-       # propagate outer loop until final itme reached,
-        # or we need to update our surface
-        while traj.t() < (t0+dt-0.2*max_step) and not (update or failed):
-            # when we change states, we reinitialize the
-            # propagator
-            propagator = RK45(
-                    fun      = self.step_function,
-                    t0       = traj.t(),
-                    y0       = np.concatenate((traj.x(), traj.p(),
-                                               dm.ravel())),
-                    t_bound  = t0 + dt,
-                    rtol     = rtol,
-                    atol     = atol,
-                    max_step = max_step)
+        # when we change states, we reinitialize the
+        # propagator
+        propagator = RK45(
+                fun      = self.step_function,
+                t0       = traj.t(),
+                y0       = np.concatenate((traj.x(), traj.p(),
+                                           dm.ravel())),
+                t_bound  = t_final,
+                rtol     = rtol,
+                atol     = atol,
+                max_step = max_step)
 
-            while propagator.status == 'running':
+        while propagator.status == 'running':
 
-                t_new   = propagator.t
-                x_new   = propagator.y[:self.nc].real
-                p_new   = propagator.y[self.nc:2*self.nc].real
-                dm_new  = np.reshape(propagator.y[2*self.nc:],
-                                     (self.ns, self.ns))
-                delta_t = t_new - traj.t()
+            t_new   = propagator.t
+            x_new   = propagator.y[:self.nc].real
+            p_new   = propagator.y[self.nc:2*self.nc].real
+            dm_new  = np.reshape(propagator.y[2*self.nc:],
+                                 (self.ns, self.ns))
+            delta_t = t_new - traj.t()
 
-                if chk_func is not None:
-                    chk_vals.append(chk_func(x_new, p_new, traj.state()))
-                    #print('chkall='+str(chkall),flush=True)
-                    if chk_vals[-1] > chk_thresh:
-                        update = True
-                        break
+            if chk_func is not None:
+                chk_vals.append(chk_func(t_new, x_new, p_new, 
+                                                traj.state()))
+                #print('chkall='+str(chkall),flush=True)
+                if chk_vals[-1] > chk_thresh:
+                    update = True
+                    break
 
-                # compute hopping probability
-                s_new = self.compute_fssh_hop(x_new, p_new, dm_new,
-                                              traj.state(), delta_t)
+            # compute hopping probability
+            s_new = self.compute_fssh_hop(x_new, p_new, dm_new,
+                                          traj.state(), delta_t)
 
-                if traj.state() != s_new:
-                    delta_p = self.scale_momentum(x_new, p_new,
-                                                  traj.state(), s_new)
-                    # we can scale momentum: hope to new state
-                    if delta_p is not None:
-                        p_new += delta_p
-                    # frustrated hop
-                    else:
-                        s_new = traj.state()
+            if traj.state() != s_new:
+                delta_p = self.scale_momentum(x_new, p_new,
+                                              traj.state(), s_new)
+                # we can scale momentum: hope to new state
+                if delta_p is not None:
+                    p_new += delta_p
+                # frustrated hop
+                else:
+                    s_new = traj.state()
 
-                tupdate = {'time': propagator.t,
-                           'state': s_new,
-                           'x': propagator.y[:self.nc].real,
-                           'p': propagator.y[self.nc:2*self.nc].real}
-                traj.update(tupdate)
-                self.state = traj.state()
-                # print(f"state:{self.state}")
-                # print(f"time:{traj.t()/41.334}")
-                propagator.step()
+            tupdate = {'time': propagator.t,
+                       'state': s_new,
+                       'x': propagator.y[:self.nc].real,
+                       'p': propagator.y[self.nc:2*self.nc].real}
+            traj.update(tupdate)
+            self.state = traj.state()
+            # print(f"state:{self.state}")
+            # print(f"time:{traj.t()/41.334}")
+            propagator.step()
 
-            # if we got here because the propagator failed not b/c
-            # of a hop or surface update, end propagation
-            if propagator.status == 'failed':
-                print('propagation failed.')
-                failed = True
-                break
+        # if we got here because the propagator failed not b/c
+        # of a hop or surface update, end propagation
+        if propagator.status == 'failed':
+            print('propagation failed.')
+            failed = True
 
         if chk_func is not None:
             return update, failed, chk_vals
