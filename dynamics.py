@@ -23,13 +23,13 @@ class SingleState(Dynamics):
     Propagate a trajectory in a single electronic state, while
     periodically checking the accuracy of the underlying suface
     """
-    def __init__(self, surrogate=None):
+    def __init__(self, gradient=None):
         super().__init__()
 
-        self.surrogate = surrogate
+        self.grad  = gradient
         # mass of each coordinate
-        self.m        = None
-        self.nc       = None
+        self.m     = None
+        self.nc    = None
 
     #
     def propagate(self, traj, t_final, tols=None, chk_func=None, chk_thresh=None):
@@ -67,6 +67,7 @@ class SingleState(Dynamics):
             t_new   = propagator.t
             x_new   = propagator.y[:self.nc].real
             p_new   = propagator.y[self.nc:2*self.nc].real
+            e_new   = self.grad.evaluate(x_new)
 
             if chk_func is not None:
                 chk_vals.append(chk_func(t_new, x_new, p_new))
@@ -74,11 +75,15 @@ class SingleState(Dynamics):
                     update = True
                     break
             
-            if t_new > t0:
-                tupdate = {'time': t_new, 'x': x_new, 'p': p_new}
-                if chk_func is not None:
-                    tupdate['checkvals'] = chk_vals[-1]
-                traj.update(tupdate)
+            grad = self.grad.gradient(x_new, states=[self.state])
+            tupdate = {'time': t_new, 
+                       'x': x_new, 
+                       'p': p_new,
+                       'energy': e_new,
+                       'gradient': grad}
+            if chk_func is not None:
+                tupdate['checkvals'] = chk_vals[-1]
+            traj.update(tupdate)
 
             propagator.step()
 
@@ -104,14 +109,14 @@ class SingleState(Dynamics):
 
         # evaluate the gradient of the potential at y.x,
         # -grad = F = ma
-        gm   = np.array([y[:self.nc]])
-        grad = self.surrogate.gradient(gm, states=[self.state])
+        gm   = y[:self.nc]
+        grad = self.grad.gradient(gm, states=[self.state])
         vel  = y[self.nc:] / self.m
 
         # dx/dt = v = p/m
         dely[:self.nc] = vel
         # dp/dt = ma = F = -grad
-        dely[self.nc:] = -grad[0,0,:]
+        dely[self.nc:] = -grad[0,:]
 
         return dely
 
@@ -122,15 +127,15 @@ class FSSH(Dynamics):
     Perform a FSSH propagation, periodically checking the accuracy
     of the surface being propagated on
     """
-    def __init__(self, nstates, surrogate=None, surface=None):
+    def __init__(self, nstates, gradient=None, coupling=None):
         super().__init__()
 
-        self.ns        = nstates
-        self.surrogate = surrogate
-        self.surface   = surface
-        self.m         = None
-        self.state     = None
-        self.nc        = None
+        self.ns     = nstates
+        self.grad   = gradient
+        self.coup   = coupling
+        self.m      = None
+        self.state  = None
+        self.nc     = None
 
     #
     def propagate(self, traj, t_final, tols=None, chk_func=None, chk_thresh=None):
@@ -147,8 +152,7 @@ class FSSH(Dynamics):
         self.state  = traj.state()
         self.nc     = traj.nc
         t0          = traj.t()
-        dm          = np.ndarray((self.ns, self.ns), dtype=complex)
-        dm[traj.state(), traj.state()]  = 1.
+        dm          = traj.dm() 
 
         max_step    = 30.
         chk_vals    = []
@@ -174,8 +178,10 @@ class FSSH(Dynamics):
             p_new   = propagator.y[self.nc:2*self.nc].real
             dm_new  = np.reshape(propagator.y[2*self.nc:],
                                  (self.ns, self.ns))
-            delta_t = t_new - traj.t()
+            dt      = t_new - traj.t()
 
+            # check to see if error metric exceed and we need to 
+            # pause to update the surrogate
             if chk_func is not None:
                 chk_vals.append(chk_func(t_new, x_new, p_new, 
                                                 traj.state()))
@@ -184,28 +190,44 @@ class FSSH(Dynamics):
                     update = True
                     break
 
-            # compute hopping probability
-            s_new = self.compute_fssh_hop(x_new, p_new, dm_new,
-                                          traj.state(), delta_t)
+            # compute gradient and couplings just once --
+            # more useful when cost of surface evaluations are large
+            e_new = self.grad.evaluate(x_new)
+            g_new = self.grad.gradient(x_new)
+            nac   = self.build_nac(x_new)
 
+            # compute hopping probability
+            s_new = self.compute_fssh_hop(p_new, nac, dm_new, dt, 
+                                                        traj.state())
+
+            # if state changed, confirm we can scale the momentum to
+            # maintain energy
             if traj.state() != s_new:
-                delta_p = self.scale_momentum(x_new, p_new,
-                                              traj.state(), s_new)
+                p_scale = self.scale_momentum(p_new,
+                                    e_new[traj.state()],
+                                    e_new[s_new],
+                                    nac[traj.state(), s_new])
                 # we can scale momentum: hope to new state
-                if delta_p is not None:
-                    p_new += delta_p
+                if p_scale is not None:
+                    p_new = p_scale
                 # frustrated hop
                 else:
                     s_new = traj.state()
 
-            tupdate = {'time': propagator.t,
-                       'state': s_new,
-                       'x': propagator.y[:self.nc].real,
-                       'p': propagator.y[self.nc:2*self.nc].real}
-            traj.update(tupdate)
+            # update the trajectory object with current timestep info
             self.state = traj.state()
-            # print(f"state:{self.state}")
-            # print(f"time:{traj.t()/41.334}")
+            tupdate = {'time':     propagator.t,
+                       'state':    s_new,
+                       'x':        x_new,
+                       'p':        p_new,
+                       'energy':   e_new,
+                       'gradient': g_new,
+                       'coupling': nac[traj.state(),:],
+                       'dm':       dm_new}
+            if chk_func is not None:
+                tupdate['checkvals'] = chk_vals[-1]
+            traj.update(tupdate)
+
             propagator.step()
 
         # if we got here because the propagator failed not b/c
@@ -229,37 +251,36 @@ class FSSH(Dynamics):
 
         # evaluate the gradient of the potential at y.x,
         # -grad = F = ma
-        gm   = np.array([y[:self.nc].real])
-        grad = self.surrogate.gradient(gm, states=[self.state])
-        vel  = y[self.nc:2*self.nc] / self.m
+        gm   = y[:self.nc].real
+        grad = self.grad.gradient(gm, states=[self.state])
+        vel  = (y[self.nc:2*self.nc] / self.m).real
 
         # dx/dt = v = p/m
         dely[:self.nc]          = vel
         # dp/dt = ma = F = -grad
-        dely[self.nc:2*self.nc] = -grad[0,0,:]
+        dely[self.nc:2*self.nc] = -grad[0,:]
 
         # propagate the dm, ns>1 and y has the correct
         # shape
         if self.ns > 1:
-            all_states = [i for i in range(self.ns)]
-            dm = y[2*self.nc: ].reshape(self.ns, self.ns)
-
-            ener = self.surface.evaluate(gm,
-                                         states=all_states).flatten()
-            ddmdt = self.propagate_dm(dm, gm, ener, vel)
-            dely[2*self.nc:] = ddmdt.ravel()
+            dm   = y[2*self.nc: ].reshape(self.ns, self.ns)
+            ener = self.grad.evaluate(gm)
+            nac  = self.build_nac(gm)
+            tdcm = self.tdcm(vel, nac)
+            dely[2*self.nc:] = self.propagate_dm(dm, ener, tdcm).ravel()
 
         return dely
 
     #
-    def compute_fssh_hop(self, x, p, dm, s, dt):
+    def compute_fssh_hop(self, p, nac, dm, dt, s):
         """
         compute the FSSH hopping probabilities
         """
 
         # compute hopping probabilities
         vel    = p / self.m
-        b      = (-2*np.conjugate(dm)*self.tdcm(np.array([x]),vel)).real
+        tdcm   = self.tdcm(vel, nac)
+        b      = (-2*np.conjugate(dm) * tdcm).real
         pop    = np.diag(dm)
         t_prob = np.array([max(0., dt*b[j, s]/pop[s])
                             for j in range(self.ns)])
@@ -277,71 +298,87 @@ class FSSH(Dynamics):
         return int(s)
 
     #
-    def scale_momentum(self, x, p, s, snew):
+    def scale_momentum(self, p, e_old, e_new, nad_vec):
         """
         following a potential hop, attempt to scale the momentum
         of the trajectory on the new state. If successful, return
         'True', else, 'False'
         """
 
-        gm  = np.array([x])
-        pair = [int(s), int(snew)]
-        nac  = self.surface.coupling(gm, [pair])[0].squeeze()
-        ener = self.surface.evaluate(gm, states=pair).flatten()
+        # the kinetic energy is given by:
+        # KE = (P . P) * / (2M)
+        #    = (x * p_para + p_perp).(x * p_para + p_perp) / (2M)
+        #    = x^2 * (p_para.p_para) / 2M + 2.*x*(p_para.p_perp) / 2M + (p_perp.p_perp) / 2M
+        #    = x^2 * KE_para_para + x * KE_para_perp + KE_perp_perp
 
         # now we solve for the momentum adjustment that conserves
         # the total energy
-        a = 0.5 * np.dot(nac/self.m, nac)
-        b = np.dot(p/self.m, nac)
-        c = ener[1] - ener[0]
+        scale_dir = nad_vec / np.linalg.norm(nad_vec)
+        k_old     = 0.5*np.dot(p / self.m, p)
+        ke_goal   = (k_old + e_old) - e_new
 
-        delta = b**2 - 4*a*c
+        p_para    = np.dot(p, scale_dir) * scale_dir
+        p_perp    = p - p_para
 
-        # print(f"delta:{delta}")
+        ke_para_para = 0.5*np.dot( p_para, p_para / self.m )
+        ke_para_perp =     np.dot( p_para, p_perp / self.m )
+        ke_perp_perp = 0.5*np.dot( p_perp, p_perp / self.m )
 
-        # if discriminant less than zero: frustrated hop,
-        # no adjustment that conserves energy
-        if delta < 0:
+        # scale p_para by x so that KE == ke_goal
+        # (ke_para_para)*x^2 + (ke_para_perp)*x + (ke_perp_perp - ke_goal) = 0
+        # solve quadratic equation
+        a = ke_para_para
+        b = ke_para_perp
+        c = ke_perp_perp - ke_goal
+
+        discrim = b**2 - 4.*a*c
+        if discrim < 0:
             return None
 
-        # since solving quadratic equation, two roots generated,
-        # choose the smaller root
+        if abs(a) > 1.e-16:
+            x = (-b + np.sqrt(discrim)) / (2.*a)
+        elif abs(b) > 1.e-16:
+            x = -c / b
         else:
-            gamma = (-b + np.sign(b)*np.sqrt(delta))/(2*a)
+            x = 0.
 
-        delta_p = gamma * nac
-
-        print(f"delta p:{delta_p}")
-
-
-        return delta_p
+        p_new = x*p_para + p_perp
+        return p_new
 
     #
-    def propagate_dm(self, DM,  gm, ener, vel):
+    def propagate_dm(self, dm, ener, tdcm):
         """
         propagate the state density matrix
         """
         dDMdt  = np.zeros((self.ns, self.ns), dtype=complex)
-        dR    = -1j*np.diag(ener) - self.tdcm(gm, vel)
-        dDMdt += dR@DM
-        dDMdt -= DM@dR
+        dR    = -1j*np.diag(ener) - tdcm
+        dDMdt += dR@dm
+        dDMdt -= dm@dR
 
         return dDMdt
 
     # compute the time-derivative coupling matrix
-    def tdcm(self, gm, vel):
+    def tdcm(self, vel, nac):
         """
         compute the time derivative coupling matrix
         """
-        tdcm  = np.zeros((self.ns, self.ns), dtype=complex)
-        pairs = [[i,j] for i in range(self.ns) for j in range(i)]
-
-        nac   = self.surface.coupling(gm, pairs)
-
-        # compute the time-derivative coupling
-        for ind in range(len(pairs)):
-            i,j       =  pairs[ind][0],pairs[ind][1]
-            tdcm[i,j] =  np.dot(vel, nac[ind].squeeze())
-            tdcm[j,i] = -tdcm[i,j]
-        # print(f'tdcm:{tdcm}')
+        tdcm = np.array([[np.dot(vel, nac[i,j]) for i in range(self.ns)] 
+                                  for j in range(self.ns)], dtype=float)
         return tdcm
+
+    # build NAC coupling matrix
+    def build_nac(self, gm):
+        """
+        build the matrix of NAC vectors
+        """
+        nac = np.zeros((self.ns, self.ns, self.nc), dtype=float)
+
+        pairs = [[i,j] for i in range(self.ns) for j in range(i)]
+        c_new = self.coup.coupling(gm, pairs=pairs)
+
+        for pair in pairs:
+            ind = pairs.index(pair)
+            nac[pair[0],pair[1]] = c_new[ind,:]
+            nac[pair[1],pair[0]] = -c_new[ind,:]
+
+        return nac

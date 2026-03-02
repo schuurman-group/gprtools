@@ -5,6 +5,7 @@ import os
 import copy as copy
 import numpy as np
 import scipy.interpolate as sp_interpolate
+import scipy.optimize as sp_optimize
 from itertools import chain
 import constants as constants
 import intc as intc
@@ -280,6 +281,23 @@ class Geometry():
             return None
 
     #
+    def optimize(self, surf, state=0, x0=None, conv=1.e-4, iter_max=100):
+        """
+        optimize the molecule using the surface (could be surface
+        or surrogate) 
+        """
+
+        # use the current geometry as starting guess, if none is
+        # explicitly given
+        if x0 is None:
+            x0 = self.x
+
+        res = sp_optimize.minimize(surf.evaluate, x0, args=([state]), 
+                                   jac=surf.gradient, hess=surf.hessian, 
+                                   method='L-BFGS-B', tol=conv)
+        return res
+
+    #
     def freq(self):
         """
         compute the vibrational frequencies corresponding to the current
@@ -300,7 +318,7 @@ class Geometry():
         freq_list = []
         mode_list = []
         for i in range(len(evals)):
-            if evals[i] >= 0 and np.sqrt(evals[i]) >= freq_cut:
+            if evals[i] >= 0 and np.sqrt(abs(evals[i])) >= freq_cut:
                 freq_list.append(np.sqrt(evals[i]))
                 mode_list.append(evecs[:,i].tolist())
 
@@ -311,16 +329,22 @@ class Trajectory():
     """
     Trajectory class, currently not much
     """
-    def __init__(self, geom, time, state):
+    def __init__(self, geom, time, state, nstate=1):
 
         # self.m is a length 3*N vector of atomic masses
         self.nincr = 100
+        self.ns    = nstate
         self.geom  = geom.copy()
         self.nc    = geom.x.shape[0]
         self.st    = np.zeros((self.nincr), dtype=int)
         self.time  = np.zeros((self.nincr), dtype=float)
         self.xt    = np.zeros((self.nincr, self.nc), dtype=float)
         self.pt    = np.zeros((self.nincr, self.nc), dtype=float)
+        self.ener  = np.zeros((self.nincr, nstate), dtype=float)
+        self.grad  = np.zeros((self.nincr, self.ns, self.nc), dtype=float)
+        self.coup  = np.zeros((self.nincr, self.ns, self.nc), dtype=float)
+        self.dmt   = np.zeros((self.nincr, self.ns, self.ns), 
+                                                   dtype=complex)
         self.checkvals = np.zeros((self.nincr), dtype=float)
         amass       = [[geom.masses[i]]*3
                             for i in range(len(geom.masses))]
@@ -330,6 +354,7 @@ class Trajectory():
         self.pt[self.cnt, :] = self.geom.p
         self.time[self.cnt]  = time
         self.st[self.cnt]    = state
+        self.dmt[self.cnt, state, state] = 1.
 
     #
     def current_geom(self):
@@ -355,8 +380,10 @@ class Trajectory():
         self.time[idx+1:]      = 0.
         self.xt[idx+1:,:]      = 0.
         self.pt[idx+1:,:]      = 0.
+        self.ener[idx+1:,:]    = 0.
+        self.grad[idx+1:,:,:]  = 0.
+        self.coup[idx+1:,:,:]  = 0.
         self.checkvals[idx+1:] = 0.
-        print('rewinding, t0='+str(t0)+', idx='+str(idx))
 
     #
     def x(self, t=None):
@@ -367,15 +394,10 @@ class Trajectory():
         # if time not specified, return current position
         if t == None:
             return self.xt[self.cnt,:]
+        elif t == 'all':
+            return self.xt[:self.cnt,:]
         else:
             return self.interpolated_value(self.xt, t)
-
-    #
-    def x_all(self):
-        """
-        return all positions
-        """
-        return self.xt[:self.cnt,:]
 
     #
     def qx(self):
@@ -393,15 +415,10 @@ class Trajectory():
         # if time not specified, return current momentum
         if t == None:
             return self.pt[self.cnt,:]
+        elif t == 'all':
+            return self.pt[:self.nct,:]
         else:
-            return self.interpoalted_value(self.pt, t)
-
-    #
-    def p_all(self):
-        """
-        return all momenta
-        """
-        return self.pt[:self.cnt,:]
+            return self.interpolated_value(self.pt, t)
 
     #
     def qp(self):
@@ -425,11 +442,18 @@ class Trajectory():
         return self.geom._mvec
 
     #
-    def v(self):
+    def v(self, t=None):
         """
         return the cartesian velocity of the trajectory
         """
-        return self.pt[self.cnt,:] / self.m()
+
+        # if time not specified, return current momentum
+        if t == None:
+            return self.pt[self.cnt,:] / self.m()
+        elif t == 'all':
+            return self.pt[:self.nct,:] / self.m()
+        else:
+            return self.interpolated_value(self.pt / self.m(), t)
 
     #
     def t(self):
@@ -445,6 +469,82 @@ class Trajectory():
         """
         return self.time[:self.cnt]
 
+    #
+    def energy(self, t=None, state=None):
+        """
+        return current energy, or energy at t=t, if specified
+        """
+        # if time not specified, return current momentum
+        if t == None:
+            if state == None:
+                return self.ener[self.cnt,:]
+            else:
+                return self.ener[self.cnt, state]
+        else:
+            if state == None:
+                return self.interpolated_value(self.ener, t)
+            else:
+                return self.interpolated_value(self.ener[:, state], t)
+
+    #
+    def gradient(self, t=None, state=None):
+        """
+        return current gradient, or grad at t=t, if specified
+        """
+        # if time not specified, return current momentum
+        if t == None:
+            if state == None:
+                return self.grad[self.cnt,:,:]
+            else:
+                return self.grad[self.cnt, state,:]
+        else:
+            if state == None:
+                return self.interpolated_value(self.grad, t)
+            else:
+                return self.interpolated_value(self.grad[:, state,:], t)
+
+    #
+    def coupling(self, t=None, state=None):
+        """
+        return current gradient, or grad at t=t, if specified
+        """
+        # if time not specified, return current momentum
+        if t == None:
+            if state == None:
+                return self.coup[self.cnt,:,:]
+            else:
+                return self.coup[self.cnt, state,:]
+        else:
+            if state == None:
+                return self.interpolated_value(self.coup, t)
+            else:
+                return self.interpolated_value(self.coup[:, state,:], t)
+
+    #
+    def dm(self, t=None):
+        """
+        return the density matrix at time t, else current dm
+        """
+        if t == None:
+            return self.dmt[self.cnt,:,:]
+        else:
+            idx = (np.abs(self.time[:self.cnt] - t)).argmin()
+            return self.dmt[idx,:,:]
+
+    #
+    def state(self, t=None):
+        """
+        return the current state
+        """
+        if t == None:
+            return self.st[self.cnt]
+        elif t == 'all':
+            return self.st[:self.cnt]
+        else:
+            idx = (np.abs(self.time[:self.cnt] - t)).argmin()
+            return self.st[idx]
+
+    #
     def vals(self, t=None):
         """
         return the check values
@@ -452,29 +552,33 @@ class Trajectory():
         # if time not specified, return current chkval
         if t == None:
             return self.checkvals[self.cnt]
+        elif t == 'all':
+            return self.checkvals[:self.cnt]
         else:
             return self.interpolated_value(self.checkvals, t)
 
     #
-    def vals_all(self):
+    def kinetic(self, t=None):
         """
-        return all checkvalues
+        Return the kinetic energy of the trajectory
         """
-        return self.checkvals[:self.cnt]
+        # if time is not specified, return current kinetic energy
+        return 0.5*np.dot(self.p(t)/self.m(), self.p(t))
 
     #
-    def state(self):
+    def potential(self, t=None):
         """
-        return the current state
+        return the potential energy of the trajectory
         """
-        return self.st[self.cnt]
+        st = self.state(t)
+        return self.energy(t, st)
 
     #
-    def state_t(self):
+    def classical(self, t=None):
         """
-        return the active state at each time
+        return the classical energy of the trajecotry
         """
-        return self.st[:self.cnt]
+        return self.kinetic(t) + self.potential(t)
 
     # 
     def interpolated_value(self, data, time):
@@ -486,11 +590,18 @@ class Trajectory():
         idx  = np.searchsorted(self.time[:self.cnt], time)
         bnds = [max(0, idx-npt), min(self.cnt, idx+npt)]
         
-        x    = self.time.take(indices=range(bnds[0], bnds[1]))
-        y    = data.take(indices=range(bnds[0], bnds[1]), axis=0)
+        x = self.time.take(indices=range(bnds[0], bnds[1]))
+        y = data.take(indices=range(bnds[0], bnds[1]), axis=0)
 
         cs   = sp_interpolate.CubicSpline(x, y)
-        return cs([time])[0]
+
+        # data is a vector, should return a scalar
+        if len(y.shape) == 1:
+            #return cs(time)[0]
+            return cs(time)
+        # else, return a N-1 dimensional array
+        else:
+            return cs(time)
 
     #
     def update_geom(self, x, p):
@@ -518,6 +629,18 @@ class Trajectory():
         def update_state(s):
             self.st[self.cnt] = s
 
+        def update_energy(ener):
+            self.ener[self.cnt, :] = ener
+
+        def update_gradient(grad):
+            self.grad[self.cnt, :, :] = grad
+
+        def update_coupling(coup):
+            self.coup[self.cnt, :, :] = coup
+
+        def update_dm(dm):
+            self.dmt[self.cnt, :, :] = dm
+
         def update_error_metric(val):
             self.checkvals[self.cnt] = val
 
@@ -525,12 +648,17 @@ class Trajectory():
                    'p': update_p,
                    'time': update_time,
                    'state': update_state,
+                   'energy': update_energy,
+                   'gradient': update_gradient,
+                   'coupling': update_coupling,
+                   'dm': update_dm,
                    'checkvals': update_error_metric}
 
         allowed = list(setfunc.keys())
 
         if all([key in allowed for key in list(values.keys())]):
-            self.cnt += 1
+            if 'time' in values.keys() and values['time'] > self.time[self.cnt]:
+                self.cnt += 1
             # grow the arrays by nincr
             if self.cnt == self.time.shape[0]:
                 self.time = np.concatenate((self.time,
@@ -543,6 +671,17 @@ class Trajectory():
                           np.zeros((self.nincr,self.nc), dtype=float)))
                 self.pt   = np.concatenate((self.pt,
                           np.zeros((self.nincr,self.nc), dtype=float)))
+                self.ener = np.concatenate((self.ener,
+                          np.zeros((self.nincr, self.ns),dtype=float)))
+                self.grad = np.concatenate((self.grad,
+                          np.zeros((self.nincr, self.ns, self.nc),
+                                                         dtype=float)))
+                self.coup = np.concatenate((self.coup,
+                          np.zeros((self.nincr, self.ns, self.nc),
+                                                         dtype=float)))
+                self.dmt  = np.concatenate((self.dmt,
+                          np.zeros((self.nincr, self.ns, self.ns),
+                                                       dtype=complex)))
 
             for key in values:
                 setfunc[key](values[key])

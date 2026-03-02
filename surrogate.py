@@ -47,6 +47,7 @@ class Surrogate(ABC):
     def coupling(self):
         pass
 
+
 #
 class Adiabat(Surrogate):
     """
@@ -87,26 +88,28 @@ class Adiabat(Surrogate):
             self.models.append(gpregress)
 
     #
-    def training_size(self):
-        """
-        return the dimension of the kernel matrix
-        """
-        return [self.training[st].shape[0] 
-                              for st in range(self.nstates)]
-
-    #
     def create(self, data, states=[], hparam=None, nrestart=None):
         """
         create a surrogate with training data, data
         """
 
-        # assumes energies for each state are in columns
-        nst = data[0].shape[0]
-        npt = data[0].shape[1]
+        # sanity check the geometry array
+        nst = len(states) 
+        if len(data[0].shape) == 3:
+            if data.shape[0] != nst:
+                print('data.shape: '+str(data.shape)+', nstate=' + 
+                    str(nst) + ' in surrogate.create -- ambiguous', 
+                    flush=True)
+            npt = [data[i,:,:].shape[0] for i in len(nst)]
+            same_geom = False
+        else:
+            npt = [data[0].shape[0]]*nst
+            same_geom = True
 
+        print('shape data[1]='+str(data[1].shape))
         # if states is not given, but the data is for all
         # states, set the eval_states to be all states
-        if nst == self.nstates and len(states)==0:
+        if nst == self.nstates and nst==0:
             eval_st = [i for i in range(self.nstates)]
         else:
             eval_st = states
@@ -122,7 +125,12 @@ class Adiabat(Surrogate):
         # generate the descriptors for the data
         for i in range(nst):
             st = eval_st[i]
-            self.descriptors[st] = self.descriptor.generate(data[0][i,:,:])
+
+            if same_geom:
+                self.descriptors[st] = self.descriptor.generate(data[0])
+            else:
+                self.descriptors[st] = self.descriptor.generate(
+                                                         data[0][i,:,:])
             self.training[st]    = data[1][i,:].copy()
 
         # generate the initial models
@@ -149,9 +157,18 @@ class Adiabat(Surrogate):
         update the surrogate with additional data
         """
 
-        # assumes energies for each state are in columns
-        nst = data[0].shape[0]
-        npt = data[0].shape[1]
+        # sanity check the geometry array
+        nst = len(states)
+        if len(data[0].shape) == 3:
+            if data.shape[0] != nst:
+                print('data.shape: '+str(data.shape)+', nstate=' +
+                    str(nst) + ' in surrogate.create -- ambiguous',
+                    flush=True)
+            npt = [data[i,:,:].shape[0] for i in len(nst)]
+            same_geom = False
+        else:
+            npt = [data[0].shape[0]]*nst
+            same_geom = True
 
         # if states is not given, but the data is for all
         # states, set the eval_states to be all states
@@ -170,18 +187,18 @@ class Adiabat(Surrogate):
             st = eval_st[i]
 
             old = self.descriptors[st].shape[0]
-            new = data[0][i,:,:].shape[0]
-
-            #print(f"Update surrogate: state {st}, training data size={old+new}")
+            if same_geom:
+                new     = data[0].shape[0]
+                new_des = self.descriptor.generate(data[0])
+            else:
+                new = data[0][i,:,:].shape[0]
+                new_des = self.descriptor.generate(data[0][i,:,:])
 
             self.descriptors[st].resize((old + new, d_size))
             self.training[st].resize((old + new))
 
-            self.descriptors[st][old:, :] = self.descriptor.generate(data[0][i,:,:])
+            self.descriptors[st][old:, :] = new_des
             self.training[st][old:]       = data[1][i,:].copy()
-
-            #print('surrogate.training.shape='+str(self.training[0].shape))
-            #print('surrogate.descriptors.shape='+str(self.descriptors[0].shape))
 
             if hparam is not None:
                 self.models[st].kernel.theta = hparam[st]
@@ -190,11 +207,6 @@ class Adiabat(Surrogate):
             if nrestart is not None:
                 self.models[st].set_params(n_restarts_optimizer =
                                                             nrestart)
-
-            #scaler = preprocessing.StandardScaler()
-            #xscaled = scaler.fit_transform(self.descriptors[st])
-            #self.models[st].fit(xscaled,
-            #                    self.training[st])
 
             self.models[st].fit(self.descriptors[st],
                                 self.training[st])
@@ -237,7 +249,19 @@ class Adiabat(Surrogate):
         else:
             eval_st = states
 
-        d_data    = self.descriptor.generate(gms)
+        # accept both a 1D array (single) geometry and a 2D array
+        # (list of geometries)
+        if len(gms.shape) == 2:
+            ngm      = gms.shape[0]
+            eval_gms = gms
+        elif len(gms.shape) == 1:
+            ngm      = 1
+            eval_gms = np.array([gms], dtype=float)
+        else:
+            print('Cannot interprete gms array - surface.evaluate')
+            os.abort()
+
+        d_data    = self.descriptor.generate(eval_gms)
 
         # return as numpy array
         evals  = []
@@ -246,11 +270,18 @@ class Adiabat(Surrogate):
             edata = self.models[st].predict( d_data, 
                                             return_std = std, 
                                             return_cov = cov)
-            if std or cov:
-                evals.append(edata[0])
-                stdcov.append(edata[1])
+            if len(gms.shape) == 1:
+                if std or cov:
+                    evals.append(edata[0][0])
+                    stdcov.append(edata[1][0])
+                else:
+                    evals.append(edata[0])
             else:
-                evals.append(edata)
+                if std or cov:
+                    evals.append(edata[0])
+                    stdcov.append(edata[1])
+                else:
+                    evals.append(edata)
 
         if std or cov:
             return np.array(evals, dtype=float), np.array(stdcov, dtype=float)
@@ -263,6 +294,9 @@ class Adiabat(Surrogate):
                  numerical=False):
         """
         evaluate the gradient using analytical expression
+
+        gradient is returned in a numpy array with 
+        shape = [nst, ngeom, ncrd]
         """
 
         # if numerical, call numerical gradient routine
@@ -276,50 +310,85 @@ class Adiabat(Surrogate):
         else:
             eval_st = states
 
-        d_data   = self.descriptor.generate(gms)
-        des_grad = self.descriptor.descriptor_gradient(gms, d_data)
+        # accept both a 1D array (single) geometry and a 2D array
+        # (list of geometries)
+        if len(gms.shape) == 2:
+            ngm      = gms.shape[0]
+            eval_gms = gms
+        elif len(gms.shape) == 1:
+            ngm      = 1
+            eval_gms = np.array([gms], dtype=float)
+        else:
+            print('Cannot interprete gms array - surface.evaluate')
+            os.abort()
 
-        # print(des_grad.shape)
+        d_data   = self.descriptor.generate(eval_gms)
+        des_grad = self.descriptor.descriptor_gradient(eval_gms, d_data)
 
-        ng = gms.shape[0]
-        nc = gms.shape[1]
+        ng = eval_gms.shape[0]
+        nc = eval_gms.shape[1]
 
-        # print(ng)
-        # print(nc)
-        ana_grad = np.zeros((len(eval_st), ng, nc), dtype=float)
+        ana_grad     = np.zeros((len(eval_st), ng, nc), dtype=float)
         ana_grad_var = np.zeros_like(ana_grad)
         for i in range(len(eval_st)):
             st = eval_st[i]
             for j in range(ng):
                 grad, grad_var_soap  = self.models[st].predict_grad(
-                                     d_data[j, :].reshape(1, -1),
-                                     compute_grad_var=variance)
+                                       d_data[j, :].reshape(1, -1),
+                                       compute_grad_var=variance)
                 grad = np.dot(des_grad[j,: ], grad).squeeze()
                 ana_grad[i, j, :] = grad
                 # print(f"analytical gradient:\n{grad.shape}")
                 if variance:
+                    #print('|descriptor_grad|='+str(np.linalg.norm(des_grad[j,:])))
+                    #print('|grad_var_soap|='+str(np.linalg.norm(grad_var_soap)))
                     grad_var = np.diag(des_grad[j,:] @ grad_var_soap @ des_grad[j,:].T)
                     ana_grad_var[i, j,: ] = grad_var
+                    #print('|grad_var|='+str(np.linalg.norm(grad_var)))
 
-        if variance:
-            return ana_grad, ana_grad_var
+        # return a 2D array (nst, ncrd) if a single geometry is requested,
+        # else return a 3D array (nst, ng, ncrd)
+        if len(gms.shape) == 1:
+            if variance:
+                return ana_grad[:,0,:], ana_grad_var[:,0,:]
+            else:
+                return ana_grad[:,0,:]
         else:
-            return ana_grad
+            if variance:
+                return ana_grad, ana_grad_var
+            else:
+                return ana_grad
 
     #
     def hessian(self, gms, states = None):
         """
         compute the hessian by gradient differences
+
+        hessian is returned in numpy array with the
+        shape = [nst, ng, ncrd, ncrd]
         """
+
+        delta = 1.e-4
 
         if states is None:
             eval_st = list(range(self.nstates))
         else:
             eval_st = states
 
-        delta = 1e-4
-        ng = gms.shape[0]  # number of geometries
-        nc = gms.shape[1]  # number of coordinates
+        # accept both a 1D array (single) geometry and a 2D array
+        # (list of geometries)
+        if len(gms.shape) == 2:
+            ngm      = gms.shape[0]
+            eval_gms = gms
+        elif len(gms.shape) == 1:
+            ngm      = 1
+            eval_gms = np.array([gms], dtype=float)
+        else:
+            print('Cannot interprete gms array - surface.evaluate')
+            os.abort()
+
+        ng = eval_gms.shape[0]  # number of geometries
+        nc = eval_gms.shape[1]  # number of coordinates
         nstates = len(eval_st)
 
         hessall = np.zeros((nstates, ng, nc, nc), dtype=float)
@@ -328,16 +397,16 @@ class Adiabat(Surrogate):
             # gms[i,:] shape: (nc,)
             for k in range(nc):
                 # Prepare displaced geometries for plus and minus displacement
-                disp_plus = np.array(gms[i,:], copy=True)
-                disp_minus = np.array(gms[i,:], copy=True)
+                disp_plus  = eval_gms[i,:].copy()
+                disp_minus = eval_gms[i,:].copy()
 
                 disp_plus[k] += delta
                 disp_minus[k] -= delta
 
                 # Get gradients at displaced points for all eval_st states
                 # Assuming self.gradient returns shape: (nstates, nc)
-                p_grad = self.gradient(disp_plus.reshape(1, -1), states=eval_st)  # shape (nstates, nc)
-                m_grad = self.gradient(disp_minus.reshape(1, -1), states=eval_st)  # shape (nstates, nc)
+                p_grad = self.gradient(disp_plus, states=eval_st)  # shape (nstates, nc)
+                m_grad = self.gradient(disp_minus, states=eval_st)  # shape (nstates, nc)
 
                 # Central difference to approximate second derivative w.r.t coordinate k
                 # For each state, calculate second derivative matrix element for k-th column
@@ -348,7 +417,13 @@ class Adiabat(Surrogate):
             for s in range(nstates):
                 hessall[s, i] = 0.5 * (hessall[s, i] + hessall[s, i].T)
 
-        return hessall
+        # if a single geometry is passed, return 3D array
+        # of hessians per state
+        # else a 4D of hessians per state per geometry
+        if len(gms.shape) == 1:
+            return hessall[:, 0, :, :]
+        else:
+            return hessall
 
     #
     def coupling(self, gms, st_pairs = None):
@@ -359,6 +434,14 @@ class Adiabat(Surrogate):
         os.abort()
 
         return None
+
+    #
+    def training_size(self):
+        """
+        return the dimension of the kernel matrix
+        """
+        return [self.training[st].shape[0]
+                              for st in range(self.nstates)]
 
     #
     def _num_gradient(self, gms, states = None):

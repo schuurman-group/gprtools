@@ -62,7 +62,7 @@ class Soap(Descriptor):
         # return the geometries
         return np.array(descriptors)
 
-    def descriptor_gradient(self, gms, descriptor, delta=0.001):
+    def descriptor_gradient(self, gms, descriptor, delta=0.02):
         """
         calculate gradient of SOAP descritor over cartesian coordinates
         """
@@ -90,5 +90,20 @@ class Soap(Descriptor):
             grad    = (p_grad - m_grad ) / (2.*delta)
 
             des_grad[i,:,:] = grad
+
+        #compare with analytic gradients:
+        #for i in range(ng):
+        #    gm        = np.reshape(gms[i,:]*constants.bohr2ang,(len(self.atoms),3))
+        #    molecule  = Atoms(symbols=self.atoms, positions=gm)
+        #    deriv,descrip = self.generator.derivatives_single(molecule, gm, 
+        #                               indices=[i for i in range(len(self.atoms))])
+        # 
+        #    des_grad[i,:,:] = np.reshape(deriv, (3*len(self.atoms), deriv.shape[-1]))
+
+        #dtest = np.reshape(deriv, (3*len(self.atoms), deriv.shape[-1]))
+        #print('|dtest-darr|='+str(np.linalg.norm(dtest-darr)))
+        #print('darr.shape='+str(darr.shape))
+        #norm_diff = np.linalg.norm(des_grad[0,:,:] - darr)
+        #print('norm_diff='+str(norm_diff))
 
         return des_grad

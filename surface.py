@@ -662,7 +662,6 @@ class ChemPotPy(Surface):
             os.abort()
 
         self.ref_geom = self._chempotpygeom(ref_geom.x / self.gconv)
-        print('chempotpy refgeom='+str(self.ref_geom))
 
         self.have_gradients = True
         self.have_coupling  = True
@@ -673,6 +672,7 @@ class ChemPotPy(Surface):
         evaluate the potential at the passed geometries. Geometries
         are assumed to be a 2D numpy array
         """
+
         if states == None:
             states = [i for i in range(self.nstates)]
         elif max(states) > self.nstates:
@@ -681,20 +681,38 @@ class ChemPotPy(Surface):
             os.abort()
 
         nst = len(states)
-        ngm = gms.shape[0]
-        energies = np.zeros((nst, ngm), dtype=float)
+
+        # accept both a 1D array (single) geometry and a 2D array
+        # (list of geometries)
+        if len(gms.shape) == 2:
+            ngm      = gms.shape[0]
+            eval_gms = gms
+        elif len(gms.shape) == 1:
+            ngm      = 1
+            eval_gms = np.array([gms], dtype=float)
+        else:
+            print('Cannot interprete gms array - surface.evaluate')
+            os.abort()
+
+        # set up energy array and run
+        ener = np.zeros((nst, ngm), dtype=float)
 
         for i in range(ngm):
-            gm             = self._chempotpygeom(gms[i,:] / self.gconv)
-            cppsurf        = chempotpy.p(self.molecule, self.surface, gm)
-            energies[:,i] = cppsurf[[states]]
+            gm        = self._chempotpygeom(eval_gms[i,:] / self.gconv)
+            cppsurf   = chempotpy.p(self.molecule, self.surface, gm)
+            ener[:,i] = cppsurf[[states]]
 
-        energies *= self.econv
+        ener *= self.econv
 
-        return energies
+        # if a single geometry is passed, return 1D of state
+        # energies, else a 2D of state energies per geometry
+        if len(gms.shape) == 1:
+            return ener[:,0]
+        else:
+            return ener
 
     #
-    def gradient(self, gms, states = None, numerical=False):
+    def gradient(self, gms, states=None, numerical=False):
         """
         evaluate the gradients at the passed geometries. Geometries
         are assumed to be a 2D numpy array
@@ -709,14 +727,22 @@ class ChemPotPy(Surface):
 
         nst = len(states)
         nat = len(self.atms)
-        ngm = gms.shape[0]
+
+        # accept both a 1D array (single) geometry and a 2D array
+        # (list of geometries)
+        if len(gms.shape) == 2:
+            ngm      = gms.shape[0]
+            eval_gms = gms
+        elif len(gms.shape) == 1:
+            ngm      = 1
+            eval_gms = np.array([gms], dtype=float)
+        else:
+            print('Cannot interprete gms array - surface.evaluate')
+            os.abort()
+
         grads    = np.zeros((nst, ngm, 3*nat), dtype=float)
 
-        for i in range(ngm):
-            gm           = self._chempotpygeom(gms[i,:] / self.gconv)
-            cppsurf      = chempotpy.pn(self.molecule, self.surface, gm)
-            grads[:,i,:] = np.reshape(cppsurf[1][[states]], (nst, 3*nat))
-
+        # retain the possibility of using numerical gradients 
         if numerical:
             delta = 1e-4
             if states is None:
@@ -727,16 +753,18 @@ class ChemPotPy(Surface):
                 # gms[i,:] shape: (nc,)
                 for k in range(3*nat):
                     # Prepare displaced geometries for plus and minus displacement
-                    disp_plus = np.array(gms[i,:], copy=True)
-                    disp_minus = np.array(gms[i,:], copy=True)
+                    disp_plus = np.array(eval_gms[i,:], copy=True)
+                    disp_minus = np.array(eval_gms[i,:], copy=True)
 
                     disp_plus[k] += delta
                     disp_minus[k] -= delta
 
                     # Get energies at displaced points for all eval_st states
                     # Assuming self.gradient returns shape: (nstates, nc)
-                    p_energy = self.evaluate(disp_plus.reshape(1, -1), states=eval_st)  # shape (nstates)
-                    m_energy = self.evaluate(disp_minus.reshape(1, -1), states=eval_st)  # shape (nstates)
+                    p_energy = self.evaluate(disp_plus.reshape(1, -1), 
+                                          states=eval_st)  # shape (nstates)
+                    m_energy = self.evaluate(disp_minus.reshape(1, -1), 
+                                          states=eval_st)  # shape (nstates)
 
                     # Central difference to approximate second derivative w.r.t coordinate k
                     # For each state, calculate second derivative matrix element for k-th column
@@ -745,28 +773,47 @@ class ChemPotPy(Surface):
 
         else:
             for i in range(ngm):
-                gm           = self._chempotpygeom(gms[i,:] / self.gconv)
+                gm         = self._chempotpygeom(eval_gms[i,:] / self.gconv)
                 cppsurf      = chempotpy.pg(self.molecule, self.surface, gm)
                 grads[:,i,:] = np.reshape(cppsurf[1][[states]], (nst, 3*nat))
 
         grads    *= (self.econv / self.gconv)
 
-        return grads
+        # if a single geometry is passed, return 2D array
+        # of gradients per state
+        # else a 3D of gradients per state per geometry
+        if len(gms.shape) == 1:
+            return grads[:,0,:]
+        else:
+            return grads
 
     #
-    def hessian(self, gms, states = None, numerical_gradient=False):
+    def hessian(self, gms, states=None, num_grad=False):
         """
         compute the hessian by gradient differences
         """
+
+        delta = 1.e-4
 
         if states is None:
             eval_st = list(range(self.nstates))
         else:
             eval_st = states
 
-        delta = 1e-4
-        ng = gms.shape[0]  # number of geometries
-        nc = gms.shape[1]  # number of coordinates
+        # accept both a 1D array (single) geometry and a 2D array
+        # (list of geometries)
+        if len(gms.shape) == 2:
+            ngm      = gms.shape[0]
+            eval_gms = gms
+        elif len(gms.shape) == 1:
+            ngm      = 1
+            eval_gms = np.array([gms], dtype=float)
+        else:
+            print('Cannot interprete gms array - surface.evaluate')
+            os.abort()
+
+        ng = eval_gms.shape[0]  # number of geometries
+        nc = eval_gms.shape[1]  # number of coordinates
         nstates = len(eval_st)
 
         hessall = np.zeros((nstates, ng, nc, nc), dtype=float)
@@ -775,16 +822,18 @@ class ChemPotPy(Surface):
             # gms[i,:] shape: (nc,)
             for k in range(nc):
                 # Prepare displaced geometries for plus and minus displacement
-                disp_plus = np.array(gms[i,:], copy=True)
-                disp_minus = np.array(gms[i,:], copy=True)
+                disp_plus = np.array(eval_gms[i,:], copy=True)
+                disp_minus = np.array(eval_gms[i,:], copy=True)
 
                 disp_plus[k] += delta
                 disp_minus[k] -= delta
 
                 # Get gradients at displaced points for all eval_st states
                 # Assuming self.gradient returns shape: (nstates, nc)
-                p_grad = self.gradient(disp_plus.reshape(1, -1), states=eval_st, numerical=numerical_gradient)  # shape (nstates, nc)
-                m_grad = self.gradient(disp_minus.reshape(1, -1), states=eval_st, numerical=numerical_gradient)  # shape (nstates, nc)
+                p_grad = self.gradient(disp_plus.reshape(1, -1), 
+                            states=eval_st, numerical=num_grad)  # shape (nstates, nc)
+                m_grad = self.gradient(disp_minus.reshape(1, -1), 
+                            states=eval_st, numerical=num_grad)  # shape (nstates, nc)
 
                 # Central difference to approximate second derivative w.r.t coordinate k
                 # For each state, calculate second derivative matrix element for k-th column
@@ -795,7 +844,14 @@ class ChemPotPy(Surface):
             for s in range(nstates):
                 hessall[s, i] = 0.5 * (hessall[s, i] + hessall[s, i].T)
 
-        return hessall
+        # if a single geometry is passed, return 3D array
+        # of hessians per state
+        # else a 4D of hessians per state per geometry
+        if len(gms.shape) == 1:
+            return hessall[:, 0, :, :]
+        else:
+            return hessall
+
     #
     def coupling(self, gms, pairs = None):
         """
@@ -803,20 +859,37 @@ class ChemPotPy(Surface):
         are assumed to be a 2D numpy array
         """
 
+        # accept both a 1D array (single) geometry and a 2D array
+        # (list of geometries)
+        if len(gms.shape) == 2:
+            ngm      = gms.shape[0]
+            eval_gms = gms
+        elif len(gms.shape) == 1:
+            ngm      = 1
+            eval_gms = np.array([gms], dtype=float)
+        else:
+            print('Cannot interprete gms array - surface.coupling')
+            os.abort()
+
         npair = len(pairs)
         nat   = len(self.atms)
-        ngm   = gms.shape[0]
         nacs  = np.zeros((npair, ngm, 3*nat), dtype=float)
 
         for i in range(ngm):
-            gm        = self._chempotpygeom(gms[i,:] / self.gconv)
+            gm        = self._chempotpygeom(eval_gms[i,:] / self.gconv)
             cppsurf   = chempotpy.pgd(self.molecule, self.surface, gm)
             for j in range(npair):
                 nacs[j,i,:] = cppsurf[2][pairs[j][0], pairs[j][1],:].ravel()
 
         nacs  /= self.gconv
 
-        return nacs
+        # if a single geometry is passed, return 2D array
+        # of couplings x nrc
+        # else a 3D of couplings per pair per geometry
+        if len(gms.shape) == 1:
+            return nacs[:, 0, :]
+        else:
+            return nacs
 
     #
     def _chempotpygeom(self, gm):
