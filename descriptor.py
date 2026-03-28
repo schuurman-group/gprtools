@@ -53,24 +53,34 @@ class Soap(Descriptor):
         descriptors = []
         natm        = len(self.atoms)
 
-        for i in range(gms.shape[0]):
-            gm        = np.reshape(gms[i,:]*constants.bohr2ang,(natm,3))
+        if len(gms.shape) == 1:
+            eval_gms = np.array([gms], dtype=float)
+        else:
+            eval_gms = gms
+
+        for i in range(eval_gms.shape[0]):
+            gm        = np.reshape(
+                            eval_gms[i,:]*constants.bohr2ang,(natm,3))
             molecule  = Atoms(symbols=self.atoms, positions=gm)
             descriptor = self.generator.create(molecule)
             descriptors.append(descriptor/np.linalg.norm(descriptor))
 
         # return the geometries
-        return np.array(descriptors)
+        if len(gms.shape) == 1:
+            return np.array(descriptors[0])
+        else:
+            return np.array(descriptors)
 
-    def descriptor_gradient(self, gms, descriptor, delta=0.02):
+
+    def descriptor_gradient(self, gms, delta=0.02):
         """
         calculate gradient of SOAP descritor over cartesian coordinates
         """
         ng = gms.shape[0]
         nc = gms.shape[1]
 
-        n_feature = descriptor.shape[1]
-
+        descriptor = self.generate(gms[0,:])
+        n_feature  = descriptor.shape[0]
         # print(f'ng:{ng}')
         # print(f'nc:{nc}')
         # print(f'n_feature:{n_feature}')

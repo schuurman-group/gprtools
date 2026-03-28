@@ -2,6 +2,7 @@
 The Surface ABC
 """
 import os
+import copy as copy
 from abc import ABC, abstractmethod
 import numpy as np
 import pickle as pickle
@@ -59,8 +60,17 @@ class Adiabat(Surrogate):
                        hparam=[10, 1]):
         super().__init__()
 
+        #print('self.kernel='+str(self.kernel))
+        self.ktype          = kernel
+        self.hparam         = hparam
+        self.nstates        = nstates
+        self.descriptor     = descriptor
+        self.models         = []
+        self.descriptors    = [[]]*nstates
+        self.training       = [[]]*nstates
+
         if kernel == 'RBF':
-            self.kernel = C(hparam[0], 
+            self.kernel = C(hparam[0],
                             constant_value_bounds=(1e-5, 1e5)) * \
                           RBF(hparam[1],
                             length_scale_bounds=(1e-3, 1e3))
@@ -73,12 +83,43 @@ class Adiabat(Surrogate):
             print('Kernel: '+str(kernel)+' not recognized.')
             os.abort()
 
-        #print('self.kernel='+str(self.kernel))
-        self.nstates        = nstates
-        self.descriptor     = descriptor
-        self.models         = []
-        self.descriptors    = [[]]*nstates
-        self.training       = [[]]*nstates
+        #for i in range(self.nstates):
+        #    gpregress = gpr.GPRegressor(
+        #                     kernel               = self.kernel,
+        #                     n_restarts_optimizer = 50,
+        #                     normalize_y          = True,
+        #                     optimizer            = 'fmin_l_bfgs_b')
+        #    self.models.append(gpregress)
+
+    #
+    def copy(self):
+        """
+        copy surrogate object
+        """
+
+        new = Adiabat(self.nstates, 
+                      self.descriptor, 
+                      kernel=self.ktype, 
+                      hparam=self.hparam)
+
+        var_dict = {key:value for key,value in self.__dict__.items()
+                   if not key.startswith('__') and not callable(key)}
+
+        for key, value in var_dict.items():
+            if hasattr(value, 'copy'):
+                setattr(new, key, value.copy())
+            else:
+                setattr(new, key, copy.deepcopy(value))
+
+        return new
+
+    #
+    def create(self, data, states=[], hparam=None, nrestart=None):
+        """
+        create a surrogate with training data, data
+        """
+
+        # create the regressor object
         for i in range(self.nstates):
             gpregress = gpr.GPRegressor(
                              kernel               = self.kernel,
@@ -86,12 +127,6 @@ class Adiabat(Surrogate):
                              normalize_y          = True,
                              optimizer            = 'fmin_l_bfgs_b')
             self.models.append(gpregress)
-
-    #
-    def create(self, data, states=[], hparam=None, nrestart=None):
-        """
-        create a surrogate with training data, data
-        """
 
         # sanity check the geometry array
         nst = len(states) 
@@ -106,7 +141,7 @@ class Adiabat(Surrogate):
             npt = [data[0].shape[0]]*nst
             same_geom = True
 
-        print('shape data[1]='+str(data[1].shape))
+        #print('shape data[1]='+str(data[1].shape))
         # if states is not given, but the data is for all
         # states, set the eval_states to be all states
         if nst == self.nstates and nst==0:
@@ -291,7 +326,7 @@ class Adiabat(Surrogate):
 
     #
     def gradient(self, gms, states=None, variance=False, 
-                 numerical=False):
+                 covariance=False, numerical=False):
         """
         evaluate the gradient using analytical expression
 
@@ -310,54 +345,65 @@ class Adiabat(Surrogate):
         else:
             eval_st = states
 
+        #print('self.descriptor[0]='+str(self.descriptors[0][0,:10]))
         # accept both a 1D array (single) geometry and a 2D array
         # (list of geometries)
         if len(gms.shape) == 2:
-            ngm      = gms.shape[0]
+            ng       = gms.shape[0]
+            nc       = gms.shape[1]
             eval_gms = gms
         elif len(gms.shape) == 1:
-            ngm      = 1
+            ng       = 1
+            nc       = gms.shape[0]
             eval_gms = np.array([gms], dtype=float)
         else:
             print('Cannot interprete gms array - surface.evaluate')
             os.abort()
 
+        #print('ngm='+str(ng))
         d_data   = self.descriptor.generate(eval_gms)
-        des_grad = self.descriptor.descriptor_gradient(eval_gms, d_data)
+        #print('d_data.shape='+str(d_data.shape))
+        #print('d_data.reshape(1,-1).shape='+str(d_data.reshape(1,-1).shape))
+        des_grad = self.descriptor.descriptor_gradient(eval_gms)
+        #print('des_grad.shape='+str(des_grad.shape))
 
-        ng = eval_gms.shape[0]
-        nc = eval_gms.shape[1]
-
-        ana_grad     = np.zeros((len(eval_st), ng, nc), dtype=float)
-        ana_grad_var = np.zeros_like(ana_grad)
+        grad       = np.zeros((len(eval_st), ng, nc), dtype=float)
+        grad_var   = np.zeros((len(eval_st), ng, nc), dtype=float)
+        grad_covar = np.zeros((len(eval_st), ng, nc, nc), dtype=float)
         for i in range(len(eval_st)):
             st = eval_st[i]
             for j in range(ng):
-                grad, grad_var_soap  = self.models[st].predict_grad(
-                                       d_data[j, :].reshape(1, -1),
-                                       compute_grad_var=variance)
-                grad = np.dot(des_grad[j,: ], grad).squeeze()
-                ana_grad[i, j, :] = grad
+                grad_d, grad_var_d  = self.models[st].predict_grad(
+                                      d_data[j, :],
+                                      covariance=True)
+                #print('grad_var_d.shape='+str(grad_var_d.shape))
+                #print('grad_d.shape='+str(grad_d.shape))
+                grad[i,j,:] = np.dot(des_grad[j,: ], grad_d).squeeze()
                 # print(f"analytical gradient:\n{grad.shape}")
-                if variance:
-                    #print('|descriptor_grad|='+str(np.linalg.norm(des_grad[j,:])))
-                    #print('|grad_var_soap|='+str(np.linalg.norm(grad_var_soap)))
-                    grad_var = np.diag(des_grad[j,:] @ grad_var_soap @ des_grad[j,:].T)
-                    ana_grad_var[i, j,: ] = grad_var
-                    #print('|grad_var|='+str(np.linalg.norm(grad_var)))
+                if covariance:
+                    grad_var_c = des_grad[j,:,:] @ grad_var_d @ des_grad[j,:,:].T
+                    #print('grad_var_c.shape='+str(grad_var_c.shape))
+                    grad_var[i, j, : ]      = np.diag(grad_var_c)
+                    grad_covar[i, j, :, :] = grad_var_c
 
+        #print('grad_d='+str(grad_d[:10]))
+        #print('grad='+str(grad[0,0,:]))
         # return a 2D array (nst, ncrd) if a single geometry is requested,
         # else return a 3D array (nst, ng, ncrd)
         if len(gms.shape) == 1:
+            vals = grad[:, 0, :]
             if variance:
-                return ana_grad[:,0,:], ana_grad_var[:,0,:]
-            else:
-                return ana_grad[:,0,:]
+                vals = (vals,) + (grad_var[:, 0, :],)
+            if covariance:
+                vals = (vals,) + (grad_covar[:, 0, :, :],)
         else:
+            vals = grad
             if variance:
-                return ana_grad, ana_grad_var
-            else:
-                return ana_grad
+                vals = (vals,) + (grad_var,)
+            if covariance:
+                vals = (vals,) + (grad_covar,)
+
+        return vals
 
     #
     def hessian(self, gms, states = None):
@@ -464,7 +510,8 @@ class Adiabat(Surrogate):
         o_ener    = self.evaluate(gms, eval_st)
         for i in range(ng):
 
-            origin = np.tile(gms[i,:], (len(eval_st), nc))
+            #origin = np.tile(gms[i,:], (len(eval_st), nc))
+            origin = np.tile(gms[i,:], (nc, len(eval_st)))
 
             disps   = origin + np.diag(np.array([delta]*nc))
             p_ener  = self.evaluate(disps, states=eval_st)

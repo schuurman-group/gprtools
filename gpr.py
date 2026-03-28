@@ -6,7 +6,6 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from scipy.linalg import solve_triangular
 
 GPR_CHOLESKY_LOWER = True
-debug = False
 
 class GPRegressor(GaussianProcessRegressor):
     """
@@ -19,120 +18,157 @@ class GPRegressor(GaussianProcessRegressor):
         """
         super().__init__(**kwargs)
 
-    def _cal_kernel_gradient(self, X):
+    def _cal_kernel_gradient(self, xtest):
         """
         calculate kernel gradient (dk*/dx*) based on the give model 
         hyperparameters and input data
+
+        Xtest         = [Nfeatures]
+        X_train.shape = [Ntraining, Nfeatures]
+        kernel_gradie = [Nfeatures, NTraining]
         """
+        # this function assumes xtest is a single point
+        if len(xtest.shape) > 1:
+            os.abort('_cal_kernel_gradient assumes a single test pt.')
+
         # get hyper parameters
-        hyper_para   = np.exp(self.kernel_.theta)
-        length_scale = hyper_para[1]
+        hyper_para = np.exp(self.kernel_.theta)
+        con        = hyper_para[0]
+        len_scale  = hyper_para[1]
 
-        diff = X.copy() - self.X_train_.copy()
-        kernel_gradient = np.einsum('ai,a->ai', -(diff/length_scale**2), 
-                               self.kernel_(X, self.X_train_).squeeze())
+        Xq   = np.array([xtest], dtype=float)
+        diff = Xq - self.X_train_
 
-        # check if the kernel formula is consitent with the 
-        #built-in function
-        if debug:
-            print(diff.shape)
-            print(X.shape)
-            print(self.X_train_.shape)
-            print(self.alpha_.shape)
-            dists = cdist(X / length_scale, self.X_train_ / 
-                          length_scale, metric="sqeuclidean")
-            kernel = hyper_para[0]*np.exp(-0.5*dists)
-            kernel_test = self.kernel_(X, self.X_train_)
-            assert np.allclose(kernel, kernel_test)
-            os._exit(0)
+        kernel_gradient = np.einsum('ai,a->ai', 
+                          -con*(diff/len_scale**2), 
+                           self.kernel_(Xq, self.X_train_).squeeze())
 
         return kernel_gradient
 
-    def _cal_kernel_hessian(self, X):
+    def _cal_kernel_hessian(self, xtest):
         """
         calculate kernel hessian (dk*^2/dx*_idx_j) based on the give 
         model hyperparameters and input data
         """
-        # get hyper-parameters
-        hyper_para     = np.exp(self.kernel_.theta)
-        num_feature    = X.shape[1]
-        kernel_hessian = (hyper_para[0] / 
-                          hyper_para[1]**2) * np.eye(num_feature)
 
-        if debug: # print for debug
-            print(kernel.shape)
-            print(X.shape)
-            print(dists.shape)
-            print(dists)
-            print(kernel_hessian)
-            kernel_test = self.kernel_(X).copy()
-            print(kernel_test.shape)
-            print(kernel.shape)
-            assert np.allclose(kernel, kernel_test)
-            os._exit(0)
+        # kernel hessian assumes a single test point
+        # this function assumes xtest is a single point, returns
+        # [Nfeature, Nfeature] matrix
+        if len(xtest.shape) > 1:
+            os.abort('_cal_kernel_gradient assumes a single test pt.')
+        
+        # get hyper-parameters
+        hyper_para = np.exp(self.kernel_.theta)
+        con        = hyper_para[0]
+        len_scale  = hyper_para[1]
+
+        num_feature    = xtest.shape[0]
+        kernel_hessian = (con / len_scale**2) * np.eye(num_feature)
 
         return kernel_hessian
 
+    def kernel_gradient(self, X):
+        """
+        compute the derivative of the kernel matrix at query points X
+        """
 
-    def predict_grad(self, X, compute_grad_var=True):
+        # check if this is a single geometry, or as set of points
+        if len(X.shape) == 1:
+            ng   = 1
+            Xmat = np.array([X], dtype=float)
+        else:
+            ng   = X.shape[0]
+            Xmat = X
+
+        (nd, nt) = self.X_train_.shape
+        K_grads = np.zeros((ng, nd, nt), dtype=float)
+        for i in range(ng):
+            K_grads[i,:,:] = self._cal_kernel_gradient(Xmat[i])
+            
+        if len(X.shape)==1:
+            return K_grads[0,:,:]
+        else:
+            return K_grads
+
+    #
+    def kernel_hessian(self, X):
+        """
+        compute the derivative of the kernel matrix at query points X
+        """
+
+        # check if this is a single geometry, or as set of points
+        if len(X.shape) == 1:
+            ng   = 1
+            nd   = X.shape[0]
+            Xmat = np.array([X], dtype=float)
+        else:
+            ng   = X.shape[0]
+            nd   = X.shape[1]
+            Xmat = X
+
+        K_hess = np.zeros((ng, nd, nd), dtype=float)
+        for i in range(ng):
+            K_hess[i,:,:] = self._cal_kernel_hessian(Xmat[i,:])
+            K_hess[i,:,:] = np.squeeze(
+                                np.outer(K_hess[i,:,:],
+                                self._y_train_std**2).reshape(
+                                *(nd,nd), -1), axis=2)
+
+        if len(X.shape)==1:
+            return K_hess[0,:,:]
+        else:
+            return K_hess
+
+    #
+    def predict_grad(self, X, covariance=True):
         """Predict analytical gradient of the target function.
         """
         # calcuate analytical gradient of the target fucntion 
         # according 2.100 of McHutchon PhD thesis
-        kernel_gradient = self._cal_kernel_gradient(X)
+        if len(X.shape) > 1:
+            os.abort('predicting multiple gradients not currently supported')
 
-        y_grad = kernel_gradient.transpose() @ self.alpha_
+        kernel_gradient = self.kernel_gradient(X)
+        #print('kernel_gradient.shape='+str(kernel_gradient.shape))
+        #print('self.X_train.shape='+str(self.X_train_.shape))
+        #print('X.shape='+str(X.shape))
+        y_grad = np.transpose(kernel_gradient) @ self.alpha_
 
         # undo normalisation
-        y_grad = self._y_train_std * y_grad
+        y_grad *= self._y_train_std
 
-        # if we don't need to compute the variance,
+        # if we don't need to compute the co-variance,
         # exit here.
-        if not compute_grad_var:
+        if not covariance:
             return y_grad, None
 
-        kernel_hessian = self._cal_kernel_hessian(X)
+        kernel_hessian = self.kernel_hessian(X)
+        #print('kernel_hessian.shape='+str(kernel_hessian.shape))
 
         # using Cholesky decomposition of efficiently evaluate the 
         # second term in gradient variance expression
         V = solve_triangular(self.L_, kernel_gradient, 
                             lower=GPR_CHOLESKY_LOWER, 
                              check_finite=False)
-        temp = V.T @ V
+        #print('V.shape='+str(V.shape))
+        kKinvk = V.T @ V
 
         # calcuate gradient variance 
         # (in analogy of how to calcuate variance)
-        y_grad_var = kernel_hessian - temp
+        y_grad_covar = kernel_hessian - kKinvk
+
+        #print('y_grad_var.shape='+str(y_grad_var.shape))
 
         # undo normalization
-        y_grad_var = np.outer(y_grad_var, 
+        y_grad_covar = np.outer(y_grad_covar, 
                         self._y_train_std**2).reshape(
-                                    *y_grad_var.shape, -1)
+                                    *y_grad_covar.shape, -1)
+        #print('shape of unorm='+str(np.outer(y_grad_var,self._y_train_std**2).shape))
+        #print('y_grad_var.shape='+str(y_grad_var.shape))
 
         # if y_cov has shape (n_samples, n_samples, 1), 
         # reshape to (n_samples, n_samples)
-        if y_grad_var.shape[2] == 1:
-            y_grad_var = np.squeeze(y_grad_var, axis=2)
+        if y_grad_covar.shape[2] == 1:
+            y_grad_covar = np.squeeze(y_grad_covar, axis=2)
 
-        if debug: # print for debug
-            # check if Cholecky decomposition is performed correctly
-            K_test = self.kernel_(self.X_train_)
-            k_star = self.kernel_(X, self.X_train_)
-            K_test[np.diag_indices_from(K_test)] += self.alpha
-            K_inv_test = np.linalg.inv(K_test)
-            Y =  kernel_gradient.T @ K_inv_test @ kernel_gradient
-            print(Y.shape)
-            print(kernel_gradient.shape)
-            print(abs(Y).max())
-            print(abs(temp).max())
-            print(abs(Y-temp).max())
-            print(k_star.shape)
-            print(kernel_gradient.shape)
-            #assert np.allclose(Y, temp)
-
-            print(f'shape of kernel gradient: {kernel_gradient.shape}')
-            print(f'shape of V matrix:{V.shape}')
-            print(f'shape of kernel hessian: {kernel_hessian.shape}')
-            print(f'shape of gradient variance:{y_grad_var.shape}')
-
-        return y_grad, y_grad_var
+        return y_grad, y_grad_covar
