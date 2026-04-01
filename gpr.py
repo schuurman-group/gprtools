@@ -18,7 +18,7 @@ class GPRegressor(GaussianProcessRegressor):
         """
         super().__init__(**kwargs)
 
-    def _cal_kernel_gradient(self, xtest):
+    def _cal_kernel_gradient(self, xtest, kernel=False):
         """
         calculate kernel gradient (dk*/dx*) based on the give model 
         hyperparameters and input data
@@ -37,10 +37,16 @@ class GPRegressor(GaussianProcessRegressor):
         len_scale  = hyper_para[1]
 
         Xq   = np.array([xtest], dtype=float)
-        diff = Xq - self.X_train_
 
-        kernel_gradient = np.einsum('ai,a->ai', 
-                          -con*(diff/len_scale**2), 
+        if kernel:
+            diff = Xq - Xq
+            kernel_gradient = np.einsum('ai,a->',
+                           -(diff/len_scale**2),
+                           self.kernel_(Xq, Xq).squeeze())
+        else:
+            diff = Xq - self.X_train_
+            kernel_gradient = np.einsum('ai,a->ai', 
+                           -(diff/len_scale**2), 
                            self.kernel_(Xq, self.X_train_).squeeze())
 
         return kernel_gradient
@@ -67,7 +73,7 @@ class GPRegressor(GaussianProcessRegressor):
 
         return kernel_hessian
 
-    def kernel_gradient(self, X):
+    def kernel_gradient(self, X, kernel=False):
         """
         compute the derivative of the kernel matrix at query points X
         """
@@ -83,7 +89,7 @@ class GPRegressor(GaussianProcessRegressor):
         (nd, nt) = self.X_train_.shape
         K_grads = np.zeros((ng, nd, nt), dtype=float)
         for i in range(ng):
-            K_grads[i,:,:] = self._cal_kernel_gradient(Xmat[i])
+            K_grads[i,:,:] = self._cal_kernel_gradient(Xmat[i], kernel)
             
         if len(X.shape)==1:
             return K_grads[0,:,:]
@@ -118,6 +124,14 @@ class GPRegressor(GaussianProcessRegressor):
             return K_hess[0,:,:]
         else:
             return K_hess
+
+    # 
+    def kernel_q_X(self, q):
+        """
+        return the k(xq, Xtrain) kernel matrix
+        """
+        qt = np.array([q], dtype=float)
+        return self.kernel_(qt, self.X_train_).squeeze()
 
     #
     def predict_grad(self, X, covariance=True):
@@ -166,8 +180,8 @@ class GPRegressor(GaussianProcessRegressor):
         #print('shape of unorm='+str(np.outer(y_grad_var,self._y_train_std**2).shape))
         #print('y_grad_var.shape='+str(y_grad_var.shape))
 
-        # if y_cov has shape (n_samples, n_samples, 1), 
-        # reshape to (n_samples, n_samples)
+        # if y_cov has shape (n_crd, n_crd, 1), 
+        # reshape to (n_crd, n_crd)
         if y_grad_covar.shape[2] == 1:
             y_grad_covar = np.squeeze(y_grad_covar, axis=2)
 

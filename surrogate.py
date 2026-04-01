@@ -318,6 +318,8 @@ class Adiabat(Surrogate):
                 else:
                     evals.append(edata)
 
+        # evals.shape = [ns, ngm]
+        # if std, stdcov.shape = [ns, ngm], else, stdcov.shape=[ns, ngm, ngm]
         if std or cov:
             return np.array(evals, dtype=float), np.array(stdcov, dtype=float)
         else:
@@ -383,7 +385,7 @@ class Adiabat(Surrogate):
                 if covariance:
                     grad_var_c = des_grad[j,:,:] @ grad_var_d @ des_grad[j,:,:].T
                     #print('grad_var_c.shape='+str(grad_var_c.shape))
-                    grad_var[i, j, : ]      = np.diag(grad_var_c)
+                    grad_var[i, j, : ]     = np.diag(grad_var_c)
                     grad_covar[i, j, :, :] = grad_var_c
 
         #print('grad_d='+str(grad_d[:10]))
