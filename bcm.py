@@ -303,8 +303,11 @@ class BCM():
                 #print('Cqi_inv.shape='+str(Cqi_inv[0].shape))
                 for k in range(ngm):
                     # accummulate covariance
+                    std_0_sq = self.surrogates[0].models[sts[j]]._y_train_std**2
+                    std_i_sq = self.surrogates[i].models[sts[j]]._y_train_std**2
+                     
                     cov_bcm[j, k, :, :] += np.linalg.pinv(
-                                                 gcov_data[j,k,:,:])
+                                          gcov_data[j,k,:,:])*(std_i_sq/std_0_sq)
 
                     P = np.linalg.pinv(
                             self.surrogates[i].models[sts[j]].L_).T
