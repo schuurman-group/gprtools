@@ -114,7 +114,7 @@ class BCM():
                 return eval_bcm[0,:]
 
     #
-    def gradient(self, gms, states=None, variance=False,
+    def gradient_orig(self, gms, states=None, variance=False,
                                                  numerical=False):
         """
         evaluate the gradient using analytical expression
@@ -158,7 +158,7 @@ class BCM():
                 cov  = [np.linalg.pinv(cov_data[j,k,:,:]) 
                                                     for k in range(ngm)]
                 for k in range(ngm):
-                    cov_bcm[j, k, :, :] = cov[k]
+                    cov_bcm[j, k, :, :] += cov[k]
                     grad_bcm[j, k, :]    = np.dot(cov[k], g_data[j, k, :])
         
         # compute covariance matrix for query points
@@ -198,7 +198,7 @@ class BCM():
 
     #
     #
-    def gradient_new(self, gms, states=None, variance=False,
+    def gradient(self, gms, states=None, variance=False,
                                                  numerical=False):
         """
         evaluate the gradient using analytical expression
@@ -234,11 +234,12 @@ class BCM():
         d_grad   = self.surrogates[0].descriptor.descriptor_gradient(eval_gms)
 
         # kernel gradient matrix over test data: del k(x*, x*) / d x_i
-        # in case of 1 test point, is vector:q
+        # in case of 1 test point, is vector
         dki = np.array([[[np.zeros(d_gm.shape[1], dtype=float) 
                          for k in range(ngm)]
                          for j in range(ns)]
                          for i in range(nsurr)])
+
         #print('dki.shape='+str(dki.shape))
         # kernel gradient matrix between test and training data: 
         # delk(x*, Xin) / del x_i
@@ -288,7 +289,7 @@ class BCM():
             # of the gradient, so:
             # g_data.shape    = (ns, ngm, nc)
             # gcov_data.shape = (ns, ngm, nc, nc)
-            g_data, cov_data  = self.surrogates[i].gradient(eval_gms,
+            g_data, gcov_data  = self.surrogates[i].gradient(eval_gms,
                                                     states=sts,
                                                     variance=False,
                                                     covariance=True,
@@ -296,12 +297,18 @@ class BCM():
 
             #print('surrogate, i='+str(i)+' grad nascent='+str(g_data[0,0,:]))
             for j in range(ns):
+
                 #Cqi_inv  = [np.linalg.pinv(ecov_data[j,:,:]) for k in range(ngm)]
                 Cqi_inv  = [1./ecov_data[j,0,0] for k in range(ngm)]
                 #print('Cqi_inv.shape='+str(Cqi_inv[0].shape))
                 for k in range(ngm):
-                    P = np.linalg.pinv(self.surrogates[i].models[sts[j]].L_).T
-                    Kinv = P.T @ P
+                    # accummulate covariance
+                    cov_bcm[j, k, :, :] += np.linalg.pinv(
+                                                 gcov_data[j,k,:,:])
+
+                    P = np.linalg.pinv(
+                            self.surrogates[i].models[sts[j]].L_).T
+                    Kinv = P @ P.T
                     #print('Kinv.shape='+str(Kinv.shape))
                     #print('dkX[i.j.k].shape='+str(dkX[i,j,k].shape))
                     #print('kqX.shape='+str(kqX[i,j,k].shape))
@@ -312,8 +319,11 @@ class BCM():
                     #print('dkKinvk_c.shape='+str(dk_Kinv_k_c.shape))
                     #print('dki_c.shape='+str(dki_c.shape))
 
-                    dCi            = -dki_c + dk_Kinv_k_c
-                    # this assumes a single point, so Cqi_inv is a scalar
+                    dCi            = (-dki_c + dk_Kinv_k_c)*self.surrogates[i].models[sts[j]]._y_train_std**2
+                    # dCi is the gradient of the *normalized* posterior variance
+                    # correction k(x*,X)K⁻¹k(X,x*). The BCM weights use the
+                    # *unnormalized* variance (σ²_u = std² · σ²_norm), so the
+                    # chain rule requires an extra std² factor here.
                     Cinv_grad      = Cqi_inv[k]*g_data[j, k, :]
                     #print('Cinv_grad.shape='+str(Cinv_grad.shape))
 
@@ -326,34 +336,32 @@ class BCM():
                     #print('delCinv.shape='+str(delCinv.shape))
                     #print('express.shape='+str((Cqi_inv[k] * dCi * Cqi_inv[k]*e_data[j,k]).shape))
                     CdCC[j,k,:]    += Cqi_inv[k] * dCi * Cqi_inv[k]*e_data[j,k] + Cinv_grad
-                    #print('CdCC.shape='+str(CdCC.shape))
-                    cov_bcm        += np.linalg.pinv(cov_data[j,k,:,:])
-                    print('contribution surrogate '+str(i)+'-> |CdCC|='+str(np.linalg.norm(Cqi_inv[k] * dCi * Cqi_inv[k]*e_data[j,k] + Cinv_grad)))
-                    print('contribution surrogate '+str(i)+'-> |e_bcm|='+str(Cqi_inv[k] * e_data[j, k]))
-                    print('contribution surrogate '+str(i)+'-> |delCinv|='+str(Cqi_inv[k] * dCi * Cqi_inv[k]))
 
         # compute covariance matrix for query points
         M = len(self.surrogates)
+        k_data = [np.array([self.surrogates[i].models[st].kernel_hessian(d_gm)
+                                          for i in range(nsurr)], dtype=float)
+                                          for st in sts]
+        sigma_qq_inv = [[d_grad[i,:,:] @
+                         k_data[st][0, i,:,:] @
+                         d_grad[i,:,:].T
+                        for st in range(ns)]
+                        for i in range(ngm)]
 
         for i in range(ngm):
             for j in range(ns):
+                cov_bcm[j, i, :, :] += -(M - 1)*sigma_qq_inv[j][i]
+                cov_bcm[j, i, :, :]  = np.linalg.pinv(cov_bcm[j, i, :, :])
+
                 #print('C_bcm[j,k].shape='+str(C_bcm.shape))
                 #C = -(M-1)*np.linalg.pinv(kii[j,0]) + C_bcm[j,i,0]
-                C = -(M-1)*(1./kii[j,0,0,0]) + C_bcm[j,i,0]
+                C = -(M-1)*(1./kii[0,j,i,i]) + C_bcm[j,i,0]
                 #print('C.shape='+str(C.shape))
                 #Cinv = np.linalg.pinv(C)
                 Cinv = 1./C
                 #print('Cinv.shape='+str(Cinv.shape))
-                dCinv = Cinv * ((M-1)*dki_c - delCinv[j,k,:]) * Cinv
-                print('ebcm='+str(e_bcm[j,i]))
-                print('|dCinv|='+str(np.linalg.norm(dCinv)))
-                print('Cinv='+str(Cinv))
-                print('|CdCC|='+str(np.linalg.norm(CdCC[j,i,:])))
-                print('|term1| + |term2|='+str(np.linalg.norm(dCinv * e_bcm[j,i]))+' + '+str(np.linalg.norm(Cinv * CdCC[j,i,:])))
-                if M == 2:
-                    grad_bcm[j, i, :] = dCinv * e_bcm[j,i] - Cinv * CdCC[j,i,:]
-                else:
-                    grad_bcm[j, i, :] = dCinv * e_bcm[j,i] + Cinv * CdCC[j,i,:]
+                dCinv = Cinv * ((M-1)*dki_c - delCinv[j,i,:]) * Cinv
+                grad_bcm[j, i, :] = dCinv * e_bcm[j,i] + Cinv * CdCC[j,i,:]
                 #print('grad.shape='+str((dCinv * e_bcm[j,i] + Cinv * CdCC[j,i,:]).shape))
 
         #print('grad bcm='+str(grad_bcm[0,0,:]))

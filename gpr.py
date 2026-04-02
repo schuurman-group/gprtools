@@ -43,6 +43,7 @@ class GPRegressor(GaussianProcessRegressor):
             kernel_gradient = np.einsum('ai,a->',
                            -(diff/len_scale**2),
                            self.kernel_(Xq, Xq).squeeze())
+
         else:
             diff = Xq - self.X_train_
             kernel_gradient = np.einsum('ai,a->ai', 
