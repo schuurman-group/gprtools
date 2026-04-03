@@ -18,7 +18,7 @@ class GPRegressor(GaussianProcessRegressor):
         """
         super().__init__(**kwargs)
 
-    def _cal_kernel_gradient(self, xtest, kernel=False):
+    def _cal_kernel_gradient(self, X, kernel=False):
         """
         calculate kernel gradient (dk*/dx*) based on the give model 
         hyperparameters and input data
@@ -28,7 +28,7 @@ class GPRegressor(GaussianProcessRegressor):
         kernel_gradie = [Nfeatures, NTraining]
         """
         # this function assumes xtest is a single point
-        if len(xtest.shape) > 1:
+        if len(X.shape) > 1:
             os.abort('_cal_kernel_gradient assumes a single test pt.')
 
         # get hyper parameters
@@ -36,7 +36,7 @@ class GPRegressor(GaussianProcessRegressor):
         con        = hyper_para[0]
         len_scale  = hyper_para[1]
 
-        Xq   = np.array([xtest], dtype=float)
+        Xq   = np.array([X], dtype=float)
 
         if kernel:
             diff = Xq - Xq
@@ -52,7 +52,7 @@ class GPRegressor(GaussianProcessRegressor):
 
         return kernel_gradient
 
-    def _cal_kernel_hessian(self, xtest):
+    def _cal_kernel_hessian(self, X):
         """
         calculate kernel hessian (dk*^2/dx*_idx_j) based on the give 
         model hyperparameters and input data
@@ -61,7 +61,7 @@ class GPRegressor(GaussianProcessRegressor):
         # kernel hessian assumes a single test point
         # this function assumes xtest is a single point, returns
         # [Nfeature, Nfeature] matrix
-        if len(xtest.shape) > 1:
+        if len(X.shape) > 1:
             os.abort('_cal_kernel_gradient assumes a single test pt.')
         
         # get hyper-parameters
@@ -69,7 +69,7 @@ class GPRegressor(GaussianProcessRegressor):
         con        = hyper_para[0]
         len_scale  = hyper_para[1]
 
-        num_feature    = xtest.shape[0]
+        num_feature    = X.shape[0]
         kernel_hessian = (con / len_scale**2) * np.eye(num_feature)
 
         return kernel_hessian
@@ -135,55 +135,88 @@ class GPRegressor(GaussianProcessRegressor):
         return self.kernel_(qt, self.X_train_).squeeze()
 
     #
-    def predict_grad(self, X, covariance=True):
+    def predict_grad(self, X, std=False, cov=False):
         """Predict analytical gradient of the target function.
         """
         # calcuate analytical gradient of the target fucntion 
         # according 2.100 of McHutchon PhD thesis
-        if len(X.shape) > 1:
-            os.abort('predicting multiple gradients not currently supported')
+        Xmat, (ngm, nfeature), singleX = self._verify_geoms(X)
+        grad = np.zeros((ngm, nfeature), dtype=float)
+        gstd = np.zeros((ngm, nfeature), dtype=float)
+        gcov = np.zeros((ngm, nfeature, nfeature), dtype=float)
 
-        kernel_gradient = self.kernel_gradient(X)
-        #print('kernel_gradient.shape='+str(kernel_gradient.shape))
-        #print('self.X_train.shape='+str(self.X_train_.shape))
-        #print('X.shape='+str(X.shape))
-        y_grad = np.transpose(kernel_gradient) @ self.alpha_
+        for i in range(ngm):
 
-        # undo normalisation
-        y_grad *= self._y_train_std
+            kernel_gradient = self.kernel_gradient(Xmat[i,:])
+            grad[i,:] = np.transpose(kernel_gradient) @ self.alpha_
 
-        # if we don't need to compute the co-variance,
-        # exit here.
-        if not covariance:
-            return y_grad, None
+            # undo normalisation
+            grad[i,:] *= self._y_train_std
 
-        kernel_hessian = self.kernel_hessian(X)
-        #print('kernel_hessian.shape='+str(kernel_hessian.shape))
+            # if we don't need to compute the co-variance,
+            # exit here.
+            if not std and not cov:
+                continue
 
-        # using Cholesky decomposition of efficiently evaluate the 
-        # second term in gradient variance expression
-        V = solve_triangular(self.L_, kernel_gradient, 
+            kernel_hessian = self.kernel_hessian(Xmat[i,:])
+
+            # using Cholesky decomposition of efficiently evaluate
+            # the second term in gradient variance expression
+            V = solve_triangular(self.L_, kernel_gradient, 
                             lower=GPR_CHOLESKY_LOWER, 
                              check_finite=False)
-        #print('V.shape='+str(V.shape))
-        kKinvk = V.T @ V
 
-        # calcuate gradient variance 
-        # (in analogy of how to calcuate variance)
-        y_grad_covar = kernel_hessian - kKinvk
+            #print('V.shape='+str(V.shape))
+            kKinvk = V.T @ V
 
-        #print('y_grad_var.shape='+str(y_grad_var.shape))
+            # calcuate gradient variance 
+            # (in analogy of how to calcuate variance)
+            gcov[i] = kernel_hessian - kKinvk
 
-        # undo normalization
-        y_grad_covar = np.outer(y_grad_covar, 
-                        self._y_train_std**2).reshape(
-                                    *y_grad_covar.shape, -1)
-        #print('shape of unorm='+str(np.outer(y_grad_var,self._y_train_std**2).shape))
-        #print('y_grad_var.shape='+str(y_grad_var.shape))
+            # undo normalization
+            gcov[i] = np.outer(gcov[i], self._y_train_std**2).reshape(
+                                          *gcov[i].shape, -1).squeeze()
+            gstd[i] = np.sqrt(np.absolute(np.diag(gcov[i])))
 
-        # if y_cov has shape (n_crd, n_crd, 1), 
-        # reshape to (n_crd, n_crd)
-        if y_grad_covar.shape[2] == 1:
-            y_grad_covar = np.squeeze(y_grad_covar, axis=2)
+       # if we don't need to compute the co-variance,
+       # exit here.
+        if singleX:
+            g_std_cov = (grad[0], gstd[0], gcov[0])
+        else:
+            g_std_cov = (grad, gstd, gcov)
+        inc = (True, std, cov)
 
-        return y_grad, y_grad_covar
+        args = ()
+        for i in range(len(g_std_cov)):
+            if inc[i]:
+                args += (g_std_cov[i],)
+            else:
+                args += (None,)
+
+        return args 
+
+    # it is exceedingly convenient to handle either a single geometry
+    # or multiple geometries with a single function and return either 
+    # a single prediction or a matrix/vector of predictions. So: we 
+    # convert single geometries into a single row matrix so all functions
+    # can behave the same
+    def _verify_geoms(self, X):
+        """
+        if len(X.shape) == 2, return X and single_geom=False
+        if len(X.shape) == 1, convert to a single row matrix, 
+                              single_geom = True
+        """
+        single_x = False
+        if len(X.shape) == 1:
+            single_x = True
+            ngm      = 1
+            nvar     = X.shape[0]
+            Xmat     = np.array([X], dtype=float)
+        else:
+            ngm      = X.shape[0]
+            nvar = X.shape[1]
+            Xmat     = X
+
+        return Xmat, (ngm, nvar), single_x
+
+

@@ -58,153 +58,75 @@ class BCM():
         # if no specific states are requested, return all state
         # energies
         if states == None:
-            eval_st = [i for i in range(self.nstates)]
+            sts = [i for i in range(self.nstates)]
         else:
-            eval_st = states
+            sts = states
 
-        # accept both a 1D array (single) geometry and a 2D array
-        # (list of geometries)
-        if len(gms.shape) == 2:
-            ngm      = gms.shape[0]
-            eval_gms = gms
-        elif len(gms.shape) == 1:
-            ngm      = 1
-            eval_gms = np.array([gms], dtype=float)
-        else:
-            print('Cannot interprete gms array - bcm.evaluate')
-            os.abort()
+        ns = len(sts)
+        M  = len(self.surrogates)
 
-        eval_bcm = np.zeros((len(eval_st), ngm), dtype=float)
-        cov_bcm  = np.zeros((len(eval_st), ngm, ngm), dtype=float)
+        # ensure geometries have the appropriate layout
+        Xq, (ngm, nc), singleX = self._verify_geoms(gms)
+
+        eval_bcm = np.zeros((ns, ngm), dtype=float)
+        std_bcm  = np.zeros((ns, ngm), dtype=float)
+        cov_bcm  = np.zeros((ns, ngm, ngm), dtype=float)
 
         # return as numpy array
-        for i in range(len(self.surrogates)):
-            e_data, cov_data = self.surrogates[i].evaluate(eval_gms, 
-                                                    states=eval_st, 
-                                                    std=False, cov=True)
-            for j in range(len(eval_st)):
-                cov               = np.linalg.pinv(cov_data[j,:,:])
-                cov_bcm[j, :, :] += cov
-                eval_bcm[j, :]   += np.dot(cov, e_data[j])
+        for i in range(M):
+            e_data, e_cov = self.surrogates[i].evaluate(Xq, 
+                                                states=sts, 
+                                                std=False, 
+                                                cov=True)
+            for j in range(ns):
+                e_cov_inv         = np.linalg.pinv(e_cov[j,:,:])
+                cov_bcm[j, :, :] += e_cov_inv
+                eval_bcm[j, :]   += np.dot(e_cov_inv, e_data[j])
 
         # compute covariance matrix for query points
-        M = len(self.surrogates)
-        d_data  = self.surrogates[0].descriptor.generate(eval_gms)
+        d_data  = self.surrogates[0].descriptor.generate(Xq)
         k_data  = [self.surrogates[0].models[st].kernel_(d_data) 
-                                              for st in eval_st]
+                                              for st in sts]
         sigma_qq_inv = [np.linalg.pinv(k_data[st]) 
-                                  for st in range(len(eval_st))]
+                                              for st in range(ns)]
 
-        for j in range(len(eval_st)):
+        for j in range(ns):
             cov_bcm[j, :, :] += -(M - 1)*sigma_qq_inv[j]
             cov_bcm[j, :, :]  = np.linalg.pinv(cov_bcm[j, :, :])
+            std_bcm[j, :]     = np.sqrt(np.absolute(
+                                             np.diag(cov_bcm[j, :, :])))
             eval_bcm[j, :]    = np.dot(cov_bcm[j, :, :], eval_bcm[j, :])
 
-        if ngm > 1:
-            if std:
-                return eval_bcm, [np.sqrt(np.diag(cov_bcm[j, :,:])) 
-                                     for j in range(len(eval_st))]
-            else:
-                return eval_bcm
+        if singleX:
+            args = self._collect_output((eval_bcm[:, 0], 
+                                         std_bcm[:, 0], 
+                                         cov_bcm[:, 0, 0]),
+                                         (True, std, cov))
         else:
-            if std:
-                return eval_bcm[0,:], [cov_bcm[j,0,0] 
-                                     for j in range(len(eval_st))]
-            else:
-                return eval_bcm[0,:]
+            args = self._collect_output((eval_bcm, std_bcm, cov),
+                                         (True, std, cov))
+
+        return args
 
     #
-    def gradient_orig(self, gms, states=None, variance=False,
+    #
+    def gradient(self, gms, states=None, std=False, cov=False,
                                                  numerical=False):
         """
         evaluate the gradient using analytical expression
 
         gradient is returned in a numpy array with 
         shape = [nst, ngeom, ncrd]
-        """
-        # if no specific states are requested, return all state
-        # energies
-        if states == None:
-            eval_st = [i for i in range(self.nstates)]
-        else:
-            eval_st = states
 
-        # accept both a 1D array (single) geometry and a 2D array
-        # (list of geometries)
-        if len(gms.shape) == 2:
-            ngm      = gms.shape[0]
-            nc       = gms.shape[1]
-            eval_gms = gms
-        elif len(gms.shape) == 1:
-            ngm      = 1
-            nc       = gms.shape[0]
-            eval_gms = np.array([gms], dtype=float)
-        else:
-            print('Cannot interprete gms array - bcm.evaluate')
-            os.abort()
+        NOTE: we CHOOSE to evaluate geometries one at a time so
+        that the gradient remains uniquely defined. If we form the
+        full BCM covariance matrix for an ensemble of points, 
+        the gradient at a single point would _depend on the 
+        points in the ensemble_. This is not desirable. 
 
-        grad_bcm = np.zeros((len(eval_st), ngm, nc), dtype=float)
-        cov_bcm  = np.zeros((len(eval_st), ngm, nc, nc), dtype=float)
-
-        # return as numpy array
-        for i in range(len(self.surrogates)):
-            g_data, cov_data = self.surrogates[i].gradient(eval_gms, 
-                                                    states=eval_st,
-                                                    variance=False,
-                                                    covariance=True, 
-                                                    numerical=numerical)
-            #print('surrogate, i='+str(i)+' grad nascent='+str(g_data[0,0,:]))
-            for j in range(len(eval_st)):
-                cov  = [np.linalg.pinv(cov_data[j,k,:,:]) 
-                                                    for k in range(ngm)]
-                for k in range(ngm):
-                    cov_bcm[j, k, :, :] += cov[k]
-                    grad_bcm[j, k, :]    = np.dot(cov[k], g_data[j, k, :])
-        
-        # compute covariance matrix for query points
-        M = len(self.surrogates)
-        d_data = self.surrogates[0].descriptor.generate(eval_gms)
-        d_grad = self.surrogates[0].descriptor.descriptor_gradient(eval_gms)
-        k_data = [self.surrogates[0].models[st].kernel_hessian(d_data)
-                                                      for st in eval_st]
-        sigma_qq_inv = [[d_grad[i,:,:] @ 
-                         k_data[st][i,:,:] @ 
-                         d_grad[i,:,:].T 
-                        for st in range(len(eval_st))]
-                        for i in range(ngm)]
-
-        for st in range(len(eval_st)):
-            for i in range(ngm):
-                cov_bcm[st, i, :, :] += -(M - 1)*sigma_qq_inv[st][i]
-                cov_bcm[st, i, :, :]  = np.linalg.pinv(cov_bcm[st, i, :, :])
-                grad_bcm[st, i, :]    = np.dot(cov_bcm[st, i, :, :], grad_bcm[st, i, :])
-
-        #print('grad bcm='+str(grad_bcm[0,0,:]))
-        var_bcm = np.array([[np.diag(cov_bcm[j, k, :, :]) 
-            for j in range(len(eval_st))] for k in range(ngm)], dtype=float)
-
-        # return a 2D array (nst, ncrd) if a single geometry is requested,
-        # else return a 3D array (nst, ng, ncrd)
-        if ngm > 1:
-            vals = grad_bcm
-            if variance:
-                vals = (vals,) + (var_bcm,)
-        else:
-            vals = grad_bcm[:, 0, :]
-            if variance:
-                vals = (vals,) + (var_bcm[:, 0, :],)
-
-        return vals
-
-    #
-    #
-    def gradient(self, gms, states=None, variance=False,
-                                                 numerical=False):
-        """
-        evaluate the gradient using analytical expression
-
-        gradient is returned in a numpy array with 
-        shape = [nst, ngeom, ncrd]
+        However, this is now inconsistent with the potential
+        evaluation, which _does_ form the full covariance matrix. We
+        should look into this at a later date...
         """
         # if no specific states are requested, return all state
         # energies
@@ -215,176 +137,168 @@ class BCM():
             sts  = states
             ns   = len(sts)
 
-        # accept both a 1D array (single) geometry and a 2D array
-        # (list of geometries)
-        if len(gms.shape) == 2:
-            ngm      = gms.shape[0]
-            nc       = gms.shape[1]
-            eval_gms = gms
-        elif len(gms.shape) == 1:
-            ngm      = 1
-            nc       = gms.shape[0]
-            eval_gms = np.array([gms], dtype=float)
-        else:
-            print('Cannot interprete gms array - bcm.evaluate')
-            os.abort()
+        # ensure geometries have the appropriate layout
+        Xq, (ngm, nc), singleX = self._verify_geoms(gms)
 
-        nsurr    = len(self.surrogates)
-        d_gm     = self.surrogates[0].descriptor.generate(eval_gms)
-        d_grad   = self.surrogates[0].descriptor.descriptor_gradient(eval_gms)
+        # number of surrogates in the BCM
+        M      = len(self.surrogates)
+        # d_gm.shape = (ngm, nfeature)
+        d_gm   = self.surrogates[0].descriptor.generate(Xq)
+        n_f    = d_gm.shape[1] 
+        # d_grad.shape = (ngm, nc, nfeature)
+        d_grad = self.surrogates[0].descriptor.descriptor_gradient(Xq)
 
-        # kernel gradient matrix over test data: del k(x*, x*) / d x_i
-        # in case of 1 test point, is vector
-        dki = np.array([[[np.zeros(d_gm.shape[1], dtype=float) 
-                         for k in range(ngm)]
-                         for j in range(ns)]
-                         for i in range(nsurr)])
-
-        #print('dki.shape='+str(dki.shape))
-        # kernel gradient matrix between test and training data: 
-        # delk(x*, Xin) / del x_i
-        dkX = np.array([[[
-                    self.surrogates[i].models[sts[j]].kernel_gradient(
-                      d_gm[k,:]) 
-                         for k in range(ngm)]
-                         for j in range(ns)]
-                         for i in range(nsurr)])
-        #print('dkk.shape='+str(dkX.shape))
-        # the kernel matrix between test and training data:
-        # k(x*, Xin)
-        kqX = np.array([[[
-                     self.surrogates[i].models[sts[j]].kernel_q_X(
-                        d_gm[k,:]) 
-                         for k in range(ngm)]
-                         for j in range(ns)]
-                         for i in range(nsurr)])
-        #print('kqX.shape='+str(kqX.shape))
-        # the kernel matrix over test data: k(x*, x*)
-        kii = np.array([[
-                    self.surrogates[0].models[sts[j]].kernel_(
-                      d_gm, d_gm)
-                         for j in range(ns)]
-                         for k in range(nsurr)])
-        #print('kii.shape='+str(kii.shape))
-
-        C_bcm   = np.zeros((ns, ngm, ngm), dtype=float)
-        e_bcm   = np.zeros((ns, ngm), dtype=float) 
-        delCinv = np.zeros((ns, ngm, nc), dtype=float)
-        CdCC    = np.zeros((ns, ngm, nc), dtype=float) 
+        # gradient, covariance and std. dev.
         grad_bcm = np.zeros((ns, ngm, nc), dtype=float)
         cov_bcm  = np.zeros((ns, ngm, nc, nc), dtype=float)
+        std_bcm  = np.zeros((ns, ngm, nc), dtype=float)
 
-        # return as numpy array
-        for i in range(nsurr):
-            # evaluate returns the predcited points, as well as the
-            # covariance matrix between the test points, so
-            # e_data.shape    = (ns, ngm,)
-            # ecov_data.shape = (ns, ngm, ngm,)
-            e_data, ecov_data = self.surrogates[i].evaluate(eval_gms,
+        # std of the training data for each surrogate is needed
+        # to scale each surrogate so we can take aggregate 
+        # properties
+        std_trn = np.array([[
+                   self.surrogates[i].models[sts[j]]._y_train_std**2 
+                   for i in range(M)] 
+                   for j in range(ns)], dtype=float)
+
+        # since we're evaluating one geometry at a time, outer
+        # loop should be over geometries
+        for i in range(ngm):
+  
+            # these quantities are accumualted over surrogates
+            C_bcm   = np.zeros(ns, dtype=float)
+            e_bcm   = np.zeros(ns, dtype=float)       
+            delCinv = np.zeros((ns, nc), dtype=float)
+            CdCC    = np.zeros((ns, nc), dtype=float)     
+
+            # nested loops in python make me cringe. This
+            # is a first pass
+            for j in range(M):
+
+                # evaluate returns the predcited point, as well as the
+                # covariance
+                # e_data.shape    = (ns,)
+                # ecov_data.shape = (ns,)
+                e_data, estd = self.surrogates[j].evaluate(
+                                                    Xq[i],
+                                                    states=sts,
+                                                    std=True,
+                                                    cov=False)
+                # gradient returns a list of predicted gradients as
+                # as the covariance matrix between the coordinate compoennts
+                # of the gradient, so:
+                # g_data.shape    = (ns, nc)
+                # gcov_data.shape = (ns, nc, nc)
+                g_data, gcov  = self.surrogates[j].gradient(
+                                                    Xq[i],
                                                     states=sts,
                                                     std=False,
-                                                    cov=True)
-            # gradient returns a list of predicted gradients as
-            # as the covariance matrix between the coordinate compoennts
-            # of the gradient, so:
-            # g_data.shape    = (ns, ngm, nc)
-            # gcov_data.shape = (ns, ngm, nc, nc)
-            g_data, gcov_data  = self.surrogates[i].gradient(eval_gms,
-                                                    states=sts,
-                                                    variance=False,
-                                                    covariance=True,
+                                                    cov=True,
                                                     numerical=numerical)
 
-            #print('surrogate, i='+str(i)+' grad nascent='+str(g_data[0,0,:]))
-            for j in range(ns):
+                # iterate over states in the surrogate
+                for k in range(ns):
+                    s_k = sts[k]
+                    tr_scale = std_trn[k,j] / std_trn[k,0]
 
-                #Cqi_inv  = [np.linalg.pinv(ecov_data[j,:,:]) for k in range(ngm)]
-                Cqi_inv  = [1./ecov_data[j,0,0] for k in range(ngm)]
-                #print('Cqi_inv.shape='+str(Cqi_inv[0].shape))
-                for k in range(ngm):
-                    # accummulate covariance
-                    std_0_sq = self.surrogates[0].models[sts[j]]._y_train_std**2
-                    std_i_sq = self.surrogates[i].models[sts[j]]._y_train_std**2
-                     
-                    cov_bcm[j, k, :, :] += np.linalg.pinv(
-                                          gcov_data[j,k,:,:])*(std_i_sq/std_0_sq)
+                    # accumulate covariance of the gradient to
+                    # determine the covariance of the BCM
+                    cov_bcm[k,i] += np.linalg.pinv(gcov[k]) * tr_scale
 
+                    # explicitly construct K^-1, this can be improved
                     P = np.linalg.pinv(
-                            self.surrogates[i].models[sts[j]].L_).T
+                                  self.surrogates[j].models[s_k].L_).T
+                    # Kinv.shape = (Ntrain, Ntrain)
                     Kinv = P @ P.T
-                    #print('Kinv.shape='+str(Kinv.shape))
-                    #print('dkX[i.j.k].shape='+str(dkX[i,j,k].shape))
-                    #print('kqX.shape='+str(kqX[i,j,k].shape))
-                    dk_Kinv_k = dkX[i,j,k].T @ Kinv @ kqX[i,j,k].T + kqX[i,j,k] @ Kinv @ dkX[i,j,k]
-                    # convert to cartesians
-                    dk_Kinv_k_c = np.dot(d_grad[k, :],  dk_Kinv_k).squeeze() 
-                    dki_c = d   = np.dot(d_grad[k, :], dki[i,j,k]).squeeze()
-                    #print('dkKinvk_c.shape='+str(dk_Kinv_k_c.shape))
-                    #print('dki_c.shape='+str(dki_c.shape))
 
-                    dCi            = (-dki_c + dk_Kinv_k_c)*self.surrogates[i].models[sts[j]]._y_train_std**2
-                    # dCi is the gradient of the *normalized* posterior variance
-                    # correction k(x*,X)K⁻¹k(X,x*). The BCM weights use the
-                    # *unnormalized* variance (σ²_u = std² · σ²_norm), so the
-                    # chain rule requires an extra std² factor here.
-                    Cinv_grad      = Cqi_inv[k]*g_data[j, k, :]
-                    #print('Cinv_grad.shape='+str(Cinv_grad.shape))
+                    # evaluate kernel based quantities:
+                    # gradient of the kernel matrix(x*, Xtrain)
+                    # dkX.shape = (Nfeature, Ntrain)
+                    dkX = self.surrogates[j].models[s_k].kernel_gradient(
+                                                                 d_gm[i])
+                    # kernel evaluated between test and training data
+                    # given that this is a single geometry:
+                    # kqX.shape = (1, Ntrain)
+                    kqX = self.surrogates[i].models[s_k].kernel_q_X(
+                                                                 d_gm[i])
 
-                    # this is currently a scalar
-                    C_bcm[j,k,:]   += Cqi_inv[k]
-                    # this is currently a scalar
-                    e_bcm[j, k]   += Cqi_inv[k] * e_data[j, k]
+                    # derivative of kernel matrix of test points
+                    # in limit of a single test point, this simplifies
+                    # to a zero vector. We'll include it for now.
+                    dki = np.zeros(n_f, dtype=float)
+
+                    # kernel gradient contribution, and convert 
+                    # to cartesian coordinates
+                    dk_Kinv_k =  dkX.T @ Kinv @ kqX.T + kqX @ Kinv @ dkX
+                    dk_Kinv_k_c = d_grad[i] @ dk_Kinv_k
+                    
+                    # convert derivative of test point kernel to 
+                    # cartesians (should be zero vector)
+                    dki_c = d_grad[i] @ dki
+
+                    # del C / dxi
+                    # dCi is the gradient of the *normalized* posterior 
+                    # variance correction k(x*,X)K⁻¹k(X,x*). The BCM weights 
+                    # use the *unnormalized* variance (σ²_u = std² · σ²_norm), 
+                    # so the chain rule requires an extra std² factor here.
+                    dCi = (-dki_c + dk_Kinv_k_c) * std_trn[k,j]
+
+                    # inverse of the covariance of the evaluated energy
+                    # single single point, just a scalar
+                    Ci_inv    = 1./(estd[k]**2)
+                    Cinv_grad  = Ci_inv * g_data[k]
+
+                    # accumulate quantities ------------
+                    # This is a scalar quantity
+                    C_bcm[k] += Ci_inv
+                    # this is a scalar qauntity
+                    e_bcm[k] += Ci_inv * e_data[k]
                     # this is a vector, [nc]
-                    delCinv[j,k,:] += Cqi_inv[k] * dCi * Cqi_inv[k]
-                    #print('delCinv.shape='+str(delCinv.shape))
-                    #print('express.shape='+str((Cqi_inv[k] * dCi * Cqi_inv[k]*e_data[j,k]).shape))
-                    CdCC[j,k,:]    += Cqi_inv[k] * dCi * Cqi_inv[k]*e_data[j,k] + Cinv_grad
+                    delCinv[k] += Ci_inv * dCi * Ci_inv
+                    # this is a vector [nc]
+                    CdCC[k] += Ci_inv*dCi*Ci_inv*e_data[k] + Cinv_grad
 
-        # compute covariance matrix for query points
-        M = len(self.surrogates)
-        k_data = [np.array([self.surrogates[i].models[st].kernel_hessian(d_gm)
-                                          for i in range(nsurr)], dtype=float)
-                                          for st in sts]
-        sigma_qq_inv = [[d_grad[i,:,:] @
-                         k_data[st][0, i,:,:] @
-                         d_grad[i,:,:].T
-                        for st in range(ns)]
-                        for i in range(ngm)]
+            # kernel matrix at test point (this is a scalar)
+            dx = np.array([d_gm[i]], dtype=float)
+            kxx = [self.surrogates[0].models[sk].kernel_(
+                                     dx, dx) for sk in sts] 
+            print('kxx.shape='+str(kxx.shape))
 
-        for i in range(ngm):
-            for j in range(ns):
-                cov_bcm[j, i, :, :] += -(M - 1)*sigma_qq_inv[j][i]
-                cov_bcm[j, i, :, :]  = np.linalg.pinv(cov_bcm[j, i, :, :])
+            # everything scaled to surrogate[0] data, compute hessian
+            # for this surrogate for each state/model
+            k_hess = np.array([
+                     self.surrogates[0].models[sk].kernel_hessian(
+                     d_gm[i]) for sk in sts], dtype=float)
+            # convert to cartesians
+            sigma_qq_inv = [d_grad[i] @ k_hess[sk] @ d_grad[i].T 
+                                                for sk in range(ns)]
 
-                #print('C_bcm[j,k].shape='+str(C_bcm.shape))
-                #C = -(M-1)*np.linalg.pinv(kii[j,0]) + C_bcm[j,i,0]
-                C = -(M-1)*(1./kii[0,j,i,i]) + C_bcm[j,i,0]
-                #print('C.shape='+str(C.shape))
-                #Cinv = np.linalg.pinv(C)
-                Cinv = 1./C
-                #print('Cinv.shape='+str(Cinv.shape))
-                dCinv = Cinv * ((M-1)*dki_c - delCinv[j,i,:]) * Cinv
-                grad_bcm[j, i, :] = dCinv * e_bcm[j,i] + Cinv * CdCC[j,i,:]
-                #print('grad.shape='+str((dCinv * e_bcm[j,i] + Cinv * CdCC[j,i,:]).shape))
+            for k in range(ns):
 
-        #print('grad bcm='+str(grad_bcm[0,0,:]))
-        var_bcm = np.array([[np.diag(cov_bcm[j, k, :, :])
-            for j in range(ns)] for k in range(ngm)], dtype=float)
+                # covariance of the BCM gradient
+                cov_bcm[k,i] += -(M-1)*sigma_qq_inv[k]
+                cov_bcm[k,i] = np.linalg.pinv(cov_bcm[i,k])
+                std_bcm[k,i] = np.sqrt(np.absolute(np.diag(cov_bcm[i,k])))
 
-        # return a 2D array (nst, ncrd) if a single geometry is requested,
-        # else return a 3D array (nst, ng, ncrd)
-        if ngm > 1:
-            vals = grad_bcm
-            if variance:
-                vals = (vals,) + (var_bcm,)
+                # construct aggregate C matrix
+                C     = -(M-1)*(1./kxx[k]) + C_bcm[k]
+                Cinv  = 1./C
+                # dki_c is always zero, can exclude
+                #dCinv = (1./C) * ((M-1.)*dki_c - delCinv[k]) * (1./C)
+                dCinv  = Cinv * ( 0. - delCinv[k] ) * Cinv
+                grad_bcm[k,i] = dCinv * e_bcm[i] + Cinv * CdCC[k]
+
+        # construct return array
+        if singleX:
+            args = self._collect_output((grad_bcm[:,0,:],
+                                         std_bcm[:,0,:],
+                                         cov_bcm[:,0,:,:]),
+                                         (True, std, cov))
         else:
-            vals = grad_bcm[:, 0, :]
-            if variance:
-                vals = (vals,) + (var_bcm[:, 0, :],)
+            args = self._collect_output((grad_bcm, std_bcm, cov_bcm),
+                                         (True, std, cov))
 
-        return vals
-
-
+        return args 
 
     #
     def hessian(self, gms, states=None):
@@ -394,6 +308,51 @@ class BCM():
         hessian is returned in numpy array with the
         shape = [nst, ng, ncrd, ncrd]
         """
+
+        delta = 1.e-4
+
+        if states is None:
+            sts = list(range(self.nstates))
+        else:
+            sts = states
+        ns = len(sts)
+
+        # confirm input is in correct format
+        Xq, (ng, nc), singleX = self._verify_geoms(gms)
+        hessall = np.zeros((ns, ng, nc, nc), dtype=float)
+
+        for i in range(ng):
+            # gms[i,:] shape: (nc,)
+            for k in range(nc):
+                # Prepare displaced geometries for plus and minus displacement
+                disp_plus  = Xq[i,:].copy()
+                disp_minus = Xq[i,:].copy()
+
+                disp_plus[k]  += delta
+                disp_minus[k] -= delta
+
+                # Get gradients at displaced points for all eval_st states
+                # Assuming self.gradient returns shape: (nstates, nc)
+                p_grad = self.gradient(disp_plus, states=sts)  # shape (nstates, nc)
+                m_grad = self.gradient(disp_minus, states=sts)  # shape (nstates, nc)
+
+                # Central difference to approximate second derivative w.r.t coordinate k
+                # For each state, calculate second derivative matrix element for k-th column
+                # hessall[:, i, :, k] = (p_grad - m_grad) / (2 * delta)
+                hessall[:, i, :, k] = (p_grad - m_grad) / (2 * delta)
+
+            # Symmetrize Hessian for each state and geometry
+            for s in range(ns):
+                hessall[s, i] = 0.5 * (hessall[s, i] + hessall[s, i].T)
+
+        # if a single geometry is passed, return 3D array
+        # of hessians per state
+        # else a 4D of hessians per state per geometry
+        if singleX == 1:
+            return hessall[:, 0, :, :]
+        else:
+            return hessall
+
 
     #
     def save(self, file_name):
@@ -415,3 +374,44 @@ class BCM():
         status = True
 
         return status
+
+    # it is exceedingly convenient to handle either a single geometry
+    # or multiple geometries with a single function and return either 
+    # a single prediction or a matrix/vector of predictions. So: we 
+    # convert single geometries into a single row matrix so all functions
+    # can behave the same
+    def _verify_geoms(self, X):
+        """
+        if len(X.shape) == 2, return X and single_geom=False
+        if len(X.shape) == 1, convert to a single row matrix, 
+                              single_geom = True
+        """
+        single_x = False
+        if len(X.shape) == 1:
+            single_x = True
+            ngm      = 1
+            nvar     = X.shape[0]
+            Xmat     = np.array([X], dtype=float)
+        else:
+            ngm      = X.shape[0]
+            nvar = X.shape[1]
+            Xmat     = X
+
+        return Xmat, (ngm, nvar), single_x
+
+    #
+    def _collect_output(self, data, include):
+        """
+        construct a tuple of output data based on the booleans
+        in the include tuple. If a single item is to be included,
+        return just the itme (not as a tuple)
+        """
+        args = ()
+        for i in range(len(data)):
+            if include[i]:
+                args += (data[i],)
+        if len(args) == 1:
+            return args[0]
+        else:
+            return args
+

@@ -48,6 +48,46 @@ class Surrogate(ABC):
     def coupling(self):
         pass
 
+    # it is exceedingly convenient to handle either a single geometry
+    # or multiple geometries with a single function and return either
+    # a single prediction or a matrix/vector of predictions. So: we
+    # convert single geometries into a single row matrix so all functions
+    # can behave the same
+    def _verify_geoms(self, X):
+        """
+        if len(X.shape) == 2, return X and single_geom=False
+        if len(X.shape) == 1, convert to a single row matrix,
+                              single_geom = True
+        """
+        single_x = False
+        if len(X.shape) == 1:
+            single_x = True
+            ngm      = 1
+            nvar     = X.shape[0]
+            Xmat     = np.array([X], dtype=float)
+        else:
+            ngm      = X.shape[0]
+            nvar = X.shape[1]
+            Xmat     = X
+
+        return Xmat, (ngm, nvar), single_x
+
+    #
+    def _collect_output(self, data, include):
+        """
+        construct a tuple of output data based on the booleans
+        in the include tuple. If a single item is to be included,
+        return just the itme (not as a tuple)
+        """
+        args = ()
+        for i in range(len(data)):
+            if include[i]:
+                args += (data[i],)
+        if len(args) == 1:
+            return args[0]
+        else:
+            return args
+
 
 #
 class Adiabat(Surrogate):
@@ -280,55 +320,47 @@ class Adiabat(Surrogate):
         # if no specific states are requested, return all state
         # energies
         if states == None:
-            eval_st = [i for i in range(self.nstates)]
+            sts = [i for i in range(self.nstates)]
         else:
-            eval_st = states
+            sts = states
+        ns = len(sts)
 
-        # accept both a 1D array (single) geometry and a 2D array
-        # (list of geometries)
-        if len(gms.shape) == 2:
-            ngm      = gms.shape[0]
-            eval_gms = gms
-        elif len(gms.shape) == 1:
-            ngm      = 1
-            eval_gms = np.array([gms], dtype=float)
-        else:
-            print('Cannot interprete gms array - surface.evaluate')
-            os.abort()
-
-        d_data    = self.descriptor.generate(eval_gms)
+        # confirm input is in correct format
+        Xq, (ngm, nc), singleX = self._verify_geoms(gms)
+        d_data    = self.descriptor.generate(Xq)
 
         # return as numpy array
-        evals  = []
-        stdcov = []
-        for st in eval_st:
+        evals = np.zeros((ns, ngm), dtype=float)
+        estd  = np.zeros((ns, ngm), dtype=float)
+        ecov  = np.zeros((ns, ngm, ngm), dtype=float)
+
+        for st in sts:
             edata = self.models[st].predict( d_data, 
                                             return_std = std, 
                                             return_cov = cov)
-            if len(gms.shape) == 1:
-                if std or cov:
-                    evals.append(edata[0][0])
-                    stdcov.append(edata[1][0])
-                else:
-                    evals.append(edata[0])
-            else:
-                if std or cov:
-                    evals.append(edata[0])
-                    stdcov.append(edata[1])
-                else:
-                    evals.append(edata)
+            evals[st] = edata[0]
 
-        # evals.shape = [ns, ngm]
-        # if std, stdcov.shape = [ns, ngm], else, stdcov.shape=[ns, ngm, ngm]
-        if std or cov:
-            return np.array(evals, dtype=float), np.array(stdcov, dtype=float)
+            # predict only allows std _or_ cov, not both
+            if std:
+                estd[st] = edata[1]
+            elif cov:
+                ecov[st] = edata[1]
+
+        if singleX:
+            args = self._collect_output((evals[:,0], 
+                                         estd[:,0], 
+                                         ecov[:,0,0]),
+                                         (True, std, cov))
         else:
-            return np.array(evals, dtype=float)
-        
+            args = self._collect_output((evals, estd, ecov),
+                                         (True, std, cov))
+
+        return args
+
 
     #
-    def gradient(self, gms, states=None, variance=False, 
-                 covariance=False, numerical=False):
+    def gradient(self, gms, states=None, std=False, cov=False,
+                                                numerical=False):
         """
         evaluate the gradient using analytical expression
 
@@ -343,69 +375,49 @@ class Adiabat(Surrogate):
         # if no specific states are requested, return all state
         # energies
         if states == None:
-            eval_st = [i for i in range(self.nstates)]
+            sts = [i for i in range(self.nstates)]
         else:
-            eval_st = states
+            sts = states
+        ns = len(sts)
 
-        #print('self.descriptor[0]='+str(self.descriptors[0][0,:10]))
-        # accept both a 1D array (single) geometry and a 2D array
-        # (list of geometries)
-        if len(gms.shape) == 2:
-            ng       = gms.shape[0]
-            nc       = gms.shape[1]
-            eval_gms = gms
-        elif len(gms.shape) == 1:
-            ng       = 1
-            nc       = gms.shape[0]
-            eval_gms = np.array([gms], dtype=float)
-        else:
-            print('Cannot interprete gms array - surface.evaluate')
-            os.abort()
+        # confirm input is in correct format
+        Xq, (ng, nc), singleX = self._verify_geoms(gms)
 
-        #print('ngm='+str(ng))
-        d_data   = self.descriptor.generate(eval_gms)
-        #print('d_data.shape='+str(d_data.shape))
-        #print('d_data.reshape(1,-1).shape='+str(d_data.reshape(1,-1).shape))
-        des_grad = self.descriptor.descriptor_gradient(eval_gms)
-        #print('des_grad.shape='+str(des_grad.shape))
+        # generate descriptors
+        d_gm   = self.descriptor.generate(Xq)
+        d_grad = self.descriptor.descriptor_gradient(Xq)
 
-        grad       = np.zeros((len(eval_st), ng, nc), dtype=float)
-        grad_var   = np.zeros((len(eval_st), ng, nc), dtype=float)
-        grad_covar = np.zeros((len(eval_st), ng, nc, nc), dtype=float)
-        for i in range(len(eval_st)):
-            st = eval_st[i]
-            for j in range(ng):
-                grad_d, grad_var_d  = self.models[st].predict_grad(
-                                      d_data[j, :],
-                                      covariance=True)
-                #print('grad_var_d.shape='+str(grad_var_d.shape))
-                #print('grad_d.shape='+str(grad_d.shape))
-                grad[i,j,:] = np.dot(des_grad[j,: ], grad_d).squeeze()
-                # print(f"analytical gradient:\n{grad.shape}")
-                if covariance:
-                    grad_var_c = des_grad[j,:,:] @ grad_var_d @ des_grad[j,:,:].T
-                    #print('grad_var_c.shape='+str(grad_var_c.shape))
-                    grad_var[i, j, : ]     = np.diag(grad_var_c)
-                    grad_covar[i, j, :, :] = grad_var_c
+        grad  = np.zeros((ns, ng, nc), dtype=float)
+        g_std = np.zeros((ns, ng, nc), dtype=float)
+        g_cov = np.zeros((ns, ng, nc, nc), dtype=float)
 
-        #print('grad_d='+str(grad_d[:10]))
-        #print('grad='+str(grad[0,0,:]))
+        for i in range(ns):
+            st = sts[i]
+            grad_d, std_d, cov_d  = self.models[st].predict_grad(
+                                                     d_gm,
+                                                     std=std,
+                                                     cov=cov)
+            
+            grad[i,:,:] = np.einsum('aij,aj->ai',d_grad, grad_d)
+            if std or cov:
+                g_cov_c = np.einsum('aik,akl,ajl->aij', 
+                                                 d_grad, cov_d, d_grad)
+                g_cov[i,:,:,:] = g_cov_c
+                g_std[i,:,:]   = np.sqrt(np.absolute(np.einsum(
+                                                  'aii->ai', g_cov_c)))
+
         # return a 2D array (nst, ncrd) if a single geometry is requested,
         # else return a 3D array (nst, ng, ncrd)
-        if len(gms.shape) == 1:
-            vals = grad[:, 0, :]
-            if variance:
-                vals = (vals,) + (grad_var[:, 0, :],)
-            if covariance:
-                vals = (vals,) + (grad_covar[:, 0, :, :],)
+        if singleX:
+            args = self._collect_output((grad[:,0,:], 
+                                         g_std[:,0,:], 
+                                         g_cov[:,0,:,:]), 
+                                        (True, std, cov))
         else:
-            vals = grad
-            if variance:
-                vals = (vals,) + (grad_var,)
-            if covariance:
-                vals = (vals,) + (grad_covar,)
+            args = self._collect_output((grad, g_std, g_cov),
+                                        (True, std, cov))
 
-        return vals
+        return args
 
     #
     def hessian(self, gms, states = None):
@@ -419,42 +431,30 @@ class Adiabat(Surrogate):
         delta = 1.e-4
 
         if states is None:
-            eval_st = list(range(self.nstates))
+            sts = list(range(self.nstates))
         else:
-            eval_st = states
+            sts = states
+        ns = len(sts)
 
-        # accept both a 1D array (single) geometry and a 2D array
-        # (list of geometries)
-        if len(gms.shape) == 2:
-            ngm      = gms.shape[0]
-            eval_gms = gms
-        elif len(gms.shape) == 1:
-            ngm      = 1
-            eval_gms = np.array([gms], dtype=float)
-        else:
-            print('Cannot interprete gms array - surface.evaluate')
-            os.abort()
+        # confirm input is in correct format
+        Xq, (ng, nc), singleX = self._verify_geoms(gms)
 
-        ng = eval_gms.shape[0]  # number of geometries
-        nc = eval_gms.shape[1]  # number of coordinates
-        nstates = len(eval_st)
-
-        hessall = np.zeros((nstates, ng, nc, nc), dtype=float)
+        hessall = np.zeros((ns, ng, nc, nc), dtype=float)
 
         for i in range(ng):
             # gms[i,:] shape: (nc,)
             for k in range(nc):
                 # Prepare displaced geometries for plus and minus displacement
-                disp_plus  = eval_gms[i,:].copy()
-                disp_minus = eval_gms[i,:].copy()
+                disp_plus  = Xq[i,:].copy()
+                disp_minus = Xq[i,:].copy()
 
-                disp_plus[k] += delta
+                disp_plus[k]  += delta
                 disp_minus[k] -= delta
 
                 # Get gradients at displaced points for all eval_st states
                 # Assuming self.gradient returns shape: (nstates, nc)
-                p_grad = self.gradient(disp_plus, states=eval_st)  # shape (nstates, nc)
-                m_grad = self.gradient(disp_minus, states=eval_st)  # shape (nstates, nc)
+                p_grad = self.gradient(disp_plus, states=sts)  # shape (nstates, nc)
+                m_grad = self.gradient(disp_minus, states=sts)  # shape (nstates, nc)
 
                 # Central difference to approximate second derivative w.r.t coordinate k
                 # For each state, calculate second derivative matrix element for k-th column
@@ -462,13 +462,13 @@ class Adiabat(Surrogate):
                 hessall[:, i, :, k] = (p_grad - m_grad) / (2 * delta)
 
             # Symmetrize Hessian for each state and geometry
-            for s in range(nstates):
+            for s in range(ns):
                 hessall[s, i] = 0.5 * (hessall[s, i] + hessall[s, i].T)
 
         # if a single geometry is passed, return 3D array
         # of hessians per state
         # else a 4D of hessians per state per geometry
-        if len(gms.shape) == 1:
+        if singleX == 1:
             return hessall[:, 0, :, :]
         else:
             return hessall
