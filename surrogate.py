@@ -393,10 +393,12 @@ class Adiabat(Surrogate):
 
         for i in range(ns):
             st = sts[i]
+            # we determine std from cov matrix, so if std is True,
+            # cov must be true
             grad_d, std_d, cov_d  = self.models[st].predict_grad(
                                                      d_gm,
                                                      std=std,
-                                                     cov=cov)
+                                                     cov=(std or cov))
             
             grad[i,:,:] = np.einsum('aij,aj->ai',d_grad, grad_d)
             if std or cov:
