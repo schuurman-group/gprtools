@@ -254,10 +254,11 @@ class BCM():
                     C_bcm[k] += Ci_inv
                     # this is a scalar qauntity
                     e_bcm[k] += Ci_inv * e_data[k]
+
                     # this is a vector, [nc]
                     delCinv[k] += Ci_inv * dCi * Ci_inv
                     # this is a vector [nc]
-                    CdCC[k] += Ci_inv*dCi*Ci_inv*e_data[k] + Cinv_grad
+                    CdCC[k] += -Ci_inv*dCi*Ci_inv*e_data[k] + Cinv_grad
 
             # kernel matrix at test point (this is a scalar), convert to
             # physical units
@@ -286,8 +287,8 @@ class BCM():
                 C     = -(M-1)*(1./kxx[k]) + C_bcm[k]
                 Cinv  = 1./C
                 # dki_c is always zero, can exclude
-                #dCinv = (1./C) * ((M-1.)*dki_c - delCinv[k]) * (1./C)
-                dCinv  = Cinv * ( 0. - delCinv[k] ) * Cinv
+                #dCinv = (1./C) * ((M-1.)*dki_c + delCinv[k]) * (1./C)
+                dCinv  = Cinv * (0. + delCinv[k]) * Cinv
                 grad_bcm[k,i] = dCinv * e_bcm[k] + Cinv * CdCC[k]
 
         # construct return array
