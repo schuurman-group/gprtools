@@ -219,7 +219,7 @@ class BCM():
                     # kernel evaluated between test and training data
                     # given that this is a single geometry:
                     # kqX.shape = (1, Ntrain)
-                    kqX = self.surrogates[i].models[s_k].kernel_q_X(
+                    kqX = self.surrogates[j].models[s_k].kernel_q_X(
                                                                  d_gm[i])
 
                     # derivative of kernel matrix of test points
@@ -261,8 +261,7 @@ class BCM():
             # kernel matrix at test point (this is a scalar)
             dx = np.array([d_gm[i]], dtype=float)
             kxx = [self.surrogates[0].models[sk].kernel_(
-                                     dx, dx) for sk in sts] 
-            print('kxx.shape='+str(kxx.shape))
+                                dx, dx)[0,0] for sk in sts] 
 
             # everything scaled to surrogate[0] data, compute hessian
             # for this surrogate for each state/model
@@ -277,8 +276,8 @@ class BCM():
 
                 # covariance of the BCM gradient
                 cov_bcm[k,i] += -(M-1)*sigma_qq_inv[k]
-                cov_bcm[k,i] = np.linalg.pinv(cov_bcm[i,k])
-                std_bcm[k,i] = np.sqrt(np.absolute(np.diag(cov_bcm[i,k])))
+                cov_bcm[k,i] = np.linalg.pinv(cov_bcm[k,i])
+                std_bcm[k,i] = np.sqrt(np.absolute(np.diag(cov_bcm[k,i])))
 
                 # construct aggregate C matrix
                 C     = -(M-1)*(1./kxx[k]) + C_bcm[k]
@@ -286,7 +285,7 @@ class BCM():
                 # dki_c is always zero, can exclude
                 #dCinv = (1./C) * ((M-1.)*dki_c - delCinv[k]) * (1./C)
                 dCinv  = Cinv * ( 0. - delCinv[k] ) * Cinv
-                grad_bcm[k,i] = dCinv * e_bcm[i] + Cinv * CdCC[k]
+                grad_bcm[k,i] = dCinv * e_bcm[k] + Cinv * CdCC[k]
 
         # construct return array
         if singleX:
