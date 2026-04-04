@@ -68,7 +68,7 @@ class BCM():
         # ensure geometries have the appropriate layout
         Xq, (ngm, nc), singleX = self._verify_geoms(gms)
 
-        eval_bcm = np.zeros((ns, ngm), dtype=float)
+        e_bcm = np.zeros((ns, ngm), dtype=float)
         std_bcm  = np.zeros((ns, ngm), dtype=float)
         cov_bcm  = np.zeros((ns, ngm, ngm), dtype=float)
 
@@ -78,32 +78,34 @@ class BCM():
                                                 states=sts, 
                                                 std=False, 
                                                 cov=True)
-            for j in range(ns):
-                e_cov_inv         = np.linalg.pinv(e_cov[j,:,:])
-                cov_bcm[j, :, :] += e_cov_inv
-                eval_bcm[j, :]   += np.dot(e_cov_inv, e_data[j])
+            for st in range(ns):
+                e_cov_inv    = np.linalg.pinv(e_cov[st])
+                cov_bcm[st] += e_cov_inv
+                e_bcm[st]   += e_cov_inv @ e_data[st]
 
         # compute covariance matrix for query points
         d_data  = self.surrogates[0].descriptor.generate(Xq)
         k_data  = [self.surrogates[0].models[st].kernel_(d_data) 
                                               for st in sts]
-        sigma_qq_inv = [np.linalg.pinv(k_data[st]) 
-                                              for st in range(ns)]
 
-        for j in range(ns):
-            cov_bcm[j, :, :] += -(M - 1)*sigma_qq_inv[j]
-            cov_bcm[j, :, :]  = np.linalg.pinv(cov_bcm[j, :, :])
-            std_bcm[j, :]     = np.sqrt(np.absolute(
-                                             np.diag(cov_bcm[j, :, :])))
-            eval_bcm[j, :]    = np.dot(cov_bcm[j, :, :], eval_bcm[j, :])
+        sigma_qq_inv = [np.linalg.pinv(k_data[st] * 
+                     self.surrogates[0].models[sts[st]]._y_train_std**2)
+                                                    for st in range(ns)]
+
+        for st in range(ns):
+            cov_bcm[st] += -(M - 1)*sigma_qq_inv[st]
+            cov_bcm[st]  = np.linalg.pinv(cov_bcm[st])
+
+            std_bcm[st]  = np.sqrt(np.absolute(np.diag(cov_bcm[st])))
+            e_bcm[st]    = cov_bcm[st] @ e_bcm[st]
 
         if singleX:
-            args = self._collect_output((eval_bcm[:, 0], 
+            args = self._collect_output((e_bcm[:, 0], 
                                          std_bcm[:, 0], 
                                          cov_bcm[:, 0, 0]),
                                          (True, std, cov))
         else:
-            args = self._collect_output((eval_bcm, std_bcm, cov),
+            args = self._collect_output((e_bcm, std_bcm, cov_bcm),
                                          (True, std, cov))
 
         return args
@@ -199,21 +201,15 @@ class BCM():
                 # iterate over states in the surrogate
                 for k in range(ns):
                     s_k = sts[k]
-                    tr_scale = std_trn[k,j] / std_trn[k,0]
+                    #tr_scale = std_trn[k,j] / std_trn[k,0]
 
                     # accumulate covariance of the gradient to
                     # determine the covariance of the BCM
-                    cov_bcm[k,i] += np.linalg.pinv(gcov[k]) * tr_scale
-
-                    # explicitly construct K^-1, this can be improved
-                    #P = np.linalg.pinv(
-                    #              self.surrogates[j].models[s_k].L_).T
-                    # Kinv.shape = (Ntrain, Ntrain)
-                    #Kinv = P @ P.T
+                    cov_bcm[k,i] += np.linalg.pinv(gcov[k])
 
                     # evaluate kernel based quantities:
                     # gradient of the kernel matrix(x*, Xtrain)
-                    # dkX.shape = (Nfeature, Ntrain)
+                    # dkX.shape = (Ntrain, Nfeature)
                     dkX = self.surrogates[j].models[s_k].kernel_gradient(
                                                                  d_gm[i])
                     # kernel evaluated between test and training data
@@ -229,18 +225,12 @@ class BCM():
 
                     # kernel gradient contribution, and convert 
                     # to cartesian coordinates
-                    #print('dk_Kinv_kqX='+str(dkX.T @ Kinv @ kqX.T))
-                    #print('kqX_Kinv_dk='+str(kqX @ Kinv @ dkX))
                     L =  self.surrogates[j].models[s_k].L_
                     U = solve_triangular(L, kqX.T, lower=True, 
                              check_finite=False)
                     V = solve_triangular(L, dkX, lower=True,
                              check_finite=False)
                     dk_Kinv_k = U.T @ V + V.T @ U
-                    #dk_Kinv_k =  dkX.T @ Kinv @ kqX.T + kqX @ Kinv @ dkX
-                    #print('normL, normInv='+str(np.linalg.norm(dk_Kinv_k2))+','+str(np.linalg.norm(dk_Kinv_k)))
-                    #print('norm diff='+str(np.linalg.norm(dk_Kinv_k2-dk_Kinv_k)))
-
                     dk_Kinv_k_c = d_grad[i] @ dk_Kinv_k
                     
                     # convert derivative of test point kernel to 
@@ -269,10 +259,11 @@ class BCM():
                     # this is a vector [nc]
                     CdCC[k] += Ci_inv*dCi*Ci_inv*e_data[k] + Cinv_grad
 
-            # kernel matrix at test point (this is a scalar)
+            # kernel matrix at test point (this is a scalar), convert to
+            # physical units
             dx = np.array([d_gm[i]], dtype=float)
-            kxx = [self.surrogates[0].models[sk].kernel_(
-                                dx, dx)[0,0] for sk in sts] 
+            kxx = [self.surrogates[0].models[sts[k]].kernel_(
+                         dx, dx)[0,0]*std_trn[k,0] for k in range(ns)] 
 
             # everything scaled to surrogate[0] data, compute hessian
             # for this surrogate for each state/model
@@ -283,6 +274,7 @@ class BCM():
             sigma_qq_inv = [d_grad[i] @ k_hess[sk] @ d_grad[i].T 
                                                 for sk in range(ns)]
 
+            # combine aggregated quantities
             for k in range(ns):
 
                 # covariance of the BCM gradient
