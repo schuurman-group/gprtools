@@ -168,14 +168,14 @@ class GPRegressor(GaussianProcessRegressor):
 
             #print('V.shape='+str(V.shape))
             kKinvk = V.T @ V
+            # scale kKinvk to physical units to match kernel_hessian,
+            # which is already scaled by _y_train_std**2
+            kKinvk = np.outer(kKinvk, self._y_train_std**2).reshape(
+                                          *kKinvk.shape, -1).squeeze()
 
             # calcuate gradient variance 
             # (in analogy of how to calcuate variance)
             gcov[i] = kernel_hessian - kKinvk
-
-            # undo normalization
-            gcov[i] = np.outer(gcov[i], self._y_train_std**2).reshape(
-                                          *gcov[i].shape, -1).squeeze()
             gstd[i] = np.sqrt(np.absolute(np.diag(gcov[i])))
 
        # if we don't need to compute the co-variance,
