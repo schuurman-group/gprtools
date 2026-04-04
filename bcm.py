@@ -206,10 +206,10 @@ class BCM():
                     cov_bcm[k,i] += np.linalg.pinv(gcov[k]) * tr_scale
 
                     # explicitly construct K^-1, this can be improved
-                    P = np.linalg.pinv(
-                                  self.surrogates[j].models[s_k].L_).T
+                    #P = np.linalg.pinv(
+                    #              self.surrogates[j].models[s_k].L_).T
                     # Kinv.shape = (Ntrain, Ntrain)
-                    Kinv = P @ P.T
+                    #Kinv = P @ P.T
 
                     # evaluate kernel based quantities:
                     # gradient of the kernel matrix(x*, Xtrain)
@@ -229,7 +229,18 @@ class BCM():
 
                     # kernel gradient contribution, and convert 
                     # to cartesian coordinates
-                    dk_Kinv_k =  dkX.T @ Kinv @ kqX.T + kqX @ Kinv @ dkX
+                    #print('dk_Kinv_kqX='+str(dkX.T @ Kinv @ kqX.T))
+                    #print('kqX_Kinv_dk='+str(kqX @ Kinv @ dkX))
+                    L =  self.surrogates[j].models[s_k].L_
+                    U = solve_triangular(L, kqX.T, lower=True, 
+                             check_finite=False)
+                    V = solve_triangular(L, dkX, lower=True,
+                             check_finite=False)
+                    dk_Kinv_k = U.T @ V + V.T @ U
+                    #dk_Kinv_k =  dkX.T @ Kinv @ kqX.T + kqX @ Kinv @ dkX
+                    #print('normL, normInv='+str(np.linalg.norm(dk_Kinv_k2))+','+str(np.linalg.norm(dk_Kinv_k)))
+                    #print('norm diff='+str(np.linalg.norm(dk_Kinv_k2-dk_Kinv_k)))
+
                     dk_Kinv_k_c = d_grad[i] @ dk_Kinv_k
                     
                     # convert derivative of test point kernel to 
