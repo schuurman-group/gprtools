@@ -213,7 +213,7 @@ class BCM():
 
                     # evaluate kernel based quantities:
                     # gradient of the kernel matrix(x*, Xtrain)
-                    # dkX.shape = (Nfeature, Ntrain)
+                    # dkX.shape = (Ntrain, Nfeature)
                     dkX = self.surrogates[j].models[s_k].kernel_gradient(
                                                                  d_gm[i])
                     # kernel evaluated between test and training data
