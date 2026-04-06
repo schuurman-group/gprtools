@@ -211,7 +211,7 @@ class BCM():
 
                         # derivative of the covariance weights are 
                         # zero under frozen_wt approximation
-                        dCi = 0.
+                        dC = 0.
 
                     # else we perform some somewhat costly matrix
                     # operations
