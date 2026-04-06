@@ -10,6 +10,8 @@ from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKern
 from sklearn import preprocessing
 from sklearn.gaussian_process import GaussianProcessRegressor
 
+import utils as utils
+
 #
 class BCM():
     """
@@ -66,7 +68,7 @@ class BCM():
         M  = len(self.surrogates)
 
         # ensure geometries have the appropriate layout
-        Xq, (ngm, nc), singleX = self._verify_geoms(gms)
+        Xq, (ngm, nc), singleX = utils.verify_geoms(gms)
 
         e_bcm = np.zeros((ns, ngm), dtype=float)
         std_bcm  = np.zeros((ns, ngm), dtype=float)
@@ -95,17 +97,20 @@ class BCM():
         for st in range(ns):
             cov_bcm[st] += -(M - 1)*sigma_qq_inv[st]
             cov_bcm[st]  = np.linalg.pinv(cov_bcm[st])
-
-            std_bcm[st]  = np.sqrt(np.absolute(np.diag(cov_bcm[st])))
             e_bcm[st]    = cov_bcm[st] @ e_bcm[st]
 
+        # if std. dev. requested, extract from the covariance
+        if std:
+            std_bcm = utils.extract_std(cov_bcm)
+
+        # collect ouptut
         if singleX:
-            args = self._collect_output((e_bcm[:, 0], 
+            args = utils.collect_output((e_bcm[:, 0], 
                                          std_bcm[:, 0], 
                                          cov_bcm[:, 0, 0]),
                                          (True, std, cov))
         else:
-            args = self._collect_output((e_bcm, std_bcm, cov_bcm),
+            args = utils.collect_output((e_bcm, std_bcm, cov_bcm),
                                          (True, std, cov))
 
         return args
@@ -113,7 +118,7 @@ class BCM():
     #
     #
     def gradient(self, gms, states=None, std=False, cov=False,
-                                                 numerical=False):
+                    numerical=False, prior_only=False, frozen_wt=False):
         """
         evaluate the gradient using analytical expression
 
@@ -140,7 +145,7 @@ class BCM():
             ns   = len(sts)
 
         # ensure geometries have the appropriate layout
-        Xq, (ngm, nc), singleX = self._verify_geoms(gms)
+        Xq, (ngm, nc), singleX = utils.verify_geoms(gms)
 
         # number of surrogates in the BCM
         M      = len(self.surrogates)
@@ -155,18 +160,10 @@ class BCM():
         cov_bcm  = np.zeros((ns, ngm, nc, nc), dtype=float)
         std_bcm  = np.zeros((ns, ngm, nc), dtype=float)
 
-        # std of the training data for each surrogate is needed
-        # to scale each surrogate so we can take aggregate 
-        # properties
-        std_trn = np.array([[
-                   self.surrogates[i].models[sts[j]]._y_train_std**2 
-                   for i in range(M)] 
-                   for j in range(ns)], dtype=float)
-
         # since we're evaluating one geometry at a time, outer
         # loop should be over geometries
         for i in range(ngm):
-  
+             
             # these quantities are accumualted over surrogates
             C_bcm   = np.zeros(ns, dtype=float)
             e_bcm   = np.zeros(ns, dtype=float)       
@@ -192,87 +189,78 @@ class BCM():
                 # g_data.shape    = (ns, nc)
                 # gcov_data.shape = (ns, nc, nc)
                 g_data, gcov  = self.surrogates[j].gradient(
-                                                    Xq[i],
-                                                    states=sts,
-                                                    std=False,
-                                                    cov=True,
-                                                    numerical=numerical)
+                                                  Xq[i],
+                                                  states=sts,
+                                                  std=False,
+                                                  cov=True,
+                                                  numerical=numerical,
+                                                  prior_only=prior_only)
 
                 # iterate over states in the surrogate
                 for k in range(ns):
                     s_k = sts[k]
-                    #tr_scale = std_trn[k,j] / std_trn[k,0]
 
                     # accumulate covariance of the gradient to
                     # determine the covariance of the BCM
                     cov_bcm[k,i] += np.linalg.pinv(gcov[k])
 
-                    # evaluate kernel based quantities:
-                    # gradient of the kernel matrix(x*, Xtrain)
-                    # dkX.shape = (Ntrain, Nfeature)
-                    dkX = self.surrogates[j].models[s_k].kernel_gradient(
-                                                                 d_gm[i])
-                    # kernel evaluated between test and training data
-                    # given that this is a single geometry:
-                    # kqX.shape = (1, Ntrain)
-                    kqX = self.surrogates[j].models[s_k].kernel_q_X(
-                                                                 d_gm[i])
+                    # compute the derivative of the covariance of the mean
+                    if not frozen_wt:
+                        # derivative of kernel matrix of test points
+                        # in limit of a single test point, this simplifies
+                        # to a zero vector. We'll include it for now.
+                        dprior = self.surrogates[j].models[s_k].dprior(
+                                                d_gm[i], physical=True)
+                        # convert to cartesians
+                        dprior_c = d_grad[i] @ dprior
 
-                    # derivative of kernel matrix of test points
-                    # in limit of a single test point, this simplifies
-                    # to a zero vector. We'll include it for now.
-                    dki = np.zeros(n_f, dtype=float)
-
-                    # kernel gradient contribution, and convert 
-                    # to cartesian coordinates
-                    L =  self.surrogates[j].models[s_k].L_
-                    U = solve_triangular(L, kqX.T, lower=True, 
-                             check_finite=False)
-                    V = solve_triangular(L, dkX, lower=True,
-                             check_finite=False)
-                    dk_Kinv_k = U.T @ V + V.T @ U
-                    dk_Kinv_k_c = d_grad[i] @ dk_Kinv_k
+                        # compute the dk(x*,X)K⁻¹k(X,x*) contribution
+                        # to the derivative of the covariance of the mean
+                        dXcovar  = self.surrogates[j].models[s_k].dk_Kinv_k(
+                                                    d_gm[i], physical=True)
+                        # convert to cartesians
+                        dXcovar_c = d_grad[i] @ dXcovar
                     
-                    # convert derivative of test point kernel to 
-                    # cartesians (should be zero vector)
-                    dki_c = d_grad[i] @ dki
+                        # dCi is the gradient of the *normalized* posterior 
+                        # variance correction k(x*,X)K⁻¹k(X,x*). The BCM weights 
+                        # use the *unnormalized* variance (σ²_u = std² · σ²_norm), 
+                        # so the chain rule requires an extra std² factor here.
+                        dC = (-dprior_c + dXcovar_c)
 
-                    # del C / dxi
-                    # dCi is the gradient of the *normalized* posterior 
-                    # variance correction k(x*,X)K⁻¹k(X,x*). The BCM weights 
-                    # use the *unnormalized* variance (σ²_u = std² · σ²_norm), 
-                    # so the chain rule requires an extra std² factor here.
-                    dCi = (-dki_c + dk_Kinv_k_c) * std_trn[k,j]
+                    # if frozen_wt approximation, derivative of covariance
+                    # is assumed to be zero
+                    else:
+                        dC = 0.
 
                     # inverse of the covariance of the evaluated energy
                     # single single point, just a scalar
-                    Ci_inv    = 1./(estd[k]**2)
-                    Cinv_grad  = Ci_inv * g_data[k]
+                    C_inv   = 1./(estd[k]**2)
+                    C_grad  = C_inv * g_data[k]
 
                     # accumulate quantities ------------
                     # This is a scalar quantity
-                    C_bcm[k] += Ci_inv
+                    C_bcm[k] += C_inv
                     # this is a scalar qauntity
-                    e_bcm[k] += Ci_inv * e_data[k]
+                    e_bcm[k] += C_inv * e_data[k]
 
                     # this is a vector, [nc]
-                    delCinv[k] += Ci_inv * dCi * Ci_inv
+                    delCinv[k] += C_inv * dC * C_inv
                     # this is a vector [nc]
-                    CdCC[k] += -Ci_inv*dCi*Ci_inv*e_data[k] + Cinv_grad
+                    CdCC[k] += -C_inv * dC * C_inv * e_data[k] + C_grad
 
-            # kernel matrix at test point (this is a scalar), convert to
-            # physical units
-            dx = np.array([d_gm[i]], dtype=float)
-            kxx = [self.surrogates[0].models[sts[k]].kernel_(
-                         dx, dx)[0,0]*std_trn[k,0] for k in range(ns)] 
+            # need the prior to evaluate the conditioned covariance,
+            # use the prior from surrogate[0]
+            prior = [self.surrogates[0].models[st].prior(
+                            d_gm[i], physical=True)[0,0] for st in sts]
 
             # everything scaled to surrogate[0] data, compute hessian
             # for this surrogate for each state/model
-            k_hess = np.array([
-                     self.surrogates[0].models[sk].kernel_hessian(
-                     d_gm[i]) for sk in sts], dtype=float)
+            prior_hess = np.array([
+                     self.surrogates[0].models[sk].prior_hessian(
+                    d_gm[i], physical=True) for sk in sts], dtype=float)
+
             # convert to cartesians
-            sigma_qq_inv = [d_grad[i] @ k_hess[sk] @ d_grad[i].T 
+            sigma_qq_inv = [d_grad[i] @ prior_hess[sk] @ d_grad[i].T 
                                                 for sk in range(ns)]
 
             # combine aggregated quantities
@@ -280,25 +268,28 @@ class BCM():
 
                 # covariance of the BCM gradient
                 cov_bcm[k,i] += -(M-1)*sigma_qq_inv[k]
-                cov_bcm[k,i] = np.linalg.pinv(cov_bcm[k,i])
-                std_bcm[k,i] = np.sqrt(np.absolute(np.diag(cov_bcm[k,i])))
+                cov_bcm[k,i]  = np.linalg.pinv(cov_bcm[k,i])
 
                 # construct aggregate C matrix
-                C     = -(M-1)*(1./kxx[k]) + C_bcm[k]
+                C     = -(M-1)*(1./prior[k]) + C_bcm[k]
                 Cinv  = 1./C
-                # dki_c is always zero, can exclude
-                #dCinv = (1./C) * ((M-1.)*dki_c + delCinv[k]) * (1./C)
+                # dprior_c is always zero, can exclude
+                #dCinv = (1./C) * ((M-1.)*dprior_c + delCinv[k]) * (1./C)
                 dCinv  = Cinv * (0. + delCinv[k]) * Cinv
                 grad_bcm[k,i] = dCinv * e_bcm[k] + Cinv * CdCC[k]
+ 
+        # extract std
+        if std:
+            std_bcm = utils.extract_std(cov_bcm)
 
         # construct return array
         if singleX:
-            args = self._collect_output((grad_bcm[:,0,:],
+            args = utils.collect_output((grad_bcm[:,0,:],
                                          std_bcm[:,0,:],
                                          cov_bcm[:,0,:,:]),
                                          (True, std, cov))
         else:
-            args = self._collect_output((grad_bcm, std_bcm, cov_bcm),
+            args = utils.collect_output((grad_bcm, std_bcm, cov_bcm),
                                          (True, std, cov))
 
         return args 
@@ -321,7 +312,7 @@ class BCM():
         ns = len(sts)
 
         # confirm input is in correct format
-        Xq, (ng, nc), singleX = self._verify_geoms(gms)
+        Xq, (ng, nc), singleX = utils.verify_geoms(gms)
         hessall = np.zeros((ns, ng, nc, nc), dtype=float)
 
         for i in range(ng):
@@ -377,44 +368,4 @@ class BCM():
         status = True
 
         return status
-
-    # it is exceedingly convenient to handle either a single geometry
-    # or multiple geometries with a single function and return either 
-    # a single prediction or a matrix/vector of predictions. So: we 
-    # convert single geometries into a single row matrix so all functions
-    # can behave the same
-    def _verify_geoms(self, X):
-        """
-        if len(X.shape) == 2, return X and single_geom=False
-        if len(X.shape) == 1, convert to a single row matrix, 
-                              single_geom = True
-        """
-        single_x = False
-        if len(X.shape) == 1:
-            single_x = True
-            ngm      = 1
-            nvar     = X.shape[0]
-            Xmat     = np.array([X], dtype=float)
-        else:
-            ngm      = X.shape[0]
-            nvar = X.shape[1]
-            Xmat     = X
-
-        return Xmat, (ngm, nvar), single_x
-
-    #
-    def _collect_output(self, data, include):
-        """
-        construct a tuple of output data based on the booleans
-        in the include tuple. If a single item is to be included,
-        return just the itme (not as a tuple)
-        """
-        args = ()
-        for i in range(len(data)):
-            if include[i]:
-                args += (data[i],)
-        if len(args) == 1:
-            return args[0]
-        else:
-            return args
 
