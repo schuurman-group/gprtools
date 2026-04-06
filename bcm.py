@@ -211,7 +211,7 @@ class BCM():
 
                         # derivative of the covariance weights are 
                         # zero under frozen_wt approximation
-                        dCi = 0.
+                        dC = 0.
 
                     # else we perform some somewhat costly matrix
                     # operations
@@ -354,25 +354,21 @@ class BCM():
         else:
             return hessall
 
-
     #
     def save(self, file_name):
         """
-        write a gpr model to file
+        dump current BCM object to file
         """
-
-        status = True
-
-        return status
-
+        with open(file_name, 'wb') as f:
+            pickle.dump(self, f)
 
     #
-    def load(self, file_name):
+    @classmethod
+    def load(cls, file_name):
         """
-        Load the BCM
+        method to load BCM object, usage is:
+        bcm = BCM.load(file_name)
         """
-
-        status = True
-
-        return status
+        with open(file_name, 'rb') as f:
+            return pickle.load(f)
 
