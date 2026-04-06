@@ -10,6 +10,7 @@ from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKern
 from sklearn import preprocessing
 from sklearn.gaussian_process import GaussianProcessRegressor
 import gpr as gpr
+import utils as utils
 
 class Surrogate(ABC):
 
@@ -47,47 +48,6 @@ class Surrogate(ABC):
     @abstractmethod
     def coupling(self):
         pass
-
-    # it is exceedingly convenient to handle either a single geometry
-    # or multiple geometries with a single function and return either
-    # a single prediction or a matrix/vector of predictions. So: we
-    # convert single geometries into a single row matrix so all functions
-    # can behave the same
-    def _verify_geoms(self, X):
-        """
-        if len(X.shape) == 2, return X and single_geom=False
-        if len(X.shape) == 1, convert to a single row matrix,
-                              single_geom = True
-        """
-        single_x = False
-        if len(X.shape) == 1:
-            single_x = True
-            ngm      = 1
-            nvar     = X.shape[0]
-            Xmat     = np.array([X], dtype=float)
-        else:
-            ngm      = X.shape[0]
-            nvar = X.shape[1]
-            Xmat     = X
-
-        return Xmat, (ngm, nvar), single_x
-
-    #
-    def _collect_output(self, data, include):
-        """
-        construct a tuple of output data based on the booleans
-        in the include tuple. If a single item is to be included,
-        return just the itme (not as a tuple)
-        """
-        args = ()
-        for i in range(len(data)):
-            if include[i]:
-                args += (data[i],)
-        if len(args) == 1:
-            return args[0]
-        else:
-            return args
-
 
 #
 class Adiabat(Surrogate):
@@ -326,7 +286,7 @@ class Adiabat(Surrogate):
         ns = len(sts)
 
         # confirm input is in correct format
-        Xq, (ngm, nc), singleX = self._verify_geoms(gms)
+        Xq, (ngm, nc), singleX = utils.verify_geoms(gms)
         d_data    = self.descriptor.generate(Xq)
 
         # return as numpy array
@@ -334,33 +294,45 @@ class Adiabat(Surrogate):
         estd  = np.zeros((ns, ngm), dtype=float)
         ecov  = np.zeros((ns, ngm, ngm), dtype=float)
 
+        # scikit doesn't support both std and cov being requested.
+        # to ensure evaluate and gradient behave the same, we'll
+        # simply extract the std from the covariance if both are
+        # requested
+        if std and cov:
+            e_std = False
+            e_cov = True
+        else:
+            e_std = std
+            e_cov = cov
+
         for st in sts:
             edata = self.models[st].predict( d_data, 
-                                            return_std = std, 
-                                            return_cov = cov)
+                                            return_std = e_std, 
+                                            return_cov = e_cov)
             evals[st] = edata[0]
-
-            # predict only allows std _or_ cov, not both
-            if std:
+            if std and cov:
+                ecov[st] = edata[1]
+                estd[st] = utils.extract_std(edata[1])
+            elif std:
                 estd[st] = edata[1]
             elif cov:
                 ecov[st] = edata[1]
 
         if singleX:
-            args = self._collect_output((evals[:,0], 
+            args = utils.collect_output((evals[:,0], 
                                          estd[:,0], 
                                          ecov[:,0,0]),
                                          (True, std, cov))
         else:
-            args = self._collect_output((evals, estd, ecov),
+            args = utils.collect_output((evals, estd, ecov),
                                          (True, std, cov))
 
         return args
 
 
     #
-    def gradient(self, gms, states=None, std=False, cov=False,
-                                                numerical=False):
+    def gradient(self, gms, states=None, std=False, cov=False, 
+                                    numerical=False, prior_only=False):
         """
         evaluate the gradient using analytical expression
 
@@ -381,7 +353,7 @@ class Adiabat(Surrogate):
         ns = len(sts)
 
         # confirm input is in correct format
-        Xq, (ng, nc), singleX = self._verify_geoms(gms)
+        Xq, (ng, nc), singleX = utils.verify_geoms(gms)
 
         # generate descriptors
         d_gm   = self.descriptor.generate(Xq)
@@ -396,27 +368,27 @@ class Adiabat(Surrogate):
             # we determine std from cov matrix, so if std is True,
             # cov must be true
             grad_d, std_d, cov_d  = self.models[st].predict_grad(
-                                                     d_gm,
-                                                     std=std,
-                                                     cov=(std or cov))
+                                                 d_gm,
+                                                 std=std,
+                                                 cov=(std or cov),
+                                                 prior_only=prior_only)
             
             grad[i,:,:] = np.einsum('aij,aj->ai',d_grad, grad_d)
             if std or cov:
-                g_cov_c = np.einsum('aik,akl,ajl->aij', 
+                g_cov_c = np.einsum('aik,akl,ajl->aij',
                                                  d_grad, cov_d, d_grad)
                 g_cov[i,:,:,:] = g_cov_c
-                g_std[i,:,:]   = np.sqrt(np.absolute(np.einsum(
-                                                  'aii->ai', g_cov_c)))
+                g_std[i,:,:]   = utils.extract_std(g_cov_c)
 
         # return a 2D array (nst, ncrd) if a single geometry is requested,
         # else return a 3D array (nst, ng, ncrd)
         if singleX:
-            args = self._collect_output((grad[:,0,:], 
+            args = utils.collect_output((grad[:,0,:], 
                                          g_std[:,0,:], 
                                          g_cov[:,0,:,:]), 
                                         (True, std, cov))
         else:
-            args = self._collect_output((grad, g_std, g_cov),
+            args = utils.collect_output((grad, g_std, g_cov),
                                         (True, std, cov))
 
         return args
@@ -439,7 +411,7 @@ class Adiabat(Surrogate):
         ns = len(sts)
 
         # confirm input is in correct format
-        Xq, (ng, nc), singleX = self._verify_geoms(gms)
+        Xq, (ng, nc), singleX = utils.verify_geoms(gms)
 
         hessall = np.zeros((ns, ng, nc, nc), dtype=float)
 
