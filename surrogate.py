@@ -68,6 +68,8 @@ class Adiabat(Surrogate):
         self.models         = []
         self.descriptors    = [[]]*nstates
         self.training       = [[]]*nstates
+        self.prior_covar    = False
+        self.numerical_grad = False
 
         if kernel == 'RBF':
             self.kernel = C(hparam[0],
@@ -83,13 +85,6 @@ class Adiabat(Surrogate):
             print('Kernel: '+str(kernel)+' not recognized.')
             os.abort()
 
-        #for i in range(self.nstates):
-        #    gpregress = gpr.GPRegressor(
-        #                     kernel               = self.kernel,
-        #                     n_restarts_optimizer = 50,
-        #                     normalize_y          = True,
-        #                     optimizer            = 'fmin_l_bfgs_b')
-        #    self.models.append(gpregress)
 
     #
     def copy(self):
@@ -331,8 +326,7 @@ class Adiabat(Surrogate):
 
 
     #
-    def gradient(self, gms, states=None, std=False, cov=False, 
-                                    numerical=False, prior_only=False):
+    def gradient(self, gms, states=None, std=False, cov=False):
         """
         evaluate the gradient using analytical expression
 
@@ -341,7 +335,7 @@ class Adiabat(Surrogate):
         """
 
         # if numerical, call numerical gradient routine
-        if numerical:
+        if self.numerical_grad:
             return self._num_gradient(self, gms, states)
 
         # if no specific states are requested, return all state
@@ -368,17 +362,20 @@ class Adiabat(Surrogate):
             # we determine std from cov matrix, so if std is True,
             # cov must be true
             grad_d, std_d, cov_d  = self.models[st].predict_grad(
-                                                 d_gm,
-                                                 std=std,
-                                                 cov=(std or cov),
-                                                 prior_only=prior_only)
+                                            d_gm,
+                                            std=std,
+                                            cov=(std or cov),
+                                            prior_only=self.prior_covar)
             
             grad[i,:,:] = np.einsum('aij,aj->ai',d_grad, grad_d)
             if std or cov:
                 g_cov_c = np.einsum('aik,akl,ajl->aij',
                                                  d_grad, cov_d, d_grad)
                 g_cov[i,:,:,:] = g_cov_c
-                g_std[i,:,:]   = utils.extract_std(g_cov_c)
+
+        # extract std dev. from covariance matrix, if requested
+        if std:
+            g_std = utils.extract_std(g_cov)
 
         # return a 2D array (nst, ncrd) if a single geometry is requested,
         # else return a 3D array (nst, ng, ncrd)

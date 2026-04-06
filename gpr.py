@@ -13,16 +13,6 @@ class GPRegressor(GaussianProcessRegressor):
     a class inherented from GaussianProcessRegressor to add gradient
     capabilities
     """
-    def init(self, **kwargs):
-        """
-        inherent all input parameters from original GPR class
-        """
-        super().__init__(**kwargs)
-
-        # we'll save these quantities for reuse: V = L^-1delK
-        self._V  = None
-        self._Xi = None
-
     #
     def prior(self, X, physical=True):
         """
@@ -191,9 +181,10 @@ class GPRegressor(GaussianProcessRegressor):
 
         for i in range(ng):
 
-            # recycle inf we have it
-            if np.linalg.norm(Xmat[i]-self._Xi) < 1.e-6:
+            Xi = getattr(self, '_Xi', None)
+            if Xi is not None and np.linalg.norm(Xmat[i]-Xi) < 1.e-6:
                 V = self._V
+                 
             else:
                 # using Cholesky decomposition of efficiently 
                 # evaluate the cross-covariance contribution to 
@@ -217,6 +208,7 @@ class GPRegressor(GaussianProcessRegressor):
         else:
             return dkKinvk
 
+    #
     #
     def predict_grad(self, X, std=False, cov=False, prior_only=False):
         """Predict analytical gradient of the target function.

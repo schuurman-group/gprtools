@@ -22,7 +22,10 @@ class BCM():
         self.surrogate      = surrogate
         self.nstates        = surrogate.nstates
         self.surrogates     = []
-        self.sdata           = []
+        self.sdata          = []
+        self.prior_covar    = False
+        self.frozen_wts     = False
+        self.numerical_grad = False
 
     #
     def n_estimators(self):
@@ -42,11 +45,12 @@ class BCM():
         hyp_param = new.create(data, states=states, 
                                      hparam=hparam, 
                                      nrestart=nrestart)
-        self.surrogates.append(new)
 
-        #print('hyp_param='+str(hyp_param))
-        #for i in range(len(self.surrogates)):
-            #print('surrogate i='+str(i)+' gm0='+str(self.sdata[i][0][0]))
+        # propagate the prior_covar and numerical_grad variables
+        # to the child surrogates
+        new.prior_covar    = self.prior_covar
+        new.numerical_grad = self.numerical_grad
+        self.surrogates.append(new)
 
         return hyp_param
 
@@ -117,8 +121,7 @@ class BCM():
 
     #
     #
-    def gradient(self, gms, states=None, std=False, cov=False,
-                    numerical=False, prior_only=False, frozen_wt=False):
+    def gradient(self, gms, states=None, std=False, cov=False):
         """
         evaluate the gradient using analytical expression
 
@@ -179,22 +182,20 @@ class BCM():
                 # e_data.shape    = (ns,)
                 # ecov_data.shape = (ns,)
                 e_data, estd = self.surrogates[j].evaluate(
-                                                    Xq[i],
-                                                    states=sts,
-                                                    std=True,
-                                                    cov=False)
+                                            Xq[i],
+                                            states=sts,
+                                            std=True,
+                                            cov=False)
                 # gradient returns a list of predicted gradients as
                 # as the covariance matrix between the coordinate compoennts
                 # of the gradient, so:
                 # g_data.shape    = (ns, nc)
                 # gcov_data.shape = (ns, nc, nc)
                 g_data, gcov  = self.surrogates[j].gradient(
-                                                  Xq[i],
-                                                  states=sts,
-                                                  std=False,
-                                                  cov=True,
-                                                  numerical=numerical,
-                                                  prior_only=prior_only)
+                                            Xq[i],
+                                            states=sts,
+                                            std=False,
+                                            cov=True)
 
                 # iterate over states in the surrogate
                 for k in range(ns):
@@ -204,11 +205,21 @@ class BCM():
                     # determine the covariance of the BCM
                     cov_bcm[k,i] += np.linalg.pinv(gcov[k])
 
-                    # compute the derivative of the covariance of the mean
-                    if not frozen_wt:
+                    # compute the derivative of the covariance of the 
+                    # mean
+                    if self.frozen_wts:
+
+                        # derivative of the covariance weights are 
+                        # zero under frozen_wt approximation
+                        dCi = 0.
+
+                    # else we perform some somewhat costly matrix
+                    # operations
+                    else:
                         # derivative of kernel matrix of test points
-                        # in limit of a single test point, this simplifies
-                        # to a zero vector. We'll include it for now.
+                        # in limit of a single test point, this 
+                        # simplifies to a zero vector. We'll include 
+                        # it for now.
                         dprior = self.surrogates[j].models[s_k].dprior(
                                                 d_gm[i], physical=True)
                         # convert to cartesians
@@ -227,11 +238,6 @@ class BCM():
                         # so the chain rule requires an extra std² factor here.
                         dC = (-dprior_c + dXcovar_c)
 
-                    # if frozen_wt approximation, derivative of covariance
-                    # is assumed to be zero
-                    else:
-                        dC = 0.
-
                     # inverse of the covariance of the evaluated energy
                     # single single point, just a scalar
                     C_inv   = 1./(estd[k]**2)
@@ -246,7 +252,7 @@ class BCM():
                     # this is a vector, [nc]
                     delCinv[k] += C_inv * dC * C_inv
                     # this is a vector [nc]
-                    CdCC[k] += -C_inv * dC * C_inv * e_data[k] + C_grad
+                    CdCC[k] += C_inv * dC * C_inv * e_data[k] + C_grad
 
             # need the prior to evaluate the conditioned covariance,
             # use the prior from surrogate[0]
@@ -275,7 +281,7 @@ class BCM():
                 Cinv  = 1./C
                 # dprior_c is always zero, can exclude
                 #dCinv = (1./C) * ((M-1.)*dprior_c + delCinv[k]) * (1./C)
-                dCinv  = Cinv * (0. + delCinv[k]) * Cinv
+                dCinv  = Cinv * (0. - delCinv[k]) * Cinv
                 grad_bcm[k,i] = dCinv * e_bcm[k] + Cinv * CdCC[k]
  
         # extract std
@@ -294,6 +300,7 @@ class BCM():
 
         return args 
 
+    #
     #
     def hessian(self, gms, states=None):
         """
