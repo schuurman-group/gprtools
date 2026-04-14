@@ -355,6 +355,26 @@ class BCM():
             return hessall
 
     #
+    @classmethod
+    def merge(cls, bcm1, bcm2):
+        """
+        Merge two BCM objects into a new BCM containing all surrogates
+        from both. Both BCMs must have the same nstates.
+        Settings (prior_covar, frozen_wts, numerical_grad) are taken
+        from bcm1; a ValueError is raised if nstates differ.
+        """
+        if bcm1.nstates != bcm2.nstates:
+            raise ValueError(
+                f'nstates mismatch: {bcm1.nstates} vs {bcm2.nstates}')
+
+        merged = cls(bcm1.surrogate)
+        merged.prior_covar    = bcm1.prior_covar
+        merged.frozen_wts     = bcm1.frozen_wts
+        merged.numerical_grad = bcm1.numerical_grad
+        merged.surrogates     = bcm1.surrogates + bcm2.surrogates
+        return merged
+
+    #
     def save(self, file_name):
         """
         dump current BCM object to file

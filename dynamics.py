@@ -127,15 +127,18 @@ class FSSH(Dynamics):
     Perform a FSSH propagation, periodically checking the accuracy
     of the surface being propagated on
     """
-    def __init__(self, nstates, gradient=None, coupling=None):
+    def __init__(self, nstates, gradient=None, coupling=None, decoherence=False):
         super().__init__()
 
-        self.ns     = nstates
-        self.grad   = gradient
-        self.coup   = coupling
-        self.m      = None
-        self.state  = None
-        self.nc     = None
+        self.ns          = nstates
+        self.grad        = gradient
+        self.coup        = coupling
+        self.decoherence = decoherence
+        self.m           = None
+        self.state       = None
+        self.nc          = None
+        self._delta_R    = None
+        self._delta_P    = None
 
     #
     def propagate(self, traj, t_final, tols=None, chk_func=None, chk_thresh=None):
@@ -152,7 +155,11 @@ class FSSH(Dynamics):
         self.state  = traj.state()
         self.nc     = traj.nc
         t0          = traj.t()
-        dm          = traj.dm() 
+        dm          = traj.dm()
+
+        if self.decoherence:
+            self._delta_R = np.zeros((self.ns, self.nc), dtype=float)
+            self._delta_P = np.zeros((self.ns, self.nc), dtype=float)
 
         max_step    = 30.
         chk_vals    = []
@@ -196,8 +203,13 @@ class FSSH(Dynamics):
             g_new = self.grad.gradient(x_new)
             nac   = self.build_nac(x_new)
 
+            # apply A-FSSH decoherence correction stroboscopically
+            if self.decoherence and dt > 0:
+                dm_new = self._apply_decoherence(dm_new, dt, g_new,
+                                                 traj.state())
+
             # compute hopping probability
-            s_new = self.compute_fssh_hop(p_new, nac, dm_new, dt, 
+            s_new = self.compute_fssh_hop(p_new, nac, dm_new, dt,
                                                         traj.state())
 
             # if state changed, confirm we can scale the momentum to
@@ -207,15 +219,19 @@ class FSSH(Dynamics):
                                     e_new[traj.state()],
                                     e_new[s_new],
                                     nac[traj.state(), s_new])
-                # we can scale momentum: hope to new state
+                # we can scale momentum: hop to new state
                 if p_scale is not None:
                     p_new = p_scale
+                    propagator.y[self.nc:2*self.nc] = p_new
+                    self.state = s_new
+                    if self.decoherence:
+                        self._delta_R = np.zeros((self.ns, self.nc), dtype=float)
+                        self._delta_P = np.zeros((self.ns, self.nc), dtype=float)
                 # frustrated hop
                 else:
                     s_new = traj.state()
 
             # update the trajectory object with current timestep info
-            self.state = traj.state()
             tupdate = {'time':     propagator.t,
                        'state':    s_new,
                        'x':        x_new,
@@ -346,6 +362,36 @@ class FSSH(Dynamics):
         return p_new
 
     #
+    def _apply_decoherence(self, dm, dt, grads, active):
+        """
+        A-FSSH stroboscopic decoherence correction.
+        Subotnik & Shenvi, J. Chem. Phys. 134, 024105 (2011), Eq. 27.
+
+        Tracks position moment delta_R and momentum moment delta_P for each
+        inactive state. Decoherence rate: gamma = max(0, dF . delta_R) / 2
+        (atomic units, hbar = 1).
+        """
+        F_active = -grads[active]
+        for k in range(self.ns):
+            if k == active:
+                continue
+            dF = -grads[k] - F_active
+            # Euler propagation of classical moments
+            self._delta_R[k] += self._delta_P[k] / self.m * dt
+            self._delta_P[k] += dF * dt
+            # decoherence rate
+            gamma = max(0., np.dot(dF, self._delta_R[k]) / 2.)
+            if gamma > 0.:
+                decay_pop = np.exp(-gamma * dt)
+                decay_coh = np.exp(-gamma * dt / 2.)
+                dpop = dm[k, k].real * (1. - decay_pop)
+                dm[k, k]         *= decay_pop
+                dm[active, active] += dpop
+                dm[active, k]    *= decay_coh
+                dm[k, active]    *= decay_coh
+        return dm
+
+    #
     def propagate_dm(self, dm, ener, tdcm):
         """
         propagate the state density matrix
@@ -362,8 +408,8 @@ class FSSH(Dynamics):
         """
         compute the time derivative coupling matrix
         """
-        tdcm = np.array([[np.dot(vel, nac[i,j]) for i in range(self.ns)] 
-                                  for j in range(self.ns)], dtype=float)
+        tdcm = np.array([[np.dot(vel, nac[i,j]) for j in range(self.ns)] 
+                                  for i in range(self.ns)], dtype=float)
         return tdcm
 
     # build NAC coupling matrix
