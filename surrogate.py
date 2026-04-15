@@ -6,6 +6,7 @@ import copy as copy
 from abc import ABC, abstractmethod
 import numpy as np
 import pickle as pickle
+import opt_einsum
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
 from sklearn import preprocessing
 from sklearn.gaussian_process import GaussianProcessRegressor
@@ -366,11 +367,16 @@ class Adiabat(Surrogate):
                                             std=std,
                                             cov=(std or cov),
                                             prior_only=self.prior_covar)
-            
+
             grad[i,:,:] = np.einsum('aij,aj->ai',d_grad, grad_d)
             if std or cov:
-                g_cov_c = np.einsum('aik,akl,ajl->aij',
-                                                 d_grad, cov_d, d_grad)
+                expr, temp = opt_einsum.contract_path(
+                                              'aik,akl,ajl->aij',
+                                               d_grad,cov_d,d_grad,
+                                               optimize='optimal')
+                g_cov_c = opt_einsum.contract('aik,akl,ajl->aij',
+                                              d_grad, cov_d, d_grad,
+                                              optimize=expr)
                 g_cov[i,:,:,:] = g_cov_c
 
         # extract std dev. from covariance matrix, if requested
