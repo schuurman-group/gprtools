@@ -9,6 +9,7 @@ from scipy.linalg import solve_triangular
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
 from sklearn import preprocessing
 from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.cluster import KMeans
 
 import utils as utils
 
@@ -19,6 +20,7 @@ class BCM():
     """
     def __init__(self, surrogate):
 
+        self.Kmax           = 1000
         self.surrogate      = surrogate
         self.nstates        = surrogate.nstates
         self.surrogates     = []
@@ -33,6 +35,23 @@ class BCM():
         return the number of estimators in the BCM
         """
         return len(self.surrogates)
+
+    #
+    def grow(self, data, states, hparam=None, nrestart=None, 
+                                                  enforce_size=False):
+        """
+        grow the current surrogate by the data in grow
+        """
+
+        if self.n_estimators() == 0:
+            self.add(data, states=states, hparam=None, nrestart=None)
+        else:
+            self.surrogates[-1].update(data, states=states,
+                                       hparam=hparam, nrestart=nrestart)
+            if self.surrogates[-1].train_size() > self.Kmax:
+                self._resort(enforce_size=enforce_size)
+
+        return self.n_estimators()
 
     #
     def add(self, data, states=[], hparam=None, nrestart=None):
@@ -177,24 +196,15 @@ class BCM():
             # is a first pass
             for j in range(M):
 
-                # evaluate returns the predcited point, as well as the
-                # covariance
-                # e_data.shape    = (ns,)
-                # ecov_data.shape = (ns,)
-                e_data, estd = self.surrogates[j].evaluate(
+                # jointly evaluate energy (with std) and gradient (with
+                # covariance), sharing the kernel computation between both
+                # e_data.shape = (ns,), estd.shape = (ns,)
+                # g_data.shape = (ns, nc), gcov.shape = (ns, nc, nc)
+                e_data, estd, g_data, gcov = \
+                    self.surrogates[j].evaluate_and_gradient(
                                             Xq[i],
                                             states=sts,
                                             std=True,
-                                            cov=False)
-                # gradient returns a list of predicted gradients as
-                # as the covariance matrix between the coordinate compoennts
-                # of the gradient, so:
-                # g_data.shape    = (ns, nc)
-                # gcov_data.shape = (ns, nc, nc)
-                g_data, gcov  = self.surrogates[j].gradient(
-                                            Xq[i],
-                                            states=sts,
-                                            std=False,
                                             cov=True)
 
                 # iterate over states in the surrogate
@@ -355,6 +365,80 @@ class BCM():
             return hessall
 
     #
+    def save(self, file_name):
+        """
+        dump current BCM object to file
+        """
+        with open(file_name, 'wb') as f:
+            pickle.dump(self, f)
+
+    #
+    def _resort(self, enforce_size=False):
+        """
+        Collect all training data from the current M surrogates, partition
+        it into M+1 clusters of ~Ktarget points using k-means in descriptor
+        space, and rebuild the BCM with one additional surrogate.
+
+        enforce_size : if True, post-process the k-means assignment so that
+                       each cluster contains at most ceil(N / (M+1)) points,
+                       keeping distortion low via greedy assignment by distance.
+        """
+        M   = len(self.surrogates)
+        sts = list(range(self.nstates))
+        n_new = M + 1
+
+        # collect descriptors (state-independent) and per-state energies
+        # from all current surrogates
+        all_desc = np.vstack([self.surrogates[j].descriptors[0]
+                               for j in range(M)])             # (N, nf)
+        all_ener = [np.concatenate([self.surrogates[j].training[st]
+                                    for j in range(M)])
+                    for st in sts]                             # nstates × (N,)
+
+        N = all_desc.shape[0]
+
+        # k-means in descriptor space: aim for ~Ktarget points per cluster
+        km     = KMeans(n_clusters=n_new, n_init=10,
+                        random_state=0).fit(all_desc)
+        labels = km.labels_
+
+        if enforce_size:
+            # greedy balanced reassignment: sort all (point, cluster) pairs
+            # by distance to center and assign in order, capping each cluster
+            # at ceil(N / n_new) points
+            cap   = int(np.ceil(N / n_new))
+            dists = np.linalg.norm(
+                        all_desc[:, None, :] - km.cluster_centers_[None, :, :],
+                        axis=2)                                # (N, n_new)
+            pt_idx, cl_idx = np.unravel_index(
+                                 np.argsort(dists.ravel()), dists.shape)
+            labels = -np.ones(N, dtype=int)
+            counts = np.zeros(n_new, dtype=int)
+            for pt, cl in zip(pt_idx, cl_idx):
+                if labels[pt] == -1 and counts[cl] < cap:
+                    labels[pt] = cl
+                    counts[cl] += 1
+                if (labels >= 0).all():
+                    break
+
+        # copy first surrogate as model template (kernel, structure, warm-start
+        # hyperparameters) before clearing the surrogate list
+        template = self.surrogates[0]
+        self.surrogates = []
+
+        for k in range(n_new):
+            idx = np.where(labels == k)[0]
+            new = template.copy()
+            new.prior_covar    = self.prior_covar
+            new.numerical_grad = self.numerical_grad
+            for st in sts:
+                new.descriptors[st] = all_desc[idx]
+                new.training[st]    = all_ener[st][idx]
+                new.models[st].fit(all_desc[idx], all_ener[st][idx])
+            self.surrogates.append(new)
+
+
+    #
     @classmethod
     def merge(cls, bcm1, bcm2):
         """
@@ -373,14 +457,6 @@ class BCM():
         merged.numerical_grad = bcm1.numerical_grad
         merged.surrogates     = bcm1.surrogates + bcm2.surrogates
         return merged
-
-    #
-    def save(self, file_name):
-        """
-        dump current BCM object to file
-        """
-        with open(file_name, 'wb') as f:
-            pickle.dump(self, f)
 
     #
     @classmethod

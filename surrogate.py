@@ -391,6 +391,48 @@ class Adiabat(Surrogate):
         return args
 
     #
+    def evaluate_and_gradient(self, gms, states=None, std=False, cov=False):
+        """
+        Jointly evaluate energy (with optional std) and gradient (with
+        optional covariance), sharing the kernel computation between both.
+
+        Returns: e (ns, ngm), estd (ns, ngm), g (ns, ngm, nc),
+                 gcov (ns, ngm, nc, nc)
+        Uncomputed quantities are zero arrays.
+        """
+        if states is None:
+            sts = list(range(self.nstates))
+        else:
+            sts = states
+        ns = len(sts)
+
+        Xq, (ngm, nc), singleX = utils.verify_geoms(gms)
+        d_gm   = self.descriptor.generate(Xq)
+        d_grad = self.descriptor.descriptor_gradient(Xq)
+
+        e_out    = np.zeros((ns, ngm), dtype=float)
+        estd_out = np.zeros((ns, ngm), dtype=float)
+        g_out    = np.zeros((ns, ngm, nc), dtype=float)
+        gcov_out = np.zeros((ns, ngm, nc, nc), dtype=float)
+
+        for i, st in enumerate(sts):
+            mean, mstd, grad_d, gcov_d = self.models[st].predict_and_grad(
+                                             d_gm,
+                                             std=std,
+                                             cov=cov,
+                                             prior_only=self.prior_covar)
+            e_out[i]    = mean
+            estd_out[i] = mstd
+            g_out[i]    = np.einsum('aij,aj->ai', d_grad, grad_d)
+            if cov:
+                gcov_out[i] = d_grad @ gcov_d @ d_grad.swapaxes(-2, -1)
+
+        if singleX:
+            return (e_out[:, 0], estd_out[:, 0],
+                    g_out[:, 0, :], gcov_out[:, 0, :, :])
+        return e_out, estd_out, g_out, gcov_out
+
+    #
     def hessian(self, gms, states = None):
         """
         compute the hessian by gradient differences

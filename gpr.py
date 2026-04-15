@@ -210,6 +210,65 @@ class GPRegressor(GaussianProcessRegressor):
 
     #
     #
+    def predict_and_grad(self, X, std=False, cov=False, prior_only=False):
+        """
+        Jointly predict posterior mean and gradient, sharing the single
+        kernel evaluation k(X*, X_train) between both computations.
+
+        std=True   : also compute posterior std of the energy
+        cov=True   : also compute posterior covariance of the gradient
+        prior_only : gradient covariance = prior hessian (skip K^{-1} solve)
+
+        Returns: mean (ng,), mstd (ng,), grad (ng, nf), gcov (ng, nf, nf)
+        Uncomputed quantities are returned as zero arrays.
+        All computed quantities are in physical (unnormalized) units.
+        """
+        Xmat, (ngm, nf), _ = utils.verify_geoms(X)
+
+        hyper_para = np.exp(self.kernel_.theta)
+        len_scale  = hyper_para[1]
+
+        mean  = np.zeros(ngm, dtype=float)
+        mstd  = np.zeros(ngm, dtype=float)
+        grad  = np.zeros((ngm, nf), dtype=float)
+        gcov  = np.zeros((ngm, nf, nf), dtype=float)
+
+        for i in range(ngm):
+            # one kernel evaluation shared by energy and gradient
+            k_cross  = self.kernel_(Xmat[i:i+1], self.X_train_).squeeze()  # (nt,)
+            diff     = Xmat[i:i+1] - self.X_train_                         # (nt, nf)
+            dk_cross = -(diff / len_scale**2) * k_cross[:, None]           # (nt, nf)
+
+            # energy and gradient predictions are always computed
+            mean[i] = (k_cross @ self.alpha_) * self._y_train_std \
+                       + self._y_train_mean
+            grad[i] = dk_cross.T @ self.alpha_ * self._y_train_std
+
+            if std:
+                # energy std: sqrt(k(x*,x*) - k(x*,X) K^{-1} k(X,x*))
+                V_e     = solve_triangular(self.L_, k_cross,
+                                           lower=GPR_CHOLESKY_LOWER,
+                                           check_finite=False)     # (nt,)
+                k_prior = self.prior(Xmat[i], physical=False)[0, 0]
+                mstd[i] = np.sqrt(max(0., k_prior - V_e @ V_e)) \
+                           * self._y_train_std
+
+            if cov:
+                # gradient covariance: ∇²k(x*,x*) - ∇k K^{-1} ∇k^T
+                prior_hess = self._cal_prior_hessian(Xmat[i]) \
+                              * self._y_train_std**2
+                if prior_only:
+                    gcov[i] = prior_hess
+                else:
+                    V_g     = solve_triangular(self.L_, dk_cross,
+                                               lower=GPR_CHOLESKY_LOWER,
+                                               check_finite=False)  # (nt, nf)
+                    gcov[i] = prior_hess - V_g.T @ V_g * self._y_train_std**2
+
+        return mean, mstd, grad, gcov
+
+    #
+    #
     def predict_grad(self, X, std=False, cov=False, prior_only=False):
         """Predict analytical gradient of the target function.
         """
