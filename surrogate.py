@@ -5,8 +5,8 @@ import os
 import copy as copy
 from abc import ABC, abstractmethod
 import numpy as np
-import pickle as pickle
 import opt_einsum
+import pickle as pickle
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
 from sklearn import preprocessing
 from sklearn.gaussian_process import GaussianProcessRegressor
@@ -48,6 +48,10 @@ class Surrogate(ABC):
 
     @abstractmethod
     def coupling(self):
+        pass
+
+    @abstractmethod
+    def train_size(self):
         pass
 
 #
@@ -117,9 +121,16 @@ class Adiabat(Surrogate):
 
         # create the regressor object
         for i in range(self.nstates):
+
+            # default is 1 restarts in hyperparam opt
+            if nrestart == None:
+                nres = 1
+            else:
+                nres = nrestart
+
             gpregress = gpr.GPRegressor(
                              kernel               = self.kernel,
-                             n_restarts_optimizer = 50,
+                             n_restarts_optimizer = nres,
                              normalize_y          = True,
                              optimizer            = 'fmin_l_bfgs_b')
             self.models.append(gpregress)
@@ -367,16 +378,15 @@ class Adiabat(Surrogate):
                                             std=std,
                                             cov=(std or cov),
                                             prior_only=self.prior_covar)
-
+            
             grad[i,:,:] = np.einsum('aij,aj->ai',d_grad, grad_d)
             if std or cov:
-                expr, temp = opt_einsum.contract_path(
-                                              'aik,akl,ajl->aij',
-                                               d_grad,cov_d,d_grad,
-                                               optimize='optimal')
+                expr, temp = opt_einsum.contract_path('aik,akl,ajl->aij',
+                                                    d_grad,cov_d,d_grad,
+                                                    optimize='optimal')
                 g_cov_c = opt_einsum.contract('aik,akl,ajl->aij',
-                                              d_grad, cov_d, d_grad,
-                                              optimize=expr)
+                                              d_grad, cov_d, d_grad, 
+                                              optimize=self.expr)
                 g_cov[i,:,:,:] = g_cov_c
 
         # extract std dev. from covariance matrix, if requested
@@ -397,7 +407,8 @@ class Adiabat(Surrogate):
         return args
 
     #
-    def evaluate_and_gradient(self, gms, states=None, std=False, cov=False):
+    def evaluate_and_gradient(self, gms, states=None, descrip=None, 
+                              grad_descrip=None, std=False, cov=False):
         """
         Jointly evaluate energy (with optional std) and gradient (with
         optional covariance), sharing the kernel computation between both.
@@ -413,8 +424,18 @@ class Adiabat(Surrogate):
         ns = len(sts)
 
         Xq, (ngm, nc), singleX = utils.verify_geoms(gms)
-        d_gm   = self.descriptor.generate(Xq)
-        d_grad = self.descriptor.descriptor_gradient(Xq)
+
+        # avoid unnecessary recomputation of descriptors and descriptor
+        # gradients if they already exist should probably add some
+        # sanity checking here at some point
+        if descrip is None:
+            d_gm = self.descriptor.generate(Xq)
+        else:
+            d_gm = descrip
+        if grad_descrip is None:
+            d_grad = self.descriptor.descriptor_gradient(Xq)
+        else:
+            d_grad = grad_descrip
 
         e_out    = np.zeros((ns, ngm), dtype=float)
         estd_out = np.zeros((ns, ngm), dtype=float)
@@ -503,7 +524,7 @@ class Adiabat(Surrogate):
         return None
 
     #
-    def training_size(self):
+    def train_size(self):
         """
         return the dimension of the kernel matrix
         """
