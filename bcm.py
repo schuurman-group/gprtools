@@ -93,7 +93,7 @@ class BCM():
         grow the current surrogate by the data in grow
         """
 
-        if hparam != None:
+        if hparam is not None:
             # just a single set of hparams, copy to the 
             # number of states
             ndim = len(hparam.shape)
@@ -104,7 +104,7 @@ class BCM():
             # a single set of hparams for a single surrogate (i.e.
             # a set per state). Nest just one layer
             if ndim == 2:
-                hp = np.array([hp], dtype=float)
+                hp = np.array([hparam], dtype=float)
             else:
                 hp = hparam
 
