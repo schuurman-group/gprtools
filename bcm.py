@@ -10,8 +10,57 @@ from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKern
 from sklearn import preprocessing
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.cluster import KMeans
+from joblib import Parallel, delayed
 
 import utils as utils
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers for parallel BCM evaluation — defined at module scope
+# so joblib can locate them regardless of backend
+# ---------------------------------------------------------------------------
+
+def _eval_one_surrogate(surrogate, Xq, sts):
+    """
+    Single-surrogate contribution to BCM evaluate.
+    """
+    return surrogate.evaluate(Xq, states=sts, std=False, cov=True)
+
+
+def _grad_one_surrogate(surrogate, xi, d_gm_i, d_grad_i, sts, ns, nc,
+                        frozen_wts):
+    """
+    Single-surrogate contribution to the BCM gradient at one geometry.
+    Returns (C_bcm, e_bcm, delCinv, CdCC, cov_contrib) accumulated over
+    states.
+    """
+    e_data, estd, g_data, gcov = surrogate.evaluate_and_gradient(
+                                     xi, states=sts, std=True, cov=True)
+
+    C_bcm_j   = np.zeros(ns, dtype=float)
+    e_bcm_j   = np.zeros(ns, dtype=float)
+    delCinv_j = np.zeros((ns, nc), dtype=float)
+    CdCC_j    = np.zeros((ns, nc), dtype=float)
+    cov_j     = np.zeros((ns, nc, nc), dtype=float)
+
+    for k in range(ns):
+        s_k      = sts[k]
+        cov_j[k] = np.linalg.pinv(gcov[k])
+
+        if frozen_wts:
+            dC = 0.
+        else:
+            dprior  = surrogate.models[s_k].dprior(d_gm_i, physical=True)
+            dXcovar = surrogate.models[s_k].dk_Kinv_k(d_gm_i, physical=True)
+            dC      = d_grad_i @ (-dprior + dXcovar)
+
+        C_inv         = 1. / estd[k]**2
+        C_bcm_j[k]    = C_inv
+        e_bcm_j[k]    = C_inv * e_data[k]
+        delCinv_j[k]  = C_inv * dC * C_inv
+        CdCC_j[k]     = C_inv * dC * C_inv * e_data[k] + C_inv * g_data[k]
+
+    return C_bcm_j, e_bcm_j, delCinv_j, CdCC_j, cov_j
 
 #
 class BCM():
@@ -28,6 +77,7 @@ class BCM():
         self.prior_covar    = False
         self.frozen_wts     = False
         self.numerical_grad = False
+        self.n_jobs         = 1
 
     #
     def n_estimators(self):
@@ -98,12 +148,12 @@ class BCM():
         std_bcm  = np.zeros((ns, ngm), dtype=float)
         cov_bcm  = np.zeros((ns, ngm, ngm), dtype=float)
 
-        # return as numpy array
-        for i in range(M):
-            e_data, e_cov = self.surrogates[i].evaluate(Xq, 
-                                                states=sts, 
-                                                std=False, 
-                                                cov=True)
+        # evaluate all surrogates — parallel over M if n_jobs != 1
+        results = Parallel(n_jobs=self.n_jobs, prefer='threads')(
+                      delayed(_eval_one_surrogate)(self.surrogates[i], Xq, sts)
+                      for i in range(M))
+
+        for e_data, e_cov in results:
             for st in range(ns):
                 e_cov_inv    = np.linalg.pinv(e_cov[st])
                 cov_bcm[st] += e_cov_inv
@@ -193,79 +243,20 @@ class BCM():
             delCinv = np.zeros((ns, nc), dtype=float)
             CdCC    = np.zeros((ns, nc), dtype=float)     
 
-            # nested loops in python make me cringe. This
-            # is a first pass
-            for j in range(M):
+            # evaluate all surrogates at geometry i — parallel over M
+            s_results = Parallel(n_jobs=self.n_jobs, prefer='threads')(
+                            delayed(_grad_one_surrogate)(
+                                self.surrogates[j], Xq[i],
+                                d_gm[i], d_grad[i],
+                                sts, ns, nc, self.frozen_wts)
+                            for j in range(M))
 
-                # jointly evaluate energy (with std) and gradient (with
-                # covariance), sharing the kernel computation between both
-                # e_data.shape = (ns,), estd.shape = (ns,)
-                # g_data.shape = (ns, nc), gcov.shape = (ns, nc, nc)
-                e_data, estd, g_data, gcov = \
-                    self.surrogates[j].evaluate_and_gradient(
-                                            Xq[i],
-                                            states=sts,
-                                            descrip=d_gm,
-                                            grad_descrip=d_grad,
-                                            std=True,
-                                            cov=True)
-
-                # iterate over states in the surrogate
-                for k in range(ns):
-                    s_k = sts[k]
-
-                    # accumulate covariance of the gradient to
-                    # determine the covariance of the BCM
-                    cov_bcm[k,i] += np.linalg.pinv(gcov[k])
-
-                    # compute the derivative of the covariance of the 
-                    # mean
-                    if self.frozen_wts:
-
-                        # derivative of the covariance weights are 
-                        # zero under frozen_wt approximation
-                        dC = 0.
-
-                    # else we perform some somewhat costly matrix
-                    # operations
-                    else:
-                        # derivative of kernel matrix of test points
-                        # in limit of a single test point, this 
-                        # simplifies to a zero vector. We'll include 
-                        # it for now.
-                        dprior = self.surrogates[j].models[s_k].dprior(
-                                                d_gm[i], physical=True)
-                        # convert to cartesians
-                        dprior_c = d_grad[i] @ dprior
-
-                        # compute the dk(x*,X)K⁻¹k(X,x*) contribution
-                        # to the derivative of the covariance of the mean
-                        dXcovar  = self.surrogates[j].models[s_k].dk_Kinv_k(
-                                                    d_gm[i], physical=True)
-                        # convert to cartesians
-                        dXcovar_c = d_grad[i] @ dXcovar
-                    
-                        # dCi is the gradient of the *normalized* posterior 
-                        # variance correction k(x*,X)K⁻¹k(X,x*). The BCM weights 
-                        # use the *unnormalized* variance (σ²_u = std² · σ²_norm), 
-                        # so the chain rule requires an extra std² factor here.
-                        dC = (-dprior_c + dXcovar_c)
-
-                    # inverse of the covariance of the evaluated energy
-                    # single single point, just a scalar
-                    C_inv   = 1./(estd[k]**2)
-                    C_grad  = C_inv * g_data[k]
-
-                    # accumulate quantities ------------
-                    # This is a scalar quantity
-                    C_bcm[k] += C_inv
-                    # this is a scalar qauntity
-                    e_bcm[k] += C_inv * e_data[k]
-
-                    # this is a vector, [nc]
-                    delCinv[k] += C_inv * dC * C_inv
-                    # this is a vector [nc]
-                    CdCC[k] += C_inv * dC * C_inv * e_data[k] + C_grad
+            for C_bcm_j, e_bcm_j, delCinv_j, CdCC_j, cov_j in s_results:
+                C_bcm   += C_bcm_j
+                e_bcm   += e_bcm_j
+                delCinv += delCinv_j
+                CdCC    += CdCC_j
+                cov_bcm[:, i] += cov_j
 
             # need the prior to evaluate the conditioned covariance,
             # use the prior from surrogate[0]
@@ -404,9 +395,9 @@ class BCM():
                     for st in sts]                             # nstates × (N,)
 
         N      = all_desc.shape[0]
-        hp     = np.array([[self.surrogates[i].models[j].kernel_.theta 
-                             for j in range(len(sts))] 
-                             for i in range(M)] dtype=float)
+        hp     = np.array([[self.surrogates[i].models[j].kernel_.theta
+                             for j in range(len(sts))]
+                             for i in range(M)], dtype=float)
         nhyper = hp.shape[2]
 
         # k-means in descriptor space: aim for ~Ktarget points per cluster
