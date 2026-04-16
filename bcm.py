@@ -93,12 +93,24 @@ class BCM():
         grow the current surrogate by the data in grow
         """
 
+        if hparam != None:
+            # just a single set of hparams, copy to the 
+            # number of states
+            ndim = len(hparam.shape)
+            if ndim == 1:
+                hp = np.repeat(np.array(hparam),repeats=self.nstates, 
+                                                              axis=0)
+            # a single set of hparams for a single surrogate (i.e.
+            # a set per state). Nest just one layer
+            if ndim == 1 or ndim == 2:
+                hp = np.array([hp], dtype=float)
+
         if self.n_estimators() == 0:
             hyper = self.add(data, states=states, 
-                                       hparam=hparam, nrestart=nrestart)
+                                       hparam=hp[-1], nrestart=nrestart)
         else:
             hyper = self.surrogates[-1].update(data, states=states,
-                                       hparam=hparam, nrestart=nrestart)
+                                       hparam=hp[-1], nrestart=nrestart)
             if self.surrogates[-1].train_size() > self.Kmax:
                 hyper = self._resort(enforce_size=enforce_size)
 
@@ -428,7 +440,7 @@ class BCM():
         # hyperparameters) before clearing the surrogate list
         template = self.surrogates[0]
         self.surrogates = []
-        hparams = np.zeros((M, len(sts), nhyper), dtype=float)
+        hparams = np.zeros((n_new, len(sts), nhyper), dtype=float)
 
         for k in range(n_new):
             idx = np.where(labels == k)[0]
@@ -442,9 +454,9 @@ class BCM():
             for st in sts:
                 new.descriptors[st] = all_desc[idx]
                 new.training[st]    = all_ener[st][idx]
-                # use the previous 
-                new.models[st].fit(all_desc[idx], all_ener[st][idx], 
-                                                    hparam=hp_init[st])
+                # use the previous
+                new.models[st].kernel_.theta = hp_init[st]
+                new.models[st].fit(all_desc[idx], all_ener[st][idx])
                 hparams[k, st] = new.models[st].kernel_.theta
             self.surrogates.append(new)
 
