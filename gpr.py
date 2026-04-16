@@ -263,6 +263,9 @@ class GPRegressor(GaussianProcessRegressor):
                     V_g     = solve_triangular(self.L_, dk_cross,
                                                lower=GPR_CHOLESKY_LOWER,
                                                check_finite=False)  # (nt, nf)
+                    self._Xi = Xmat[i]
+                    self._V  = V_g
+
                     gcov[i] = prior_hess - V_g.T @ V_g * self._y_train_std**2
 
         return mean, mstd, grad, gcov

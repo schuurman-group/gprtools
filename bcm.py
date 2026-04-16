@@ -44,14 +44,15 @@ class BCM():
         """
 
         if self.n_estimators() == 0:
-            self.add(data, states=states, hparam=None, nrestart=None)
+            hyper = self.add(data, states=states, 
+                                       hparam=hparam, nrestart=nrestart)
         else:
-            self.surrogates[-1].update(data, states=states,
+            hyper = self.surrogates[-1].update(data, states=states,
                                        hparam=hparam, nrestart=nrestart)
             if self.surrogates[-1].train_size() > self.Kmax:
-                self._resort(enforce_size=enforce_size)
+                hyper = self._resort(enforce_size=enforce_size)
 
-        return self.n_estimators()
+        return hyper
 
     #
     def add(self, data, states=[], hparam=None, nrestart=None):
@@ -61,7 +62,7 @@ class BCM():
 
         #self.sdata.append(data)
         new = self.surrogate.copy()
-        hyp_param = new.create(data, states=states, 
+        hyper = new.create(data, states=states, 
                                      hparam=hparam, 
                                      nrestart=nrestart)
 
@@ -71,7 +72,7 @@ class BCM():
         new.numerical_grad = self.numerical_grad
         self.surrogates.append(new)
 
-        return hyp_param
+        return hyper
 
     #
     def evaluate(self, gms, states=None, std=False, cov=False):
@@ -204,6 +205,8 @@ class BCM():
                     self.surrogates[j].evaluate_and_gradient(
                                             Xq[i],
                                             states=sts,
+                                            descrip=d_gm,
+                                            grad_descrip=d_grad,
                                             std=True,
                                             cov=True)
 
@@ -384,6 +387,11 @@ class BCM():
                        keeping distortion low via greedy assignment by distance.
         """
         M   = len(self.surrogates)
+
+        # if no surrogates exist, exit now
+        if M == 0:
+            return None
+        
         sts = list(range(self.nstates))
         n_new = M + 1
 
@@ -395,7 +403,11 @@ class BCM():
                                     for j in range(M)])
                     for st in sts]                             # nstates × (N,)
 
-        N = all_desc.shape[0]
+        N      = all_desc.shape[0]
+        hp     = np.array([[self.surrogates[i].models[j].kernel_.theta 
+                             for j in range(len(sts))] 
+                             for i in range(M)] dtype=float)
+        nhyper = hp.shape[2]
 
         # k-means in descriptor space: aim for ~Ktarget points per cluster
         km     = KMeans(n_clusters=n_new, n_init=10,
@@ -425,18 +437,28 @@ class BCM():
         # hyperparameters) before clearing the surrogate list
         template = self.surrogates[0]
         self.surrogates = []
+        hparams = np.zeros((M, len(sts), nhyper), dtype=float)
 
         for k in range(n_new):
             idx = np.where(labels == k)[0]
             new = template.copy()
             new.prior_covar    = self.prior_covar
             new.numerical_grad = self.numerical_grad
+            # the initial hyper parameters are taken from previous
+            # surrogates. No guarantee hp[i] now algins with data in
+            # surrogate[i], but it's much better than nothing
+            hp_init = hp[min(k,M-1)]
             for st in sts:
                 new.descriptors[st] = all_desc[idx]
                 new.training[st]    = all_ener[st][idx]
-                new.models[st].fit(all_desc[idx], all_ener[st][idx])
+                # use the previous 
+                new.models[st].fit(all_desc[idx], all_ener[st][idx], 
+                                                    hparam=hp_init[st])
+                hparams[k, st] = new.models[st].kernel_.theta
             self.surrogates.append(new)
 
+        # return the optimized hyper params
+        return hparams
 
     #
     @classmethod
