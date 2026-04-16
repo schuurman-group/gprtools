@@ -97,13 +97,16 @@ class BCM():
             # just a single set of hparams, copy to the 
             # number of states
             ndim = len(hparam.shape)
+            # just a single set of hparams, change shape to
+            # hp.shape = (1, nstate, nparam)
             if ndim == 1:
-                hp = np.repeat(np.array(hparam),repeats=self.nstates, 
-                                                              axis=0)
+                hp = np.repeat([[hparam]],repeats=self.nstates, axis=1)
             # a single set of hparams for a single surrogate (i.e.
             # a set per state). Nest just one layer
-            if ndim == 1 or ndim == 2:
+            if ndim == 2:
                 hp = np.array([hp], dtype=float)
+            else:
+                hp = hparam
 
         if self.n_estimators() == 0:
             hyper = self.add(data, states=states, 

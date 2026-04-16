@@ -191,7 +191,8 @@ class Adiabat(Surrogate):
             self.models[st].fit(self.descriptors[st],
                                 self.training[st])
 
-        return [model.kernel_.theta for model in self.models]
+        return np.array([model.kernel_.theta for model in self.models], 
+                                                           dtype=float)
 
     #
     def update(self, data, states=[], hparam=None, nrestart=None):
@@ -253,7 +254,8 @@ class Adiabat(Surrogate):
             self.models[st].fit(self.descriptors[st],
                                 self.training[st])
 
-        return [model.kernel_.theta for model in self.models]
+        return np.array([model.kernel_.theta for model in self.models],
+                                                           dtype=float)
 
     #
     def load(self, model_name):
