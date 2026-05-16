@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from scipy.stats import qmc
 from scipy.integrate import RK45
 from scipy.integrate import solve_ivp
+import timer as timer
 
 
 class Dynamics(ABC):
@@ -32,6 +33,7 @@ class SingleState(Dynamics):
         self.nc    = None
 
     #
+    @timer.timed
     def propagate(self, traj, t_final, tols=None, chk_func=None, chk_thresh=None):
         """
         propagate a trajectory from current time t to t+dt using
@@ -100,6 +102,7 @@ class SingleState(Dynamics):
             return failed
 
     #
+    @timer.timed
     def step_function(self, t, y):
         """
         function to pass to solve_ivp to propagate trajectory
@@ -141,7 +144,9 @@ class FSSH(Dynamics):
         self._delta_P    = None
 
     #
-    def propagate(self, traj, t_final, tols=None, chk_func=None, chk_thresh=None):
+    @timer.timed
+    def propagate(self, traj, t_final, gs_stoptime=1000.,
+                        tols=None, chk_func=None, chk_thresh=None):
         """
         propagate a trajectory from current time t to t+dt using
         the surrogate
@@ -156,6 +161,7 @@ class FSSH(Dynamics):
         self.nc     = traj.nc
         t0          = traj.t()
         dm          = traj.dm()
+        gs_start    = None
 
         if self.decoherence:
             self._delta_R = np.zeros((self.ns, self.nc), dtype=float)
@@ -231,6 +237,16 @@ class FSSH(Dynamics):
                 else:
                     s_new = traj.state()
 
+            # if on the ground state, start ground state timer
+            if traj.state() == 0.:
+                if gs_start is None:
+                    gs_start = propagator.t
+                elif (propagator.t - gs_start) >= gs_stoptime:
+                    break
+            # else, deactivate gs timer
+            else:
+                gs_start = None
+
             # update the trajectory object with current timestep info
             tupdate = {'time':     propagator.t,
                        'state':    s_new,
@@ -258,6 +274,7 @@ class FSSH(Dynamics):
             return failed
 
     #
+    @timer.timed
     def step_function(self, t, y):
         """
         function to pass to solve_ivp to propagate trajectory

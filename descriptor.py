@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from ase import Atoms
 from dscribe.descriptors import SOAP
 import constants
+import timer as timer
 
 class Descriptor(ABC):
 
@@ -45,6 +46,7 @@ class Soap(Descriptor):
         )
 
     #
+    @timer.timed
     def generate(self, gms):
         """
         evaluate the energy at passed geometry, gm
@@ -72,6 +74,7 @@ class Soap(Descriptor):
             return np.array(descriptors)
 
 
+    @timer.timed
     def descriptor_gradient(self, gms, delta=0.02):
         """
         calculate gradient of SOAP descritor over cartesian coordinates

@@ -12,6 +12,7 @@ from sklearn import preprocessing
 from sklearn.gaussian_process import GaussianProcessRegressor
 import gpr as gpr
 import utils as utils
+import timer as timer
 
 class Surrogate(ABC):
 
@@ -114,6 +115,7 @@ class Adiabat(Surrogate):
         return new
 
     #
+    @timer.timed
     def create(self, data, states=[], hparam=None, nrestart=None):
         """
         create a surrogate with training data, data
@@ -195,6 +197,7 @@ class Adiabat(Surrogate):
                                                            dtype=float)
 
     #
+    @timer.timed
     def update(self, data, states=[], hparam=None, nrestart=None):
         """
         update the surrogate with additional data
@@ -260,27 +263,36 @@ class Adiabat(Surrogate):
     #
     def load(self, model_name):
         """
-        load a gpr model from file
+        Load a GPR model from file
         """
+        self.models = [None] * self.nstates
+        self.training = [None] * self.nstates
+        self.descriptors = [None] * self.nstates
+
         for i in range(self.nstates):
-            with open(str(model_name) + '_st' + str(i)
-                                           + '.pkl', 'rb') as f:
-                self.models[i]      = pickle.load(f)
-                self.descriptors[i] = self.models[i].X_train_
-                self.training[i]    = self.models[i].y_train_
-        
+            with open(f"{model_name}_st{i}.pkl", 'rb') as f:
+                bundle = pickle.load(f)
+                self.models[i] = bundle['model']
+                self.training[i] = bundle['training_data']
+                self.descriptors[i] = bundle['descriptors']
+
     #
     def save(self, model_name):
         """
-        write a gpr model to file
+        Write a GPR model to file
         """
-        # save the classifier
         for i in range(self.nstates):
-            with open(str(model_name) + '_st' + str(i)
-                                         + '.pkl', 'wb') as fid:
-                pickle.dump(self.models[i], fid)
+            # Create a bundle of everything needed for this state
+            bundle = {
+                'model': self.models[i],
+                'training_data': self.training[i],
+                'descriptors': self.descriptors[i]
+            }
+            with open(f"{model_name}_st{i}.pkl", 'wb') as fid:
+                pickle.dump(bundle, fid)
 
     #
+    @timer.timed
     def evaluate(self, gms, states=None, std=False, cov=False):
         """
         evaluate teh surrogate at gms
@@ -340,6 +352,7 @@ class Adiabat(Surrogate):
 
 
     #
+    @timer.timed
     def gradient(self, gms, states=None, std=False, cov=False):
         """
         evaluate the gradient using analytical expression
@@ -388,7 +401,7 @@ class Adiabat(Surrogate):
                                                     optimize='optimal')
                 g_cov_c = opt_einsum.contract('aik,akl,ajl->aij',
                                               d_grad, cov_d, d_grad, 
-                                              optimize=self.expr)
+                                              optimize=expr)
                 g_cov[i,:,:,:] = g_cov_c
 
         # extract std dev. from covariance matrix, if requested
@@ -409,7 +422,8 @@ class Adiabat(Surrogate):
         return args
 
     #
-    def evaluate_and_gradient(self, gms, states=None, descrip=None, 
+    @timer.timed
+    def evaluate_and_gradient(self, gms, states=None, descrip=None,
                               grad_descrip=None, std=False, cov=False):
         """
         Jointly evaluate energy (with optional std) and gradient (with
@@ -462,6 +476,7 @@ class Adiabat(Surrogate):
         return e_out, estd_out, g_out, gcov_out
 
     #
+    @timer.timed
     def hessian(self, gms, states = None):
         """
         compute the hessian by gradient differences

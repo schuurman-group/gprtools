@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 # import graci.core.libs as libs
 import chempotpy
 import constants as constants
+import timer as timer
 
 class Surface(ABC):
 
@@ -78,6 +79,7 @@ class Graci(Surface):
         libs.lib_load('bitci')
 
     #
+    @timer.timed
     def evaluate(self, gms, scr_dir=None, propagate=True, clean=True):
         """
         evaluate the energy at passed geometry, gm
@@ -159,6 +161,7 @@ class Graci(Surface):
         return energies, scf_fail, ci_fail
 
     #
+    @timer.timed
     def gradient(self, geoms):
         """
         not defined for GRaCI surfaces
@@ -166,6 +169,7 @@ class Graci(Surface):
         return None
 
     #
+    @timer.timed
     def coupling(self, geoms):
         """
         time-derivative couplings will be added in the future
@@ -240,6 +244,7 @@ class Kdc(Surface):
         self.nstates = self.ham.nstates
 
     #
+    @timer.timed
     def evaluate(self, gms, n_s=None, rep='adiabatic'):
         """
         Evaluate the energies  energies
@@ -667,6 +672,7 @@ class ChemPotPy(Surface):
         self.have_coupling  = True
 
     #
+    @timer.timed
     def evaluate(self, gms, states=None):
         """
         evaluate the potential at the passed geometries. Geometries
@@ -712,6 +718,7 @@ class ChemPotPy(Surface):
             return ener
 
     #
+    @timer.timed
     def gradient(self, gms, states=None, numerical=False):
         """
         evaluate the gradients at the passed geometries. Geometries
@@ -788,6 +795,7 @@ class ChemPotPy(Surface):
             return grads
 
     #
+    @timer.timed
     def hessian(self, gms, states=None, num_grad=False):
         """
         compute the hessian by gradient differences
@@ -853,6 +861,7 @@ class ChemPotPy(Surface):
             return hessall
 
     #
+    @timer.timed
     def coupling(self, gms, pairs = None):
         """
         evaluate the NACs at the passed geometries. Geometries

@@ -5,6 +5,7 @@ import numpy as np
 from sklearn.gaussian_process import GaussianProcessRegressor
 from scipy.linalg import solve_triangular
 import utils as utils
+import timer as timer
 
 GPR_CHOLESKY_LOWER = True
 
@@ -210,6 +211,7 @@ class GPRegressor(GaussianProcessRegressor):
 
     #
     #
+    @timer.timed
     def predict_and_grad(self, X, std=False, cov=False, prior_only=False):
         """
         Jointly predict posterior mean and gradient, sharing the single
@@ -272,6 +274,7 @@ class GPRegressor(GaussianProcessRegressor):
 
     #
     #
+    @timer.timed
     def predict_grad(self, X, std=False, cov=False, prior_only=False):
         """Predict analytical gradient of the target function.
         """
