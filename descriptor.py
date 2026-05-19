@@ -42,7 +42,12 @@ class Soap(Descriptor):
             n_max = n_max,      # maximum radial basis functions
             l_max = l_max,      # maximum degree of spherical harmonics
             sigma = sigma,      # Gaussian smearing of atomic densities
-            average="inner"     # use a single vector for all atoms
+            average = "off"     # per-site SOAP; the outer (site) average
+                                # is taken explicitly in generate(). This
+                                # keeps analytic derivatives available --
+                                # dscribe does not provide them for
+                                # averaged output, and the outer average
+                                # is linear in the per-site descriptors.
         )
 
     #
@@ -64,7 +69,8 @@ class Soap(Descriptor):
             gm        = np.reshape(
                             eval_gms[i,:]*constants.bohr2ang,(natm,3))
             molecule  = Atoms(symbols=self.atoms, positions=gm)
-            descriptor = self.generator.create(molecule)
+            # per-site SOAP, outer-averaged over sites
+            descriptor = np.mean(self.generator.create(molecule), axis=0)
             descriptors.append(descriptor/np.linalg.norm(descriptor))
 
         # return the geometries
@@ -75,48 +81,70 @@ class Soap(Descriptor):
 
 
     @timer.timed
-    def descriptor_gradient(self, gms, delta=0.02):
+    def descriptor_gradient(self, gms, delta=None):
         """
-        calculate gradient of SOAP descritor over cartesian coordinates
+        gradient of the (normalized, outer-averaged) SOAP descriptor
+        with respect to the cartesian coordinates.
+
+        delta is None  : analytic gradient -- dscribe per-site analytic
+                         derivatives, averaged over sites, carrying the
+                         generate() normalization and the bohr -> ang
+                         unit conversion through the chain rule.
+        delta not None : central finite difference of generate() with
+                         the given step size (kept for backwards
+                         compatibility / cross-checking).
+
+        gradient is returned in a numpy array with
+        shape = [ng, nc, n_feature]
         """
-        ng = gms.shape[0]
-        nc = gms.shape[1]
+        ng   = gms.shape[0]
+        nc   = gms.shape[1]
+        natm = len(self.atoms)
 
-        descriptor = self.generate(gms[0,:])
-        n_feature  = descriptor.shape[0]
-        # print(f'ng:{ng}')
-        # print(f'nc:{nc}')
-        # print(f'n_feature:{n_feature}')
+        n_feature = self.generate(gms[0,:]).shape[0]
+        des_grad  = np.zeros((ng, nc, n_feature), dtype=float)
 
-        des_grad = np.zeros((ng, nc, n_feature))
+        # backwards-compatible numerical differentiation
+        if delta is not None:
+            for i in range(ng):
+                origin  = np.tile(gms[i,:], (nc, 1))
+                disps   = origin + np.diag(np.array([delta]*nc))
+                p_grad  = self.generate(disps)
+                disps   = origin - np.diag(np.array([delta]*nc))
+                m_grad  = self.generate(disps)
+                des_grad[i,:,:] = (p_grad - m_grad)/(2.*delta)
+            return des_grad
+
+        # analytic differentiation (default)
+        eye = np.eye(n_feature)
 
         for i in range(ng):
 
-            origin = np.tile(gms[i,:], (nc, 1))
+            gm       = np.reshape(gms[i,:]*constants.bohr2ang, (natm,3))
+            molecule = Atoms(symbols=self.atoms, positions=gm)
 
-            disps   = origin + np.diag(np.array([delta]*nc))
-            p_grad  = self.generate(disps)
+            # per-site analytic derivatives and per-site descriptors;
+            # attach=True so each SOAP center moves with its atom
+            der, des = self.generator.derivatives(molecule,
+                                                  method='analytical',
+                                                  attach=True,
+                                                  return_descriptor=True)
+            # der.shape = (nsite, natm, 3, n_feature)
+            # des.shape = (nsite, n_feature)
 
-            disps   = origin - np.diag(np.array([delta]*nc))
-            m_grad  = self.generate(disps)
+            # outer-averaged (raw) descriptor and its derivative are the
+            # mean over sites
+            d_raw  = np.mean(des, axis=0)                          # (nf,)
+            dd_raw = np.mean(der, axis=0).reshape(nc, n_feature)   # (nc,nf)
 
-            grad    = (p_grad - m_grad ) / (2.*delta)
+            # normalization: dhat = d/||d||
+            #   d(dhat) = (1/||d||)(I - dhat dhat^T) d(d)
+            nrm  = np.linalg.norm(d_raw)
+            dhat = d_raw/nrm
+            proj = eye - np.outer(dhat, dhat)
+            dd_n = (dd_raw @ proj)/nrm                             # (nc,nf)
 
-            des_grad[i,:,:] = grad
-
-        #compare with analytic gradients:
-        #for i in range(ng):
-        #    gm        = np.reshape(gms[i,:]*constants.bohr2ang,(len(self.atoms),3))
-        #    molecule  = Atoms(symbols=self.atoms, positions=gm)
-        #    deriv,descrip = self.generator.derivatives_single(molecule, gm, 
-        #                               indices=[i for i in range(len(self.atoms))])
-        # 
-        #    des_grad[i,:,:] = np.reshape(deriv, (3*len(self.atoms), deriv.shape[-1]))
-
-        #dtest = np.reshape(deriv, (3*len(self.atoms), deriv.shape[-1]))
-        #print('|dtest-darr|='+str(np.linalg.norm(dtest-darr)))
-        #print('darr.shape='+str(darr.shape))
-        #norm_diff = np.linalg.norm(des_grad[0,:,:] - darr)
-        #print('norm_diff='+str(norm_diff))
+            # chain rule for the bohr -> angstrom coordinate scaling
+            des_grad[i,:,:] = dd_n*constants.bohr2ang
 
         return des_grad
