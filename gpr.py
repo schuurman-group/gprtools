@@ -15,6 +15,20 @@ class GPRegressor(GaussianProcessRegressor):
     capabilities
     """
     #
+    def fit(self, X, y):
+        """
+        fit the GP and invalidate the cached dk_Kinv solve.
+
+        dk_Kinv_dk / predict_and_grad cache a triangular solve on the
+        model (_Xi, _V) for reuse by dk_Kinv_k. That cache is tied to
+        the current training set, so it must be dropped whenever the
+        model is (re)fit.
+        """
+        self._Xi = None
+        self._V  = None
+        return super().fit(X, y)
+
+    #
     def prior(self, X, physical=True):
         """
         evaluate the kernel matrix at test points X

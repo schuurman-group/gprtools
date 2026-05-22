@@ -96,20 +96,22 @@ class Adiabat(Surrogate):
     def copy(self):
         """
         copy surrogate object
+
+        Every attribute is deep-copied so the returned surrogate is
+        fully independent. In particular models, descriptors and
+        training are plain lists -- a shallow list copy would leave the
+        copy sharing the original's GPRegressor / ndarray objects, so a
+        subsequent fit() or update() on the copy would mutate the
+        original.
         """
 
-        new = Adiabat(self.nstates, 
-                      self.descriptor, 
-                      kernel=self.ktype, 
+        new = Adiabat(self.nstates,
+                      self.descriptor,
+                      kernel=self.ktype,
                       hparam=self.hparam)
 
-        var_dict = {key:value for key,value in self.__dict__.items()
-                   if not key.startswith('__') and not callable(key)}
-
-        for key, value in var_dict.items():
-            if hasattr(value, 'copy'):
-                setattr(new, key, value.copy())
-            else:
+        for key, value in self.__dict__.items():
+            if not key.startswith('__'):
                 setattr(new, key, copy.deepcopy(value))
 
         return new

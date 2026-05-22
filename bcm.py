@@ -161,23 +161,35 @@ class BCM():
     #
     #
     @timer.timed
-    def gradient(self, gms, states=None, std=False, cov=False):
+    def gradient(self, gms, states=None, std=False, cov=False,
+                                                    numerical=False):
         """
         evaluate the gradient using analytical expression
 
-        gradient is returned in a numpy array with 
+        gradient is returned in a numpy array with
         shape = [nst, ngeom, ncrd]
+
+        numerical=True : fall back to a central finite difference of
+                         BCM.evaluate (see _numerical_gradient). std
+                         and cov are supported and are computed from
+                         the inter-point covariance of the displaced
+                         evaluations -- they are the variance /
+                         covariance of the FD estimator itself.
 
         NOTE: we CHOOSE to evaluate geometries one at a time so
         that the gradient remains uniquely defined. If we form the
-        full BCM covariance matrix for an ensemble of points, 
-        the gradient at a single point would _depend on the 
-        points in the ensemble_. This is not desirable. 
+        full BCM covariance matrix for an ensemble of points,
+        the gradient at a single point would _depend on the
+        points in the ensemble_. This is not desirable.
 
         However, this is now inconsistent with the potential
         evaluation, which _does_ form the full covariance matrix. We
         should look into this at a later date...
         """
+        if numerical:
+            return self._numerical_gradient(gms, states=states,
+                                                 std=std, cov=cov)
+
         # if no specific states are requested, return all state
         # energies
         if states == None:
@@ -272,8 +284,10 @@ class BCM():
                         dC = (-dprior_c + dXcovar_c)
 
                     # inverse of the covariance of the evaluated energy
-                    # single single point, just a scalar
-                    C_inv   = 1./(estd[k]**2)
+                    # at the (single) query point. sklearn clips
+                    # numerically-negative predictive variances to zero,
+                    # so floor estd^2 at the squared machine precision.
+                    C_inv   = 1./np.maximum(estd[k]**2, 1.e-32)
                     C_grad  = C_inv * g_data[k]
 
                     # accumulate quantities ------------
@@ -334,6 +348,89 @@ class BCM():
         return args 
 
     #
+    #
+    @timer.timed
+    def _numerical_gradient(self, gms, states=None, std=False, cov=False,
+                                                              delta=1.e-4):
+        """
+        central finite-difference gradient via BCM.evaluate calls.
+
+        The gradient mean is the central FD of the BCM posterior mean.
+        std and cov are well-defined as the variance / covariance of
+        the FD estimator, which is a linear combination of GP-
+        distributed energies at the 2 nc displaced points:
+
+            g_fd,k = (E_{+k} - E_{-k}) / (2 delta)
+            Var(g_fd,k)         = (V_{+k} + V_{-k} - 2 C_{+k,-k}) / (4 d^2)
+            Cov(g_fd,k, g_fd,l) =
+                (C_{+,+} - C_{+,-} - C_{-,+} + C_{-,-}) / (4 d^2)
+
+        all obtained from BCM.evaluate(..., cov=True) on the 2 nc
+        displaced points per geometry.
+
+        Returns the same shapes as gradient():
+            grad   (nst, ngeom, ncrd)
+            std    (nst, ngeom, ncrd)
+            cov    (nst, ngeom, ncrd, ncrd)
+        """
+        if states is None:
+            sts = list(range(self.nstates))
+        else:
+            sts = states
+        ns = len(sts)
+
+        Xq, (ng, nc), singleX = utils.verify_geoms(gms)
+
+        grads = np.zeros((ns, ng, nc),    dtype=float)
+        g_std = np.zeros((ns, ng, nc),    dtype=float)
+        g_cov = np.zeros((ns, ng, nc, nc), dtype=float)
+
+        need_cov = std or cov
+        inv_2d   = 1./(2.*delta)
+        inv_4d2  = 1./(4.*delta*delta)
+        eye_nc   = np.eye(nc)
+
+        for i in range(ng):
+            # 2 nc displaced points: rows 0..nc-1 are +delta along
+            # each axis, rows nc..2nc-1 are -delta along each axis
+            displ = np.empty((2*nc, nc), dtype=float)
+            displ[:nc, :] = Xq[i] + delta*eye_nc
+            displ[nc:, :] = Xq[i] - delta*eye_nc
+
+            if need_cov:
+                e, e_cov = self.evaluate(displ, states=sts,
+                                                std=False, cov=True)
+                # e     shape (ns, 2nc)
+                # e_cov shape (ns, 2nc, 2nc)
+                grads[:, i, :] = (e[:, :nc] - e[:, nc:])*inv_2d
+                for s in range(ns):
+                    G    = e_cov[s]
+                    C_pp = G[:nc, :nc]
+                    C_pm = G[:nc, nc:]
+                    C_mp = G[nc:, :nc]
+                    C_mm = G[nc:, nc:]
+                    g_cov[s, i] = (C_pp - C_pm - C_mp + C_mm)*inv_4d2
+            else:
+                e = self.evaluate(displ, states=sts)        # (ns, 2nc)
+                grads[:, i, :] = (e[:, :nc] - e[:, nc:])*inv_2d
+
+        if std:
+            # (V_+ + V_- - 2 C_{+,-}) can go slightly negative from
+            # round-off in the inter-point evaluate covariance,
+            # especially at small delta; floor before the sqrt
+            diag  = np.diagonal(g_cov, axis1=-2, axis2=-1)
+            g_std = np.sqrt(np.maximum(diag, 0.))
+
+        if singleX:
+            args = utils.collect_output((grads[:, 0, :],
+                                         g_std[:, 0, :],
+                                         g_cov[:, 0, :, :]),
+                                        (True, std, cov))
+        else:
+            args = utils.collect_output((grads, g_std, g_cov),
+                                        (True, std, cov))
+        return args
+
     #
     @timer.timed
     def hessian(self, gms, states=None):
