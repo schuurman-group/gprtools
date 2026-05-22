@@ -162,7 +162,8 @@ class BCM():
     #
     @timer.timed
     def gradient(self, gms, states=None, std=False, cov=False,
-                                                    numerical=False):
+                                                    numerical=False,
+                                                    delta=1.e-4):
         """
         evaluate the gradient using analytical expression
 
@@ -188,7 +189,8 @@ class BCM():
         """
         if numerical:
             return self._numerical_gradient(gms, states=states,
-                                                 std=std, cov=cov)
+                                                 std=std, cov=cov,
+                                                 delta=delta)
 
         # if no specific states are requested, return all state
         # energies

@@ -588,8 +588,14 @@ class Trajectory():
         # not sure how many points to include
         npt  = 5
         idx  = np.searchsorted(self.time[:self.cnt], time)
+        st   = self.state(time)
         bnds = [max(0, idx-npt), min(self.cnt, idx+npt)]
-        
+
+        # tighten each end so the kept window stays on the active
+        # state st (avoid bridging across state switches)
+        while bnds[0] < idx and self.st[bnds[0]]   != st: bnds[0] += 1
+        while bnds[1] > idx and self.st[bnds[1]-1] != st: bnds[1] -= 1
+
         x = self.time.take(indices=range(bnds[0], bnds[1]))
         y = data.take(indices=range(bnds[0], bnds[1]), axis=0)
 
