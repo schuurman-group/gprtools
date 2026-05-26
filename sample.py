@@ -37,7 +37,13 @@ class Wigner(Sample):
             os.abort()
 
         self.ref_gm = ref_gm
-        np.random.seed(seed)  # set  seed for reproducibility
+        # per-instance Generator -- using np.random.seed sets the
+        # GLOBAL state, so the actual sample drawn from Wigner.sample()
+        # depends on whatever else has called np.random.* between
+        # this constructor and sample(). That makes Wigner ICs not
+        # reproducible across runs whenever upstream code changes
+        # (e.g. cache-hit vs cache-miss differs between sessions).
+        self.rng = np.random.default_rng(seed)
 
 
     #
@@ -83,8 +89,8 @@ class Wigner(Sample):
         sigma_x = np.sqrt(0.25 / alpha)
         sigma_p = np.sqrt(alpha)
 
-        dx = np.random.normal(0., sigma_x, (nsample, nc))
-        dp = np.random.normal(0., sigma_p, (nsample, nc))
+        dx = self.rng.normal(0., sigma_x, (nsample, nc))
+        dp = self.rng.normal(0., sigma_p, (nsample, nc))
 
         if bounds == None:
             chk_bounds = False
@@ -117,8 +123,8 @@ class Wigner(Sample):
                         dist_p[ipass,:] = np.dot(modes, dp) * np.sqrt(masses)
 
                 if ipass < nsample:
-                    dx = self.rseed.normal(0., sigma_x, (nsample, nc))
-                    dp = self.rseed.normal(0., sigma_p, (nsample, nc))
+                    dx = self.rng.normal(0., sigma_x, (nsample, nc))
+                    dp = self.rng.normal(0., sigma_p, (nsample, nc))
 
             dist_x += self.ref_gm.x
             dist_p += self.ref_gm.p

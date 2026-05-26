@@ -24,8 +24,7 @@ class GPRegressor(GaussianProcessRegressor):
         the current training set, so it must be dropped whenever the
         model is (re)fit.
         """
-        self._Xi = None
-        self._V  = None
+    
         return super().fit(X, y)
 
     #
@@ -159,8 +158,6 @@ class GPRegressor(GaussianProcessRegressor):
             # gradient variance expression
             V = solve_triangular(self.L_, dcross[i], lower=True,
                                       check_finite=False)
-            self._Xi = Xmat[i]
-            self._V  = V
 
             #print('V.shape='+str(V.shape))
             dkKinvdk[i] = V.T @ V
@@ -174,7 +171,7 @@ class GPRegressor(GaussianProcessRegressor):
         else:
             return dkKinvdk
 
-    #
+
     def dk_Kinv_k(self, X, physical=True):
         """
         return the gradient of the conditioning covariance
@@ -191,28 +188,20 @@ class GPRegressor(GaussianProcessRegressor):
         dcross = self.dcross_covar(Xmat, physical=False)
 
         # should probably check that the ng is the same in k_grad
-        (ng, nt, nf) = dcross.shape
+    #    (ng, nt, nf) = dcross.shape
         dkKinvk = np.zeros((ng, nf), dtype=float)
 
         for i in range(ng):
 
-            Xi = getattr(self, '_Xi', None)
-            if Xi is not None and np.linalg.norm(Xmat[i]-Xi) < 1.e-6:
-                V = self._V
-                 
-            else:
-                # using Cholesky decomposition of efficiently 
-                # evaluate the cross-covariance contribution to 
-                # gradient variance expression
-                V = solve_triangular(self.L_, dcross[i], lower=True,
-                                                 check_finite=False)
-
             U = solve_triangular(self.L_, cross[i].T, lower=True,
                                                check_finite=False)
 
+            Kinvk = solve_triangular(self.L_.T, U, lower=False,
+                                     check_finite=False)
+
 
             #print('V.shape='+str(V.shape))
-            dkKinvk[i] = U.T @ V + V.T @ U
+            dkKinvk[i] = 2.*(dcross[i].T @ Kinvk)
 
             # if we want this in normalized units, have to re-scale
             if physical:
@@ -279,8 +268,6 @@ class GPRegressor(GaussianProcessRegressor):
                     V_g     = solve_triangular(self.L_, dk_cross,
                                                lower=GPR_CHOLESKY_LOWER,
                                                check_finite=False)  # (nt, nf)
-                    self._Xi = Xmat[i]
-                    self._V  = V_g
 
                     gcov[i] = prior_hess - V_g.T @ V_g * self._y_train_std**2
 

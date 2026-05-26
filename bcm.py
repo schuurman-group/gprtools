@@ -124,22 +124,25 @@ class BCM():
                                                 std=False,
                                                 cov=True)
             for st in range(ns):
-                e_cov_inv    = np.linalg.pinv(e_cov[st])
+                # per-expert posterior cov is PSD by construction;
+                # use psd_pinv to keep epsilon-scale numerical noise
+                # from being inverted into huge spurious eigenvalues
+                e_cov_inv    = utils.psd_pinv(e_cov[st])
                 cov_bcm[st] += e_cov_inv
                 e_bcm[st]   += e_cov_inv @ e_data[st]
 
         # compute covariance matrix for query points
         d_data  = self.surrogates[0].descriptor.generate(Xq)
-        k_data  = [self.surrogates[0].models[st].kernel_(d_data) 
+        k_data  = [self.surrogates[0].models[st].kernel_(d_data)
                                               for st in sts]
 
-        sigma_qq_inv = [np.linalg.pinv(k_data[st] * 
+        sigma_qq_inv = [utils.psd_pinv(k_data[st] *
                      self.surrogates[0].models[sts[st]]._y_train_std**2)
                                                     for st in range(ns)]
 
         for st in range(ns):
             cov_bcm[st] += -(M - 1)*sigma_qq_inv[st]
-            cov_bcm[st]  = np.linalg.pinv(cov_bcm[st])
+            cov_bcm[st]  = utils.psd_pinv(cov_bcm[st])
             e_bcm[st]    = cov_bcm[st] @ e_bcm[st]
 
         # if std. dev. requested, extract from the covariance
@@ -249,8 +252,14 @@ class BCM():
                     s_k = sts[k]
 
                     # accumulate covariance of the gradient to
-                    # determine the covariance of the BCM
-                    cov_bcm[k,i] += np.linalg.pinv(gcov[k])
+                    # determine the covariance of the BCM. The
+                    # per-expert gcov is PSD by construction but can
+                    # have epsilon-scale negative eigenvalues from
+                    # numerical assembly; psd_pinv projects those out
+                    # before inversion (else pinv blows them up to
+                    # ~1e+18 spurious eigenvalues that contaminate the
+                    # BCM aggregation -> negative diagonals -> NaN std)
+                    cov_bcm[k,i] += utils.psd_pinv(gcov[k])
 
                     # compute the derivative of the covariance of the
                     # mean
@@ -323,7 +332,7 @@ class BCM():
 
                 # covariance of the BCM gradient
                 cov_bcm[k,i] += -(M-1)*sigma_qq_inv[k]
-                cov_bcm[k,i]  = np.linalg.pinv(cov_bcm[k,i])
+                cov_bcm[k,i]  = utils.psd_pinv(cov_bcm[k,i])
 
                 # construct aggregate C matrix
                 C     = -(M-1)*(1./prior[k]) + C_bcm[k]

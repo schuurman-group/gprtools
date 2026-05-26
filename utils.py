@@ -2,20 +2,51 @@
 import numpy as np
 
 # extract the standard deviation from (a series) of covariance
-# matrices. Assume the covariance matrices are given by the 
+# matrices. Assume the covariance matrices are given by the
 # final two indices
 def extract_std(cov):
     """
     extract std. dev. from covatriance matrix/matrices. Assume
     the covariance matrices are given by the final two indices.
+
+    Negative diagonals (variance < 0) can leak through even with PSD-
+    projected upstream pinvs in pathological numerical cases; clip to 0
+    here so np.sqrt does not return NaN. Warn with magnitude so the
+    upstream code can be flagged if this fires.
     """
+    var = np.diagonal(cov, axis1=-2, axis2=-1)
+    mn  = float(np.min(var))
+    if mn < 0.:
+        print(f'WARNING: variance < 0 (min={mn:.3e}); clipping to 0')
+        var = np.maximum(var, 0.)
+    return np.sqrt(var)
 
-    std = np.diagonal(cov, axis1=-2, axis2=-1)
-    if np.min(std) < 0.:
-        print('WARNING: variance < 0.: '+str(np.argmin(std)))
 
-    std = np.sqrt(std)
-    return std
+def psd_pinv(mat, rcond=None):
+    """
+    Symmetric pseudo-inverse with positive-semi-definite projection.
+
+    Use this when `mat` is mathematically supposed to be PSD (e.g. a
+    GP posterior covariance) but may have machine-epsilon-scale
+    negative eigenvalues from numerical assembly. np.linalg.pinv on
+    such a matrix inverts the tiny negative eigenvalues to huge
+    spurious negative values, which then propagate through downstream
+    BCM/GRBCM aggregation as wildly wrong precision matrices.
+
+    The eigendecomposition path here:
+      - symmetrises the input,
+      - clips negative eigenvalues to 0 (PSD projection),
+      - pseudo-inverts only eigenvalues above the standard pinv cutoff,
+      - recomposes.
+    Returns a symmetric PSD matrix.
+    """
+    A    = 0.5*(mat + mat.T)
+    w, V = np.linalg.eigh(A)
+    if rcond is None:
+        rcond = max(mat.shape) * np.finfo(mat.dtype).eps
+    cutoff = rcond * max(np.max(w), 0.0)
+    w_inv  = np.where(w > cutoff, 1.0/np.maximum(w, cutoff), 0.0)
+    return (V * w_inv) @ V.T
 
 # it is exceedingly convenient to handle either a single geometry
 # or multiple geometries with a single function and return either

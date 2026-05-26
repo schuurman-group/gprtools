@@ -78,10 +78,16 @@ class Adiabat(Surrogate):
         self.numerical_grad = False
 
         if kernel == 'RBF':
+            # length_scale lower bound at 0.25 prevents the hparam
+            # optimiser from collapsing to a tiny length scale
+            # (essentially-zero generalisation) on hard fits; a
+            # too-small length scale leads to active-loop pathologies
+            # (the GP can't predict outside the immediate vicinity of
+            # training points so the trajectory is "stuck")
             self.kernel = C(hparam[0],
                             constant_value_bounds=(1e-5, 1e5)) * \
                           RBF(hparam[1],
-                            length_scale_bounds=(1e-3, 1e3))
+                            length_scale_bounds=(0.25, 1e3))
             # self.kernel = C(hparam[0]) * RBF(hparam[1])
         elif kernel == 'WhiteNoise':
             self.kernel = C(hparam[0]) * RBF(hparam[1],
