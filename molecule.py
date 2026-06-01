@@ -5,7 +5,6 @@ import os
 import copy as copy
 import numpy as np
 import scipy.interpolate as sp_interpolate
-import scipy.optimize as sp_optimize
 from itertools import chain
 import constants as constants
 import intc as intc
@@ -279,23 +278,6 @@ class Geometry():
             return self.c2int.cart2intp(x, v)
         else:
             return None
-
-    #
-    def optimize(self, surf, state=0, x0=None, conv=1.e-4, iter_max=100):
-        """
-        optimize the molecule using the surface (could be surface
-        or surrogate) 
-        """
-
-        # use the current geometry as starting guess, if none is
-        # explicitly given
-        if x0 is None:
-            x0 = self.x
-
-        res = sp_optimize.minimize(surf.evaluate, x0, args=([state]), 
-                                   jac=surf.gradient, hess=surf.hessian, 
-                                   method='L-BFGS-B', tol=conv)
-        return res
 
     #
     def freq(self):

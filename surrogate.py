@@ -1081,6 +1081,11 @@ class CP(Surrogate):
         # MECI optimisation. Default 1e-3 Eh (~0.027 eV) only flattens
         # the surface where the true gap < ~eps; tune per system.
         self.degeneracy_eps = degeneracy_eps
+        # one-shot diagnostic flags: reconstruction near a seam fires the
+        # complex-root / exact-coincidence notices on essentially every
+        # query (e.g. throughout a MECI search), so warn once per instance
+        self._warned_im    = False
+        self._warned_coinc = False
         self.models         = []
         self.descriptors    = None      # shared (npts, nfeat) over all targets
         self.targets        = None      # (nstates, npts): omega + CP coeffs
@@ -1290,11 +1295,14 @@ class CP(Surrogate):
 
         eps = self.degeneracy_eps
         # with tip smoothing, overshoots up to ~eps are absorbed, so only
-        # warn on imaginary parts the floor cannot account for
-        if max_im > max(self._ROOT_IM_TOL, eps):
+        # warn on imaginary parts the floor cannot account for (once per
+        # instance -- near a seam this fires on essentially every query)
+        if max_im > max(self._ROOT_IM_TOL, eps) and not self._warned_im:
             print(f'WARNING: CP companion roots have |Im| up to '
                   f'{max_im:.3e} au; taking real part. Coefficient GPs '
-                  f'may be extrapolating beyond a real-rooted region.')
+                  f'may be extrapolating beyond a real-rooted region. '
+                  f'(further such warnings suppressed for this surrogate)')
+            self._warned_im = True
 
         if eps > 0.:
             # floor each adjacent gap to sqrt(d^2 + eps^2); rebuild the
@@ -1332,17 +1340,18 @@ class CP(Surrogate):
         jac[:, :, 0] = 1.0
         if n == 1:
             return jac
-        warned = False
         for g in range(ngm):
             for i in range(n):
                 pprime = np.prod(z[g, i] - np.delete(z[g], i))
                 if abs(pprime) < self._PPRIME_TOL:
-                    if not warned:
+                    if not self._warned_coinc:
                         print(f"WARNING: CP exact root coincidence at "
                               f"degeneracy_eps=0; |p'(z_{i})|="
-                              f"{abs(pprime):.3e} au -- gradient singular "
-                              f"(set degeneracy_eps>0 to smooth).")
-                        warned = True
+                              f"{abs(pprime):.3e} au -- gradient singular. "
+                              f"Use a small degeneracy_eps (e.g. 1e-6) for "
+                              f"MECI to stay smooth. (further warnings "
+                              f"suppressed for this surrogate)")
+                        self._warned_coinc = True
                     pprime = self._PPRIME_TOL if pprime == 0. \
                              else np.copysign(self._PPRIME_TOL, pprime)
                 powers        = z[g, i] ** np.arange(n - 1)  # z^0..z^{n-2}
