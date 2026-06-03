@@ -24,6 +24,8 @@ amu2au = 1836.152673
 #MISC CONSTANTS
 fine_str = 1. / 137.0359895
 c_spd    = 1. / fine_str
+# conversion factor for degree K to au
+kB       = 3.16681520371153e-6
 
 #TRIG CONSTANTS
 rad2deg  = 180./math.pi

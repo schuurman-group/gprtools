@@ -6,9 +6,10 @@ import shutil
 import numpy as np
 import itertools
 from abc import ABC, abstractmethod
-import graci.core.libs as libs
+# import graci.core.libs as libs
 import chempotpy
 import constants as constants
+import timer as timer
 
 class Surface(ABC):
 
@@ -68,7 +69,7 @@ class Graci(Surface):
             self.graci_scf = self.graci_ci.scf.copy()
         self.graci_scf.verbose = False
 
-        # set the Molecule object 
+        # set the Molecule object
         if mol_obj is not None:
             self.graci_mol = mol_obj.copy()
         else:
@@ -78,6 +79,7 @@ class Graci(Surface):
         libs.lib_load('bitci')
 
     #
+    @timer.timed
     def evaluate(self, gms, scr_dir=None, propagate=True, clean=True):
         """
         evaluate the energy at passed geometry, gm
@@ -116,7 +118,7 @@ class Graci(Surface):
         ci_guess  = None
         for i in range(len(ordr)):
             geom = gms[ordr[i],:]
- 
+
             # update the geometry
             self.graci_mol.set_geometry(atms, geom.reshape(natm,3))
             self.graci_mol.run()
@@ -142,7 +144,7 @@ class Graci(Surface):
             if conv:
                 energies[ordr[i],:] = np.asarray(self.graci_ci.energy(
                                      range(self.nroots)), dtype=float)
-                # if we're propagating the CI reference space, 
+                # if we're propagating the CI reference space,
                 # update the ci_guess
                 if propagate:
                     ci_guess = self.graci_ci.copy()
@@ -159,6 +161,7 @@ class Graci(Surface):
         return energies, scf_fail, ci_fail
 
     #
+    @timer.timed
     def gradient(self, geoms):
         """
         not defined for GRaCI surfaces
@@ -166,6 +169,7 @@ class Graci(Surface):
         return None
 
     #
+    @timer.timed
     def coupling(self, geoms):
         """
         time-derivative couplings will be added in the future
@@ -182,10 +186,10 @@ class Graci(Surface):
         gms = np.vstack([origin, geoms])
 
         # construct tensor that is all unique differences
-        r,c = np.triu_indices(gms.shape[0], 1)       
+        r,c = np.triu_indices(gms.shape[0], 1)
         dif = gms[r,:] - gms[c,:]
 
-        # compute the distances between all unique pairs of geoms 
+        # compute the distances between all unique pairs of geoms
         dist = np.sqrt(np.einsum('ij,ij->i',dif, dif))
 
         # construct the distance matrix
@@ -194,7 +198,7 @@ class Graci(Surface):
 
         # order the geometries so each step takes you to closest
         # unique geometry
-        ordr    = []       
+        ordr    = []
         ndist   = []
         current = 0
         for i in range(geoms.shape[0]):
@@ -202,19 +206,19 @@ class Graci(Surface):
             nearest = valid[dmat[current, valid].argmin()]
             mindist = dmat[current, nearest]
             ndist.append(mindist)
-            # decrement closest by 1: first geometry is the origin 
+            # decrement closest by 1: first geometry is the origin
             ordr.append(nearest-1)
             # remove this pair as a future possibility
             dmat[current, :] = dmat[:, current] = -1
             # move to next geometry
             current = nearest
-          
+
         # if something goes wrong, return just sequential ordering
         if len(set(ordr)) != geoms.shape[0]:
-            print('error sorting geometries: ' + str(len(set(ordr))) + 
+            print('error sorting geometries: ' + str(len(set(ordr))) +
                   ' != '+str(geoms.shape[0]))
             ordr = [i for i in range(geoms.shape[0])]
- 
+
         return ordr, ndist
 
 #
@@ -223,7 +227,7 @@ class Kdc(Surface):
     KDC Vibronic surface evaluator
     """
     def __init__(self):
-        super().__init__() 
+        super().__init__()
         self.ham            = Kdc_ham()
         self.nmodes         = None
         self.nstates        = None
@@ -240,9 +244,10 @@ class Kdc(Surface):
         self.nstates = self.ham.nstates
 
     #
+    @timer.timed
     def evaluate(self, gms, n_s=None, rep='adiabatic'):
         """
-        Evaluate the energies  energies 
+        Evaluate the energies  energies
         """
         if n_s is not None and n_s <= self.ham.nstates:
             nst = n_s
@@ -279,7 +284,7 @@ class Kdc_ham():
         """
 
         # might as well initialize to the constant values
-        h = self.cfs[0].copy() 
+        h = self.cfs[0].copy()
 
         for n in range(1, len(self.cfs)):
             if len(self.terms[n]) > 0:
@@ -290,7 +295,7 @@ class Kdc_ham():
                         tensor = np.outer(tensor, np.power(gm, exps[i]))
 
                     h += np.einsum('ij...,...->ij',
-                                       self.cfs[n][:,:,ordr,...], 
+                                       self.cfs[n][:,:,ordr,...],
                                        tensor, optimize=True)
 
         return h
@@ -313,7 +318,7 @@ class Kdc_ham():
     #
     def parse_op_file(self, op_file):
         """
-        static method for parsing quantics input file, return a 
+        static method for parsing quantics input file, return a
         kdc_ham object
         """
 
@@ -341,11 +346,11 @@ class Kdc_ham():
         # initialize the coefficient arrays
         self.cfs = []
         for n in range(n_max+1):
-            dim     = (nst, nst) 
+            dim     = (nst, nst)
             if len(self.terms[n]) > 0:
                 dim += (len(self.terms[n]),)
                 dim += (nq,)*n
-            self.cfs.append(np.zeros(dim, dtype=float))            
+            self.cfs.append(np.zeros(dim, dtype=float))
 
         # now we parse the file again and fill in all the
         # non-zero terms
@@ -369,12 +374,12 @@ class Kdc_ham():
                     read_ham   = False
                     ham_done   = True
                 elif 'hamiltonian-section' in line and not ham_done:
-                    read_ham   = True 
+                    read_ham   = True
 
-                # store all the parameters in a dictionary 
+                # store all the parameters in a dictionary
                 if read_param and not param_done:
                     key, value, units = self.parse_param_line(line)
-                    
+
                     # if we couldn't parse this line, move on
                     if key is not None:
                         #..else set the parameter
@@ -391,13 +396,13 @@ class Kdc_ham():
                             for ind in indices:
                                 self.cfs[n][ind] += num * kdc_params[key] / fac
                         else:
-                            print('ERROR: term not found -- STATES=' + 
+                            print('ERROR: term not found -- STATES=' +
                                   str(stlst) + ' Q=' + str(qlst))
 
                 line = f.readline()
-                  
+
         #print('cfs='+str(self.cfs),flush=True)
- 
+
         return
 
     #
@@ -436,7 +441,7 @@ class Kdc_ham():
 
                 # we're using unrestricted summations`
                 for perm in crd_perm:
-                    inds.append(ind+perm) 
+                    inds.append(ind+perm)
 
             else:
                 inds.append(ind)
@@ -490,19 +495,19 @@ class Kdc_ham():
                             el = crd_lst.index('el')
 
                     else:
-                        num, key, qlst, slst = self.parse_term_line(line,el)    
+                        num, key, qlst, slst = self.parse_term_line(line,el)
                         if num != None:
                             ordr = len(qlst)
                             nm   = len(set(qlst))
                             if nm > nmode_max:
                                 nmode_max = nm
                             if ordr > ordr_max[nm]:
-                                ordr_max[nm] = ordr         
+                                ordr_max[nm] = ordr
 
                 line = f.readline()
 
         nq = len(crd_lst) - crd_lst.count('el')
-        return nstates, nq, nmode_max, ordr_max[:nmode_max+1], el 
+        return nstates, nq, nmode_max, ordr_max[:nmode_max+1], el
 
     #
     def parse_param_line(self, line):
@@ -524,7 +529,7 @@ class Kdc_ham():
 
         else:
             return None, None, None
-        
+
     #
     def parse_term_line(self, line, el):
         """
@@ -544,8 +549,8 @@ class Kdc_ham():
 
             # in this case, electronic states
             # are explicitly given
-            crds   = []                
-            states = [] 
+            crds   = []
+            states = []
 
             parsed = line
             ncrds = line.count('|')
@@ -555,10 +560,10 @@ class Kdc_ham():
                 crdi   = int(cdef[0])-1
 
                 # if current coordinate is electronic coord,
-                # append to the states list  
+                # append to the states list
                 if crdi == el:
                     sts = cdef[1].replace('S','').strip().split('&')
-                    # states run from 0..ns-1         
+                    # states run from 0..ns-1
                     states = [int(st)-1 for st in sts]
 
                 # else this is a vibrational coord -- determine
@@ -570,13 +575,13 @@ class Kdc_ham():
                         cnt = 1
                     # coord indices run from 0..nq-1
                     crds += [crdi]*cnt
-                
-            return num, key, crds, states 
+
+            return num, key, crds, states
 
         #
         else:
             return None, None, None, None
-   
+
     #
     def gen_partition(self, k, n):
         """
@@ -646,7 +651,7 @@ class ChemPotPy(Surface):
         self.atms     = ref_geom.atms
 
         if e_units.lower() == 'ev':
-            self.econv = constants.ev2au 
+            self.econv = constants.ev2au
         elif e_units.lower() == 'au':
             self.econv = 1.
         else:
@@ -654,7 +659,7 @@ class ChemPotPy(Surface):
             os.abort()
 
         if g_units.lower() == 'angstrom':
-            self.gconv = constants.ang2bohr 
+            self.gconv = constants.ang2bohr
         elif g_units.lower() == 'bohr':
             self.gconv = 1.
         else:
@@ -667,11 +672,13 @@ class ChemPotPy(Surface):
         self.have_coupling  = True
 
     #
-    def evaluate(self, gms, states = None):
+    @timer.timed
+    def evaluate(self, gms, states=None):
         """
         evaluate the potential at the passed geometries. Geometries
         are assumed to be a 2D numpy array
         """
+
         if states == None:
             states = [i for i in range(self.nstates)]
         elif max(states) > self.nstates:
@@ -680,20 +687,39 @@ class ChemPotPy(Surface):
             os.abort()
 
         nst = len(states)
-        ngm = gms.shape[0]
-        energies = np.zeros((ngm, nst), dtype=float)
+
+        # accept both a 1D array (single) geometry and a 2D array
+        # (list of geometries)
+        if len(gms.shape) == 2:
+            ngm      = gms.shape[0]
+            eval_gms = gms
+        elif len(gms.shape) == 1:
+            ngm      = 1
+            eval_gms = np.array([gms], dtype=float)
+        else:
+            print('Cannot interprete gms array - surface.evaluate')
+            os.abort()
+
+        # set up energy array and run
+        ener = np.zeros((nst, ngm), dtype=float)
 
         for i in range(ngm):
-            gm             = self._chempotpygeom(gms[i,:] / self.gconv) 
-            cppsurf        = chempotpy.p(self.molecule, self.surface, gm)
-            energies[i, :] = cppsurf[[states]]
+            gm        = self._chempotpygeom(eval_gms[i,:] / self.gconv)
+            cppsurf   = chempotpy.p(self.molecule, self.surface, gm)
+            ener[:,i] = cppsurf[[states]]
 
-        energies *= self.econv
+        ener *= self.econv
 
-        return energies
+        # if a single geometry is passed, return 1D of state
+        # energies, else a 2D of state energies per geometry
+        if len(gms.shape) == 1:
+            return ener[:,0]
+        else:
+            return ener
 
     #
-    def gradient(self, gms, states = None):
+    @timer.timed
+    def gradient(self, gms, states=None, numerical=False):
         """
         evaluate the gradients at the passed geometries. Geometries
         are assumed to be a 2D numpy array
@@ -708,64 +734,171 @@ class ChemPotPy(Surface):
 
         nst = len(states)
         nat = len(self.atms)
-        ngm = gms.shape[0]
-        grads    = np.zeros((ngm, nst, 3*nat), dtype=float)
 
-        for i in range(ngm):
-            gm           = self._chempotpygeom(gms[i,:] / self.gconv)
-            cppsurf      = chempotpy.pg(self.molecule, self.surface, gm)
-            grads[i,:,:] = np.reshape(cppsurf[1][[states]], (nst, 3*nat))
+        # accept both a 1D array (single) geometry and a 2D array
+        # (list of geometries)
+        if len(gms.shape) == 2:
+            ngm      = gms.shape[0]
+            eval_gms = gms
+        elif len(gms.shape) == 1:
+            ngm      = 1
+            eval_gms = np.array([gms], dtype=float)
+        else:
+            print('Cannot interprete gms array - surface.evaluate')
+            os.abort()
+
+        grads    = np.zeros((nst, ngm, 3*nat), dtype=float)
+
+        # retain the possibility of using numerical gradients 
+        if numerical:
+            delta = 1e-4
+            if states is None:
+                eval_st = list(range(self.nstates))
+            else:
+                eval_st = states
+            for i in range(ngm):
+                # gms[i,:] shape: (nc,)
+                for k in range(3*nat):
+                    # Prepare displaced geometries for plus and minus displacement
+                    disp_plus = np.array(eval_gms[i,:], copy=True)
+                    disp_minus = np.array(eval_gms[i,:], copy=True)
+
+                    disp_plus[k] += delta
+                    disp_minus[k] -= delta
+
+                    # Get energies at displaced points for all eval_st states
+                    # Assuming self.gradient returns shape: (nstates, nc)
+                    p_energy = self.evaluate(disp_plus.reshape(1, -1), 
+                                          states=eval_st)  # shape (nstates)
+                    m_energy = self.evaluate(disp_minus.reshape(1, -1), 
+                                          states=eval_st)  # shape (nstates)
+
+                    # Central difference to approximate second derivative w.r.t coordinate k
+                    # For each state, calculate second derivative matrix element for k-th column
+                    # hessall[:, i, :, k] = (p_grad - m_grad) / (2 * delta)
+                    grads[:, i, k] = (p_energy - m_energy) / (2 * delta)
+
+        else:
+            for i in range(ngm):
+                gm         = self._chempotpygeom(eval_gms[i,:] / self.gconv)
+                cppsurf      = chempotpy.pg(self.molecule, self.surface, gm)
+                grads[:,i,:] = np.reshape(cppsurf[1][[states]], (nst, 3*nat))
 
         grads    *= (self.econv / self.gconv)
 
-        return grads
+        # if a single geometry is passed, return 2D array
+        # of gradients per state
+        # else a 3D of gradients per state per geometry
+        if len(gms.shape) == 1:
+            return grads[:,0,:]
+        else:
+            return grads
 
     #
-    def hessian(self, gms, states = None):
+    @timer.timed
+    def hessian(self, gms, states=None, num_grad=False):
         """
-        evaluate the hessian on states 'states'. If states=None, return
-        hessian for all defined states
+        compute the hessian by gradient differences
         """
-        if states == None:
-            states = [i for i in range(self.nstates)]
-        elif max(states) > self.nstates:
-            print('surface only defined for ' +str(self.nstates) +
-                   ': Exiting...')
+
+        delta = 1.e-4
+
+        if states is None:
+            eval_st = list(range(self.nstates))
+        else:
+            eval_st = states
+
+        # accept both a 1D array (single) geometry and a 2D array
+        # (list of geometries)
+        if len(gms.shape) == 2:
+            ngm      = gms.shape[0]
+            eval_gms = gms
+        elif len(gms.shape) == 1:
+            ngm      = 1
+            eval_gms = np.array([gms], dtype=float)
+        else:
+            print('Cannot interprete gms array - surface.evaluate')
             os.abort()
 
-        nst = len(states)
-        nat = len(self.atms)
-        ngm = gms.shape[0]
-        hessian  = np.zeros((ngm, nst, 3*nat, 3*nat), dtype=float)
-        for i in range(ngm):
-            for j in range(natm):
-                gm  = self._chempotpygeom(gms[i,:] / self.gconv)
-                cppsurf = chempotpy.pg(self.molecule, self.surface, gm)
-                hessian[i,:,:,:] = np.reshape(cppsurf[1][[states]], (nst, 3*nat))
+        ng = eval_gms.shape[0]  # number of geometries
+        nc = eval_gms.shape[1]  # number of coordinates
+        nstates = len(eval_st)
 
-        return hessian
+        hessall = np.zeros((nstates, ng, nc, nc), dtype=float)
+
+        for i in range(ng):
+            # gms[i,:] shape: (nc,)
+            for k in range(nc):
+                # Prepare displaced geometries for plus and minus displacement
+                disp_plus = np.array(eval_gms[i,:], copy=True)
+                disp_minus = np.array(eval_gms[i,:], copy=True)
+
+                disp_plus[k] += delta
+                disp_minus[k] -= delta
+
+                # Get gradients at displaced points for all eval_st states
+                # Assuming self.gradient returns shape: (nstates, nc)
+                p_grad = self.gradient(disp_plus.reshape(1, -1), 
+                            states=eval_st, numerical=num_grad)  # shape (nstates, nc)
+                m_grad = self.gradient(disp_minus.reshape(1, -1), 
+                            states=eval_st, numerical=num_grad)  # shape (nstates, nc)
+
+                # Central difference to approximate second derivative w.r.t coordinate k
+                # For each state, calculate second derivative matrix element for k-th column
+                # hessall[:, i, :, k] = (p_grad - m_grad) / (2 * delta)
+                hessall[0, i, :, k] = (p_grad - m_grad) / (2 * delta)
+
+            # Symmetrize Hessian for each state and geometry
+            for s in range(nstates):
+                hessall[s, i] = 0.5 * (hessall[s, i] + hessall[s, i].T)
+
+        # if a single geometry is passed, return 3D array
+        # of hessians per state
+        # else a 4D of hessians per state per geometry
+        if len(gms.shape) == 1:
+            return hessall[:, 0, :, :]
+        else:
+            return hessall
 
     #
+    @timer.timed
     def coupling(self, gms, pairs = None):
         """
         evaluate the NACs at the passed geometries. Geometries
         are assumed to be a 2D numpy array
         """
 
+        # accept both a 1D array (single) geometry and a 2D array
+        # (list of geometries)
+        if len(gms.shape) == 2:
+            ngm      = gms.shape[0]
+            eval_gms = gms
+        elif len(gms.shape) == 1:
+            ngm      = 1
+            eval_gms = np.array([gms], dtype=float)
+        else:
+            print('Cannot interprete gms array - surface.coupling')
+            os.abort()
+
         npair = len(pairs)
         nat   = len(self.atms)
-        ngm   = gms.shape[0]
-        nacs  = np.zeros((ngm, npair, 3*nat), dtype=float)
+        nacs  = np.zeros((npair, ngm, 3*nat), dtype=float)
 
         for i in range(ngm):
-            gm        = self._chempotpygeom(gms[i,:] / self.gconv)
-            cppsurf   = chempotpy.pgd(self.molecule, self.surface, gm) 
+            gm        = self._chempotpygeom(eval_gms[i,:] / self.gconv)
+            cppsurf   = chempotpy.pgd(self.molecule, self.surface, gm)
             for j in range(npair):
-                nacs[i,j,:] = cppsurf[2][pairs[j][0], pairs[j][1],:]
+                nacs[j,i,:] = cppsurf[2][pairs[j][0], pairs[j][1],:].ravel()
 
-        nacs    *= (self.econv / self.gconv)
+        nacs  /= self.gconv
 
-        return nacs
+        # if a single geometry is passed, return 2D array
+        # of couplings x nrc
+        # else a 3D of couplings per pair per geometry
+        if len(gms.shape) == 1:
+            return nacs[:, 0, :]
+        else:
+            return nacs
 
     #
     def _chempotpygeom(self, gm):
@@ -777,4 +910,3 @@ class ChemPotPy(Surface):
             xyz = gm[3*i:3*i+3].tolist()
             cgm.append([self.atms[i]] + xyz)
         return cgm
-
