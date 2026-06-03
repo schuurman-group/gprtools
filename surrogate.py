@@ -562,6 +562,134 @@ class Adiabat(Surrogate):
                               for st in range(self.nstates)]
 
     #
+    # -- BCM/GRBCM aggregation hooks ---------------------------------
+    # For an Adiabat each internal GP *is* an adiabatic state, so the
+    # aggregator weights energies directly and reconstruction is the
+    # identity (select the requested states). These hooks let BCM use a
+    # single per-model aggregation path shared with CP.
+    def n_models(self):
+        """Number of internal GPs the aggregator weights (= nstates)."""
+        return self.nstates
+
+    #
+    def raw_predict(self, gms, need_cov=False):
+        """
+        Per-state GP predictions on gms.
+            returns raw_mean (nstates, ngm), raw_cov (nstates, ngm, ngm)
+        raw_cov is zero when need_cov is False.
+        """
+        Xq, (ngm, _), _ = utils.verify_geoms(gms)
+        d_data = self.descriptor.generate(Xq)
+        raw_mean = np.zeros((self.nstates, ngm), dtype=float)
+        raw_cov  = np.zeros((self.nstates, ngm, ngm), dtype=float)
+        for m in range(self.nstates):
+            out = self.models[m].predict(
+                    d_data, return_std=False, return_cov=need_cov)
+            if need_cov:
+                raw_mean[m] = out[0]
+                raw_cov[m]  = out[1]
+            else:
+                raw_mean[m] = out
+        return raw_mean, raw_cov
+
+    #
+    def reconstruct_energy(self, raw_mean, raw_cov, states, std, cov):
+        """
+        Identity reconstruction: the adiabats are the per-state GP means.
+            returns evals (ns, ngm), estd (ns, ngm), ecov (ns, ngm, ngm)
+        """
+        ns  = len(states)
+        idx = list(states)
+        evals = raw_mean[idx]
+        ecov  = np.zeros((ns, raw_mean.shape[1], raw_mean.shape[1]),
+                         dtype=float)
+        estd  = np.zeros((ns, raw_mean.shape[1]), dtype=float)
+        if std or cov:
+            ecov = raw_cov[idx].copy()
+        if std:
+            estd = utils.extract_std(ecov)
+        if not cov:
+            ecov = np.zeros_like(ecov)
+        return evals, estd, ecov
+
+    #
+    def raw_predict_and_grad(self, gms, descrip=None, grad_descrip=None,
+                             std=False, cov=False):
+        """
+        Per-model joint mean/std/gradient(/gcov) on gms, no reconstruction.
+            returns mean (nmodel, ngm), std (nmodel, ngm),
+                    grad (nmodel, ngm, nc), gcov (nmodel, ngm, nc, nc)
+        """
+        Xq, (ngm, nc), _ = utils.verify_geoms(gms)
+        d_gm   = self.descriptor.generate(Xq) if descrip is None else descrip
+        d_grad = (self.descriptor.descriptor_gradient(Xq)
+                  if grad_descrip is None else grad_descrip)
+        nmod   = self.nstates
+        rmean = np.zeros((nmod, ngm),         dtype=float)
+        rstd  = np.zeros((nmod, ngm),         dtype=float)
+        rgrad = np.zeros((nmod, ngm, nc),     dtype=float)
+        rgcov = np.zeros((nmod, ngm, nc, nc), dtype=float)
+        for m in range(nmod):
+            mean, mstd, grad_d, gcov_d = self.models[m].predict_and_grad(
+                d_gm, std=std, cov=cov, prior_only=self.prior_covar)
+            rmean[m] = mean
+            rstd[m]  = mstd
+            rgrad[m] = np.einsum('aij,aj->ai', d_grad, grad_d)
+            if cov:
+                rgcov[m] = d_grad @ gcov_d @ d_grad.swapaxes(-2, -1)
+        return rmean, rstd, rgrad, rgcov
+
+    #
+    def reconstruct_gradient(self, coeff_mean, coeff_grad, coeff_gcov,
+                             states, std, cov):
+        """
+        Identity reconstruction (single query point): adiabatic gradients
+        are the per-state gradients.
+            coeff_grad (nmodel, nc), coeff_gcov (nmodel, nc, nc)
+            returns grad (ns, nc), gstd (ns, nc), gcov (ns, nc, nc)
+        """
+        idx = list(states)
+        ns  = len(idx)
+        nc  = coeff_grad.shape[-1]
+        grad = coeff_grad[idx]
+        gcov = np.zeros((ns, nc, nc), dtype=float)
+        gstd = np.zeros((ns, nc),     dtype=float)
+        if std or cov:
+            gcov = coeff_gcov[idx].copy()
+        if std:
+            gstd = utils.extract_std(gcov)
+        if not cov:
+            gcov = np.zeros((ns, nc, nc), dtype=float)
+        return grad, gstd, gcov
+
+    #
+    # -- BCM/GRBCM storage + target accessors ------------------------
+    # Let aggregators collect/rebuild training data without knowing the
+    # surrogate's internal layout. For an Adiabat the targets ARE the
+    # adiabatic energies (to_targets is the identity), and descriptors
+    # are stored per state (all identical -- states share geometries).
+    def to_targets(self, energies):
+        """Map adiabatic energies (nmodel, npts) to internal targets;
+        identity for an Adiabat."""
+        return np.asarray(energies, dtype=float)
+
+    def model_descriptors(self):
+        """Shared (npts, nfeat) descriptor matrix of the training set."""
+        return self.descriptors[0]
+
+    def model_targets(self):
+        """Per-model training targets, shape (nmodel, npts)."""
+        return np.array([self.training[m] for m in range(self.nstates)])
+
+    def set_model_data(self, descriptors, targets):
+        """Replace the (unfitted) training storage; targets (nmodel, npts).
+        The caller is responsible for refitting the models."""
+        descriptors = np.asarray(descriptors, dtype=float)
+        targets     = np.asarray(targets, dtype=float)
+        self.descriptors = [descriptors for _ in range(self.nstates)]
+        self.training    = [targets[m].copy() for m in range(self.nstates)]
+
+    #
     def _num_gradient(self, gms, states = None):
         """
         evaluate the gradient of the surrogate at gms
@@ -1370,12 +1498,45 @@ class CP(Surrogate):
             sts = list(range(self.nstates))
         else:
             sts = states
-        ns = len(sts)
 
-        Xq, (ngm, _), singleX = utils.verify_geoms(gms)
-        d_data   = self.descriptor.generate(Xq)
+        Xq, _, singleX = utils.verify_geoms(gms)
         need_cov = std or cov
 
+        raw_mean, raw_cov = self.raw_predict(Xq, need_cov=need_cov)
+        evals, estd, ecov = self.reconstruct_energy(
+                                raw_mean, raw_cov, sts, std, cov)
+
+        if singleX:
+            args = utils.collect_output(
+                (evals[:, 0], estd[:, 0], ecov[:, 0, 0]),
+                (True, std, cov))
+        else:
+            args = utils.collect_output(
+                (evals, estd, ecov), (True, std, cov))
+        return args
+
+    #
+    # -- BCM/GRBCM aggregation hooks ---------------------------------
+    # CP's experts share the smooth coefficient GPs {omega, c_k}; those
+    # are proper (Gaussian) GPs and are what an aggregator should
+    # precision-weight. raw_predict exposes the per-coefficient
+    # predictions; reconstruct_energy maps aggregated coefficient
+    # mean/cov to adiabatic energies. Aggregating coefficients (bounded
+    # variance) and reconstructing once keeps the 1/sqrt(-c0) blow-up of
+    # the root map out of the precision weighting.
+    def n_models(self):
+        """Number of internal GPs the aggregator weights (= nstates)."""
+        return self.nstates
+
+    #
+    def raw_predict(self, gms, need_cov=False):
+        """
+        Per-coefficient GP predictions on gms (no reconstruction).
+            returns raw_mean (nstates, ngm), raw_cov (nstates, ngm, ngm)
+        raw_cov is zero when need_cov is False.
+        """
+        Xq, (ngm, _), _ = utils.verify_geoms(gms)
+        d_data = self.descriptor.generate(Xq)
         raw_mean = np.zeros((self.nstates, ngm), dtype=float)
         raw_cov  = np.zeros((self.nstates, ngm, ngm), dtype=float)
         for m in range(self.nstates):
@@ -1386,6 +1547,21 @@ class CP(Surrogate):
                 raw_cov[m]  = out[1]
             else:
                 raw_mean[m] = out
+        return raw_mean, raw_cov
+
+    #
+    def reconstruct_energy(self, raw_mean, raw_cov, states, std, cov):
+        """
+        Reconstruct adiabatic energies (and delta-method variance) from
+        per-coefficient mean/cov -- whether those came from a single
+        surrogate or from an aggregator's coefficient-space weighting.
+
+            raw_mean (nstates, ngm), raw_cov (nstates, ngm, ngm)
+            returns evals (ns, ngm), estd (ns, ngm), ecov (ns, ngm, ngm)
+        """
+        ngm      = raw_mean.shape[1]
+        ns       = len(states)
+        need_cov = std or cov
 
         _, z, E = self._reconstruct(raw_mean)        # E (ngm, nstates)
         if need_cov:
@@ -1394,27 +1570,98 @@ class CP(Surrogate):
         evals = np.zeros((ns, ngm),      dtype=float)
         estd  = np.zeros((ns, ngm),      dtype=float)
         ecov  = np.zeros((ns, ngm, ngm), dtype=float)
-        for k, st in enumerate(sts):
+        for k, st in enumerate(states):
             evals[k] = E[:, st]
             if need_cov:
                 J = jac[:, st, :]                    # (ngm, ntargets)
                 # cov_E[a,b] = sum_t J[a,t] raw_cov[t,a,b] J[b,t]
                 cov_st  = np.einsum('at,tab,bt->ab', J, raw_cov, J)
                 ecov[k] = cov_st
-                estd[k] = utils.extract_std(cov_st)
-        if not std:
-            estd = np.zeros((ns, ngm), dtype=float)
+                if std:
+                    estd[k] = utils.extract_std(cov_st)
         if not cov:
             ecov = np.zeros((ns, ngm, ngm), dtype=float)
+        return evals, estd, ecov
 
-        if singleX:
-            args = utils.collect_output(
-                (evals[:, 0], estd[:, 0], ecov[:, 0, 0]),
-                (True, std, cov))
-        else:
-            args = utils.collect_output(
-                (evals, estd, ecov), (True, std, cov))
-        return args
+    #
+    def raw_predict_and_grad(self, gms, descrip=None, grad_descrip=None,
+                             std=False, cov=False):
+        """
+        Per-coefficient joint mean/std/gradient(/gcov), no reconstruction.
+            returns mean (nstates, ngm), std (nstates, ngm),
+                    grad (nstates, ngm, nc), gcov (nstates, ngm, nc, nc)
+        """
+        Xq, (ngm, nc), _ = utils.verify_geoms(gms)
+        d_gm   = self.descriptor.generate(Xq) if descrip is None else descrip
+        d_grad = (self.descriptor.descriptor_gradient(Xq)
+                  if grad_descrip is None else grad_descrip)
+        nmod   = self.nstates
+        rmean = np.zeros((nmod, ngm),         dtype=float)
+        rstd  = np.zeros((nmod, ngm),         dtype=float)
+        rgrad = np.zeros((nmod, ngm, nc),     dtype=float)
+        rgcov = np.zeros((nmod, ngm, nc, nc), dtype=float)
+        for m in range(nmod):
+            mean, mstd, grad_d, gcov_d = self.models[m].predict_and_grad(
+                d_gm, std=std, cov=cov, prior_only=self.prior_covar)
+            rmean[m] = mean
+            rstd[m]  = mstd
+            rgrad[m] = np.einsum('aij,aj->ai', d_grad, grad_d)
+            if cov:
+                rgcov[m] = d_grad @ gcov_d @ d_grad.swapaxes(-2, -1)
+        return rmean, rstd, rgrad, rgcov
+
+    #
+    def reconstruct_gradient(self, coeff_mean, coeff_grad, coeff_gcov,
+                             states, std, cov):
+        """
+        Reconstruct adiabatic gradients from aggregated per-coefficient
+        mean/gradient/gcov via the root-map chain rule (single query
+        point):
+            dE_st/dx  = sum_m J[st, m] coeff_grad[m]
+            gcov_E_st = sum_m J[st, m]^2 coeff_gcov[m]   (delta-method)
+        with J the state jacobian at the roots of coeff_mean.
+        """
+        _, z, _ = self._reconstruct(np.asarray(coeff_mean)[:, None])
+        J  = self._state_jacobian(z)[0]            # (nstates, ntargets)
+        ns = len(states)
+        nc = coeff_grad.shape[-1]
+        grad = np.zeros((ns, nc),     dtype=float)
+        gstd = np.zeros((ns, nc),     dtype=float)
+        gcov = np.zeros((ns, nc, nc), dtype=float)
+        for k, st in enumerate(states):
+            grad[k] = J[st] @ coeff_grad           # sum_m J[st,m] coeff_grad[m]
+            if std or cov:
+                gcov[k] = np.einsum('m,mcd->cd', J[st]**2, coeff_gcov)
+                if std:
+                    gstd[k] = utils.extract_std(gcov[k])
+        if not cov:
+            gcov = np.zeros((ns, nc, nc), dtype=float)
+        return grad, gstd, gcov
+
+    #
+    # -- BCM/GRBCM storage + target accessors ------------------------
+    # CP stores the smooth {omega, c_k} coefficients (not energies) as
+    # its model targets, in a single shared descriptor matrix. to_targets
+    # is the energies->coefficients map (the inverse of reconstruction),
+    # so an aggregator working in descriptor/target space stays in
+    # coefficient space throughout.
+    def to_targets(self, energies):
+        """Map adiabatic energies (nstates, npts) to omega-CP targets."""
+        return self._to_targets(energies)
+
+    def model_descriptors(self):
+        """Shared (npts, nfeat) descriptor matrix."""
+        return self.descriptors
+
+    def model_targets(self):
+        """Per-coefficient training targets, shape (nstates, npts)."""
+        return self.targets
+
+    def set_model_data(self, descriptors, targets):
+        """Replace the (unfitted) training storage; targets (nstates, npts)
+        are coefficient targets. The caller refits the models."""
+        self.descriptors = np.asarray(descriptors, dtype=float)
+        self.targets     = np.asarray(targets, dtype=float)
 
     #
     @timer.timed

@@ -66,7 +66,7 @@ class BCM():
         else:
             hyper = self.surrogates[-1].update(data, states=states,
                                        hparam=hp[-1], nrestart=nrestart)
-            if self.surrogates[-1].train_size() > self.Kmax:
+            if max(self.surrogates[-1].train_size()) > self.Kmax:
                 hyper = self._resort(enforce_size=enforce_size)
 
         return hyper
@@ -107,52 +107,52 @@ class BCM():
         else:
             sts = states
 
-        ns = len(sts)
         M  = len(self.surrogates)
 
         # ensure geometries have the appropriate layout
-        Xq, (ngm, nc), singleX = utils.verify_geoms(gms)
+        Xq, (ngm, _), singleX = utils.verify_geoms(gms)
 
-        e_bcm = np.zeros((ns, ngm), dtype=float)
-        std_bcm  = np.zeros((ns, ngm), dtype=float)
-        cov_bcm  = np.zeros((ns, ngm, ngm), dtype=float)
+        # BCM aggregates in the experts' internal-GP ("model") space:
+        # adiabatic energies for an Adiabat, the smooth {omega, c_k}
+        # coefficients for a CP surrogate. Reconstruction to adiabatic
+        # energies happens once, AFTER aggregation, via the surrogate's
+        # reconstruct_energy hook. For CP this keeps the 1/sqrt(-c0)
+        # blow-up of the root map out of the precision weighting (the
+        # coefficient GPs have bounded variance even on a CI seam).
+        nmod     = self.surrogates[0].n_models()
+        prec_sum = np.zeros((nmod, ngm, ngm), dtype=float)  # sum cov_m^-1
+        mean_sum = np.zeros((nmod, ngm),      dtype=float)   # sum cov_m^-1 mu
 
-        # return as numpy array
         for i in range(M):
-            e_data, e_cov = self.surrogates[i].evaluate(Xq,
-                                                states=sts,
-                                                std=False,
-                                                cov=True)
-            for st in range(ns):
-                # per-expert posterior cov is PSD by construction;
-                # use psd_pinv to keep epsilon-scale numerical noise
-                # from being inverted into huge spurious eigenvalues
-                e_cov_inv    = utils.psd_pinv(e_cov[st])
-                cov_bcm[st] += e_cov_inv
-                e_bcm[st]   += e_cov_inv @ e_data[st]
+            rm, rc = self.surrogates[i].raw_predict(Xq, need_cov=True)
+            for m in range(nmod):
+                # per-expert model cov is PSD by construction; psd_pinv
+                # keeps epsilon-scale noise from inverting into huge
+                # spurious eigenvalues
+                c_inv = utils.psd_pinv(rc[m])
+                prec_sum[m] += c_inv
+                mean_sum[m] += c_inv @ rm[m]
 
-        # compute covariance matrix for query points
-        d_data  = self.surrogates[0].descriptor.generate(Xq)
-        k_data  = [self.surrogates[0].models[st].kernel_(d_data)
-                                              for st in sts]
+        # per-model prior correction, using each model's own kernel/prior
+        d_data   = self.surrogates[0].descriptor.generate(Xq)
+        agg_mean = np.zeros((nmod, ngm),      dtype=float)
+        agg_cov  = np.zeros((nmod, ngm, ngm), dtype=float)
+        for m in range(nmod):
+            k_m        = self.surrogates[0].models[m].kernel_(d_data)
+            sig_qq_inv = utils.psd_pinv(
+                k_m * self.surrogates[0].models[m]._y_train_std**2)
+            agg_cov[m]  = utils.psd_pinv(prec_sum[m] - (M - 1)*sig_qq_inv)
+            agg_mean[m] = agg_cov[m] @ mean_sum[m]
 
-        sigma_qq_inv = [utils.psd_pinv(k_data[st] *
-                     self.surrogates[0].models[sts[st]]._y_train_std**2)
-                                                    for st in range(ns)]
-
-        for st in range(ns):
-            cov_bcm[st] += -(M - 1)*sigma_qq_inv[st]
-            cov_bcm[st]  = utils.psd_pinv(cov_bcm[st])
-            e_bcm[st]    = cov_bcm[st] @ e_bcm[st]
-
-        # if std. dev. requested, extract from the covariance
-        if std:
-            std_bcm = utils.extract_std(cov_bcm)
+        # reconstruct adiabatic energies (and variance) from the
+        # aggregated internal-GP mean/cov
+        e_bcm, std_bcm, cov_bcm = self.surrogates[0].reconstruct_energy(
+                                      agg_mean, agg_cov, sts, std, cov)
 
         # collect ouptut
         if singleX:
-            args = utils.collect_output((e_bcm[:, 0], 
-                                         std_bcm[:, 0], 
+            args = utils.collect_output((e_bcm[:, 0],
+                                         std_bcm[:, 0],
                                          cov_bcm[:, 0, 0]),
                                          (True, std, cov))
         else:
@@ -211,9 +211,17 @@ class BCM():
         M      = len(self.surrogates)
         # d_gm.shape = (ngm, nfeature)
         d_gm   = self.surrogates[0].descriptor.generate(Xq)
-        n_f    = d_gm.shape[1] 
         # d_grad.shape = (ngm, nc, nfeature)
         d_grad = self.surrogates[0].descriptor.descriptor_gradient(Xq)
+
+        # BCM aggregates each expert's internal GPs in "model" space
+        # (energies for Adiabat, the smooth {omega, c_k} coefficients for
+        # CP); the surrogate reconstructs the adiabatic gradient from the
+        # aggregated coefficient mean/gradient/covariance afterwards. For
+        # CP this keeps the 1/sqrt(-c0) blow-up of the root map out of the
+        # precision weighting. For Adiabat (model = state, identity
+        # reconstruct) this is numerically the previous energy-space path.
+        nmod = self.surrogates[0].n_models()
 
         # gradient, covariance and std. dev.
         grad_bcm = np.zeros((ns, ngm, nc), dtype=float)
@@ -223,128 +231,97 @@ class BCM():
         # since we're evaluating one geometry at a time, outer
         # loop should be over geometries
         for i in range(ngm):
-             
-            # these quantities are accumualted over surrogates
-            C_bcm   = np.zeros(ns, dtype=float)
-            e_bcm   = np.zeros(ns, dtype=float)       
-            delCinv = np.zeros((ns, nc), dtype=float)
-            CdCC    = np.zeros((ns, nc), dtype=float)     
 
-            # nested loops in python make me cringe. This
-            # is a first pass
+            # per-model accumulators (over experts)
+            C_bcm    = np.zeros(nmod, dtype=float)
+            e_bcm    = np.zeros(nmod, dtype=float)
+            delCinv  = np.zeros((nmod, nc), dtype=float)
+            CdCC     = np.zeros((nmod, nc), dtype=float)
+            gcov_acc = np.zeros((nmod, nc, nc), dtype=float)
+
             for j in range(M):
 
-                # jointly evaluate energy (with std) and gradient (with
-                # covariance), sharing the kernel computation between both
-                # e_data.shape = (ns,), estd.shape = (ns,)
-                # g_data.shape = (ns, nc), gcov.shape = (ns, nc, nc)
-                e_data, estd, g_data, gcov = \
-                    self.surrogates[j].evaluate_and_gradient(
+                # raw per-model mean/std/gradient/gradient-cov at this
+                # point (no per-expert reconstruction)
+                rmean, rstd, rgrad, rgcov = \
+                    self.surrogates[j].raw_predict_and_grad(
                                             Xq[i],
-                                            states=sts,
-                                            descrip=d_gm,
-                                            grad_descrip=d_grad,
-                                            std=True,
-                                            cov=True)
+                                            descrip=d_gm[i:i+1],
+                                            grad_descrip=d_grad[i:i+1],
+                                            std=True, cov=True)
+                rmean = rmean[:, 0]
+                rstd  = rstd[:, 0]
+                rgrad = rgrad[:, 0, :]
+                rgcov = rgcov[:, 0, :, :]
 
-                # iterate over states in the surrogate
-                for k in range(ns):
-                    s_k = sts[k]
+                # iterate over the internal GPs (models)
+                for m in range(nmod):
 
-                    # accumulate covariance of the gradient to
-                    # determine the covariance of the BCM. The
-                    # per-expert gcov is PSD by construction but can
-                    # have epsilon-scale negative eigenvalues from
-                    # numerical assembly; psd_pinv projects those out
-                    # before inversion (else pinv blows them up to
-                    # ~1e+18 spurious eigenvalues that contaminate the
-                    # BCM aggregation -> negative diagonals -> NaN std)
-                    cov_bcm[k,i] += utils.psd_pinv(gcov[k])
+                    # accumulate the gradient covariance precision. The
+                    # per-expert gcov is PSD by construction but can have
+                    # epsilon-scale negative eigenvalues from numerical
+                    # assembly; psd_pinv projects those out before
+                    # inversion (else pinv blows them up to ~1e+18
+                    # spurious eigenvalues -> negative diagonals -> NaN std)
+                    gcov_acc[m] += utils.psd_pinv(rgcov[m])
 
-                    # compute the derivative of the covariance of the
-                    # mean
+                    # derivative of the (normalized) posterior variance
+                    # correction for model m's GP
                     if self.frozen_wts:
-
-                        # derivative of the covariance weights are
-                        # zero under frozen_wt approximation
                         dC = 0.
-
-                    # else we perform some somewhat costly matrix
-                    # operations
                     else:
-                        # derivative of kernel matrix of test points
-                        # in limit of a single test point, this
-                        # simplifies to a zero vector. We'll include
-                        # it for now.
-                        dprior = self.surrogates[j].models[s_k].dprior(
+                        dprior = self.surrogates[j].models[m].dprior(
                                                 d_gm[i], physical=True)
-                        # convert to cartesians
                         dprior_c = d_grad[i] @ dprior
-
-                        # compute the dk(x*,X)K⁻¹k(X,x*) contribution
-                        # to the derivative of the covariance of the mean
-                        dXcovar  = self.surrogates[j].models[s_k].dk_Kinv_k(
+                        dXcovar  = self.surrogates[j].models[m].dk_Kinv_k(
                                                     d_gm[i], physical=True)
-                        # convert to cartesians
                         dXcovar_c = d_grad[i] @ dXcovar
-
-                        # dCi is the gradient of the *normalized* posterior
-                        # variance correction k(x*,X)K⁻¹k(X,x*). The BCM weights
-                        # use the *unnormalized* variance (σ²_u = std² · σ²_norm),
-                        # so the chain rule requires an extra std² factor here.
                         dC = (-dprior_c + dXcovar_c)
 
-                    # inverse of the covariance of the evaluated energy
-                    # at the (single) query point. sklearn clips
-                    # numerically-negative predictive variances to zero,
-                    # so floor estd^2 at the squared machine precision.
-                    C_inv   = 1./np.maximum(estd[k]**2, 1.e-32)
-                    C_grad  = C_inv * g_data[k]
+                    # inverse of model m's predictive variance at the
+                    # (single) query point; floor at squared machine eps
+                    C_inv  = 1./np.maximum(rstd[m]**2, 1.e-32)
+                    C_grad = C_inv * rgrad[m]
 
-                    # accumulate quantities ------------
-                    # This is a scalar quantity
-                    C_bcm[k] += C_inv
-                    # this is a scalar qauntity
-                    e_bcm[k] += C_inv * e_data[k]
+                    C_bcm[m]   += C_inv
+                    e_bcm[m]   += C_inv * rmean[m]
+                    delCinv[m] += C_inv * dC * C_inv
+                    CdCC[m]    += C_inv * dC * C_inv * rmean[m] + C_grad
 
-                    # this is a vector, [nc]
-                    delCinv[k] += C_inv * dC * C_inv
-                    # this is a vector [nc]
-                    CdCC[k] += C_inv * dC * C_inv * e_data[k] + C_grad
-
-            # need the prior to evaluate the conditioned covariance,
-            # use the prior from surrogate[0]
-            prior = [self.surrogates[0].models[st].prior(
-                            d_gm[i], physical=True)[0,0] for st in sts]
-
-            # everything scaled to surrogate[0] data, compute hessian
-            # for this surrogate for each state/model
+            # per-model prior / prior-hessian from surrogate[0]
+            prior = [self.surrogates[0].models[m].prior(
+                            d_gm[i], physical=True)[0,0]
+                     for m in range(nmod)]
             prior_hess = np.array([
-                     self.surrogates[0].models[sk].prior_hessian(
-                    d_gm[i], physical=True) for sk in sts], dtype=float)
+                     self.surrogates[0].models[m].prior_hessian(
+                    d_gm[i], physical=True) for m in range(nmod)],
+                    dtype=float)
+            sigma_qq_inv = [d_grad[i] @ prior_hess[m] @ d_grad[i].T
+                                                for m in range(nmod)]
 
-            # convert to cartesians
-            sigma_qq_inv = [d_grad[i] @ prior_hess[sk] @ d_grad[i].T 
-                                                for sk in range(ns)]
-
-            # combine aggregated quantities
-            for k in range(ns):
-
-                # covariance of the BCM gradient
-                cov_bcm[k,i] += -(M-1)*sigma_qq_inv[k]
-                cov_bcm[k,i]  = utils.psd_pinv(cov_bcm[k,i])
-
-                # construct aggregate C matrix
-                C     = -(M-1)*(1./prior[k]) + C_bcm[k]
+            # aggregate per-model mean, gradient and gradient covariance
+            coeff_mean = np.zeros(nmod, dtype=float)
+            coeff_grad = np.zeros((nmod, nc), dtype=float)
+            coeff_gcov = np.zeros((nmod, nc, nc), dtype=float)
+            for m in range(nmod):
+                coeff_gcov[m] = utils.psd_pinv(
+                                    gcov_acc[m] - (M-1)*sigma_qq_inv[m])
+                C     = -(M-1)*(1./prior[m]) + C_bcm[m]
                 Cinv  = 1./C
-                # dprior_c is always zero, can exclude
-                #dCinv = (1./C) * ((M-1.)*dprior_c + delCinv[k]) * (1./C)
-                dCinv  = Cinv * (0. - delCinv[k]) * Cinv
-                grad_bcm[k,i] = dCinv * e_bcm[k] + Cinv * CdCC[k]
- 
-        # extract std
-        if std:
-            std_bcm = utils.extract_std(cov_bcm)
+                dCinv = Cinv * (0. - delCinv[m]) * Cinv
+                coeff_grad[m] = dCinv * e_bcm[m] + Cinv * CdCC[m]
+                coeff_mean[m] = Cinv * e_bcm[m]
+
+            # reconstruct the adiabatic gradient (and covariance) from the
+            # aggregated coefficient mean/gradient/gcov
+            g_rec, gstd_rec, gcov_rec = \
+                self.surrogates[0].reconstruct_gradient(
+                    coeff_mean, coeff_grad, coeff_gcov, sts, std, cov)
+            grad_bcm[:, i, :] = g_rec
+            if std:
+                std_bcm[:, i, :] = gstd_rec
+            if cov:
+                cov_bcm[:, i, :, :] = gcov_rec
 
         # construct return array
         if singleX:
@@ -356,7 +333,7 @@ class BCM():
             args = utils.collect_output((grad_bcm, std_bcm, cov_bcm),
                                          (True, std, cov))
 
-        return args 
+        return args
 
     #
     #
@@ -522,20 +499,21 @@ class BCM():
         if M == 0:
             return None
         
-        sts = list(range(self.nstates))
+        nmod  = self.surrogates[0].n_models()
         n_new = M + 1
 
-        # collect descriptors (state-independent) and per-state energies
-        # from all current surrogates
-        all_desc = np.vstack([self.surrogates[j].descriptors[0]
+        # collect the shared descriptors and per-model targets (energies
+        # for Adiabat, {omega, c_k} coefficients for CP) from all experts.
+        # Aggregation/re-fitting happens in the experts' native target
+        # space via the storage hooks, so this is representation-agnostic.
+        all_desc = np.vstack([self.surrogates[j].model_descriptors()
                                for j in range(M)])             # (N, nf)
-        all_ener = [np.concatenate([self.surrogates[j].training[st]
-                                    for j in range(M)])
-                    for st in sts]                             # nstates × (N,)
+        all_tgt  = np.hstack([self.surrogates[j].model_targets()
+                               for j in range(M)])             # (nmod, N)
 
         N      = all_desc.shape[0]
-        hp     = np.array([[self.surrogates[i].models[j].kernel_.theta
-                             for j in range(len(sts))]
+        hp     = np.array([[self.surrogates[i].models[m].kernel_.theta
+                             for m in range(nmod)]
                              for i in range(M)], dtype=float)
         nhyper = hp.shape[2]
 
@@ -567,7 +545,7 @@ class BCM():
         # hyperparameters) before clearing the surrogate list
         template = self.surrogates[0]
         self.surrogates = []
-        hparams = np.zeros((n_new, len(sts), nhyper), dtype=float)
+        hparams = np.zeros((n_new, nmod, nhyper), dtype=float)
 
         for k in range(n_new):
             idx = np.where(labels == k)[0]
@@ -578,13 +556,13 @@ class BCM():
             # surrogates. No guarantee hp[i] now algins with data in
             # surrogate[i], but it's much better than nothing
             hp_init = hp[min(k,M-1)]
-            for st in sts:
-                new.descriptors[st] = all_desc[idx]
-                new.training[st]    = all_ener[st][idx]
-                # use the previous
-                new.models[st].kernel_.theta = hp_init[st]
-                new.models[st].fit(all_desc[idx], all_ener[st][idx])
-                hparams[k, st] = new.models[st].kernel_.theta
+            # store the re-clustered data in the surrogate's native layout
+            new.set_model_data(all_desc[idx], all_tgt[:, idx])
+            for m in range(nmod):
+                # use the previous hyperparameters as a warm start
+                new.models[m].kernel_.theta = hp_init[m]
+                new.models[m].fit(all_desc[idx], all_tgt[m, idx])
+                hparams[k, m] = new.models[m].kernel_.theta
             self.surrogates.append(new)
 
         # return the optimized hyper params

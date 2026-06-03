@@ -116,23 +116,24 @@ class GRBCM():
         return new
 
     #
-    def _fit_expert_descr(self, descr, eners, template):
+    def _fit_expert_descr(self, descr, targets, template):
         """
         build a trained surrogate directly from descriptor-space data,
         copying template for the model structure (kernel + warm-start
         hyperparameters). Used by add() and _resort(), where the raw
         geometries are no longer available -- only stored descriptors.
 
-          descr.shape = (npts, nfeat)
-          eners.shape = (nstates, npts)
+          descr.shape   = (npts, nfeat)
+          targets.shape = (nmodel, npts)   internal targets (energies for
+                          Adiabat, {omega, c_k} coefficients for CP)
         """
         new = template.copy()
         new.prior_covar    = self.prior_covar
         new.numerical_grad = self.numerical_grad
-        for st in range(self.nstates):
-            new.descriptors[st] = descr.copy()
-            new.training[st]    = np.array(eners[st], dtype=float)
-            new.models[st].fit(new.descriptors[st], new.training[st])
+        descr = np.asarray(descr, dtype=float)
+        new.set_model_data(descr, targets)
+        for m in range(new.n_models()):
+            new.models[m].fit(descr, np.asarray(targets[m], dtype=float))
         return new
 
     #
@@ -211,14 +212,16 @@ class GRBCM():
                                           hparam, nrestart)
             return self.n_estimators()
 
-        # otherwise -- a new enhanced expert on D_c u D_new
+        # otherwise -- a new enhanced expert on D_c u D_new. Work in the
+        # surrogate's internal target space: the comm expert already
+        # stores its targets, and the new energies are mapped with
+        # to_targets (identity for Adiabat, energies->coefficients for CP).
         descr_new = self.surrogate.descriptor.generate(geoms)
-        aug_descr = np.vstack([self.comm.descriptors[0], descr_new])
-        aug_ener  = np.hstack([
-            np.array([self.comm.training[st] for st in sts]),
-            np.asarray(eners, dtype=float)])
+        aug_descr = np.vstack([self.comm.model_descriptors(), descr_new])
+        aug_tgt   = np.hstack([self.comm.model_targets(),
+                               self.comm.to_targets(eners)])
         self.surrogates.append(
-            self._fit_expert_descr(aug_descr, aug_ener, self.comm))
+            self._fit_expert_descr(aug_descr, aug_tgt, self.comm))
         return self.n_estimators()
 
     #
@@ -279,37 +282,41 @@ class GRBCM():
 
         Xq, (ngm, nc), singleX = utils.verify_geoms(gms)
 
-        e_bcm   = np.zeros((ns, ngm), dtype=float)
-        std_bcm = np.zeros((ns, ngm), dtype=float)
-        cov_bcm = np.zeros((ns, ngm, ngm), dtype=float)
+        # GRBCM aggregates each expert's internal GPs in "model" space
+        # (adiabatic energies for Adiabat, the smooth {omega, c_k}
+        # coefficients for CP); the surrogate reconstructs adiabatic
+        # energies once, AFTER aggregation. For CP this keeps the
+        # 1/sqrt(-c0) blow-up of the root map out of the precision
+        # weighting. Adiabat (model = state, identity reconstruct)
+        # reproduces the previous energy-space path.
+        nmod = self.comm.n_models()
 
-        # communication expert M_c -- full predictive covariance
-        e_c, cov_c = self.comm.evaluate(Xq, states=sts,
-                                            std=False, cov=True)
-
-        # all enhanced experts, evaluated once
-        exp_e, exp_cov = [], []
+        # raw per-model mean + full predictive covariance, one pass each
+        rmean_c, rcov_c = self.comm.raw_predict(Xq, need_cov=True)
+        exp_mean, exp_cov = [], []
         for expert in self.surrogates:
-            e_p, cov_p = expert.evaluate(Xq, states=sts,
-                                             std=False, cov=True)
-            exp_e.append(e_p)
-            exp_cov.append(cov_p)
+            rm, rc = expert.raw_predict(Xq, need_cov=True)
+            exp_mean.append(rm)
+            exp_cov.append(rc)
+
+        agg_mean = np.zeros((nmod, ngm),      dtype=float)
+        agg_cov  = np.zeros((nmod, ngm, ngm), dtype=float)
 
         tiny = 1.e-32      # ~ machine precision squared
-        for st in range(ns):
+        for m in range(nmod):
             # per-expert posterior covs are PSD by construction; use
             # psd_pinv so machine-eps negative eigenvalues are projected
             # out instead of being inverted into huge spurious values
-            prec_c   = utils.psd_pinv(cov_c[st])
-            var_c_pt = np.maximum(np.diag(cov_c[st]), tiny)
+            prec_c   = utils.psd_pinv(rcov_c[m])
+            var_c_pt = np.maximum(np.diag(rcov_c[m]), tiny)
 
             prec_A = np.zeros((ngm, ngm), dtype=float)
             rhs_A  = np.zeros(ngm, dtype=float)
             sum_b  = np.zeros(ngm, dtype=float)
 
             for j in range(len(self.surrogates)):
-                cov_p    = exp_cov[j][st]
-                e_p      = exp_e[j][st]
+                cov_p    = exp_cov[j][m]
+                e_p      = exp_mean[j][m]
                 prec_p   = utils.psd_pinv(cov_p)
                 var_p_pt = np.maximum(np.diag(cov_p), tiny)
 
@@ -332,14 +339,15 @@ class GRBCM():
             ch      = np.sqrt(np.maximum(sum_b - 1., 0.))
             wprec_c = (ch[:, None] * prec_c) * ch[None, :]
             prec_A -= wprec_c
-            rhs_A  -= wprec_c @ e_c[st]
+            rhs_A  -= wprec_c @ rmean_c[m]
 
-            cov_bcm[st] = utils.psd_pinv(prec_A)
-            e_bcm[st]   = cov_bcm[st] @ rhs_A
+            agg_cov[m]  = utils.psd_pinv(prec_A)
+            agg_mean[m] = agg_cov[m] @ rhs_A
 
-        # extract pointwise std from the covariance, if requested
-        if std:
-            std_bcm = utils.extract_std(cov_bcm)
+        # reconstruct adiabatic energies (and variance) from the
+        # aggregated per-model mean/cov
+        e_bcm, std_bcm, cov_bcm = self.comm.reconstruct_energy(
+                                      agg_mean, agg_cov, sts, std, cov)
 
         if singleX:
             args = utils.collect_output((e_bcm[:, 0],
@@ -429,45 +437,51 @@ class GRBCM():
         d_gm   = self.surrogate.descriptor.generate(Xq)
         d_grad = self.surrogate.descriptor.descriptor_gradient(Xq)
 
-        # mean, std, mean-gradient and (if requested) gradient
-        # covariance of every expert -- one pass each
-        e_c, estd_c, g_c, gcov_c = self.comm.evaluate_and_gradient(
-                                       Xq, states=sts, descrip=d_gm,
-                                       grad_descrip=d_grad,
-                                       std=True, cov=need_cov)
-        exp = []
-        for expert in self.surrogates:
-            res = expert.evaluate_and_gradient(
-                      Xq, states=sts, descrip=d_gm,
-                      grad_descrip=d_grad, std=True, cov=need_cov)
-            exp.append(res)
+        # raw per-model mean/std/gradient(/gcov) for every expert -- one
+        # pass each. GRBCM aggregates in the experts' internal-GP ("model")
+        # space (energies for Adiabat, the smooth {omega, c_k} coefficients
+        # for CP); the surrogate reconstructs adiabatic gradients AFTER
+        # aggregation. For CP this keeps the singular root-map jacobian out
+        # of the per-expert weighting. Adiabat (model = state, identity
+        # reconstruct) reproduces the previous energy-space path.
+        nmod = self.comm.n_models()
+        rc   = self.comm.raw_predict_and_grad(
+                   Xq, descrip=d_gm, grad_descrip=d_grad,
+                   std=True, cov=need_cov)
+        exp  = [expert.raw_predict_and_grad(
+                    Xq, descrip=d_gm, grad_descrip=d_grad,
+                    std=True, cov=need_cov)
+                for expert in self.surrogates]
 
-        nexp     = len(self.surrogates)
-        grad_bcm = np.zeros((ns, ngm, nc), dtype=float)
-        std_bcm  = np.zeros((ns, ngm, nc), dtype=float)
-        cov_bcm  = np.zeros((ns, ngm, nc, nc), dtype=float)
+        nexp       = len(self.surrogates)
+        grad_bcm   = np.zeros((ns, ngm, nc), dtype=float)
+        std_bcm    = np.zeros((ns, ngm, nc), dtype=float)
+        cov_bcm    = np.zeros((ns, ngm, nc, nc), dtype=float)
+        # aggregated per-model coefficient mean / gradient / gradient-cov
+        mean_coeff = np.zeros((nmod, ngm),         dtype=float)
+        grad_coeff = np.zeros((nmod, ngm, nc),     dtype=float)
+        cov_coeff  = np.zeros((nmod, ngm, nc, nc), dtype=float)
 
-        for s, st in enumerate(sts):
+        for m in range(nmod):
 
             # --- communication expert M_c ---
-            m_c  = e_c[s]                                  # (ngm,)
-            v_raw = estd_c[s]**2
+            m_c  = rc[0][m]                                # (ngm,)
+            v_raw = rc[1][m]**2
             n_floored += int(np.sum(v_raw < tiny))
             v_c  = np.maximum(v_raw, tiny)                 # (ngm,)
-            dm_c = g_c[s]                                  # (ngm, nc)
-            dk_c = self.comm.models[st].dk_Kinv_k(d_gm, physical=True)
+            dm_c = rc[2][m]                                # (ngm, nc)
+            dk_c = self.comm.models[m].dk_Kinv_k(d_gm, physical=True)
             dv_c = -np.einsum('gcf,gf->gc', d_grad, dk_c)  # (ngm, nc)
             P_c  = 1./v_c
             dP_c = -(P_c**2)[:, None]*dv_c
 
             # --- base enhanced expert (surrogates[0], beta_0 = 1) ---
-            ej, estdj, gj, _ = exp[0]
-            m_0   = ej[s]
-            v_raw = estdj[s]**2
+            m_0   = exp[0][0][m]
+            v_raw = exp[0][1][m]**2
             n_floored += int(np.sum(v_raw < tiny))
             v_0   = np.maximum(v_raw, tiny)
-            dm_0 = gj[s]
-            dk_0 = self.surrogates[0].models[st].dk_Kinv_k(
+            dm_0 = exp[0][2][m]
+            dk_0 = self.surrogates[0].models[m].dk_Kinv_k(
                                                 d_gm, physical=True)
             dv_0 = -np.einsum('gcf,gf->gc', d_grad, dk_0)
             P_0  = 1./v_0
@@ -490,13 +504,12 @@ class GRBCM():
 
             # --- enhanced experts j >= 1, accumulated as corrections ---
             for j in range(1, nexp):
-                ej, estdj, gj, _ = exp[j]
-                m_j   = ej[s]
-                v_raw = estdj[s]**2
+                m_j   = exp[j][0][m]
+                v_raw = exp[j][1][m]**2
                 n_floored += int(np.sum(v_raw < tiny))
                 v_j   = np.maximum(v_raw, tiny)
-                dm_j = gj[s]
-                dk_j = self.surrogates[j].models[st].dk_Kinv_k(
+                dm_j = exp[j][2][m]
+                dk_j = self.surrogates[j].models[m].dk_Kinv_k(
                                                 d_gm, physical=True)
                 dv_j = -np.einsum('gcf,gf->gc', d_grad, dk_j)
                 P_j  = 1./v_j
@@ -540,7 +553,7 @@ class GRBCM():
 
             P_A = P_0 + DelP                                # (ngm,)
 
-            # --- gradient mean ---
+            # --- aggregated coefficient gradient (mean of d/dx) ---
             # grad mu_A = (dR P_A - R dP_A) / P_A^2; expand with
             # P_A = P_0 + DelP, R = P_0 m_0 + DelR to factor out the
             # P_0^2 dm_0 leading term cleanly:
@@ -556,9 +569,12 @@ class GRBCM():
                 + P_0[:, None]*dDelR       - DelR[:, None]*dP_0 \
                 + DelP[:, None]*dDelR      - DelR[:, None]*dDelP
 
-            grad_bcm[s] = num / (P_A**2)[:, None]
+            grad_coeff[m] = num / (P_A**2)[:, None]
+            # aggregated coefficient mean (mu_A = R / P_A), needed for the
+            # reconstruction jacobian
+            mean_coeff[m] = (P_0*m_0 + DelR) / P_A
 
-            # --- gradient coordinate covariance (Stage C) ---
+            # --- aggregated coefficient gradient covariance (Stage C) ---
             # Sigma_A^-1 = sum_j beta_j Sigma_{+j}^-1 - (B-1) Sigma_c^-1
             if need_cov:
                 for g in range(ngm):
@@ -568,13 +584,21 @@ class GRBCM():
                         # negative eigenvalues in per-expert gcov are
                         # otherwise blown up by plain pinv -> NaN std)
                         prec += betas[j, g] \
-                              * utils.psd_pinv(exp[j][3][s, g])
-                    prec -= (B[g] - 1.)*utils.psd_pinv(gcov_c[s, g])
-                    cov_bcm[s, g] = utils.psd_pinv(prec)
+                              * utils.psd_pinv(exp[j][3][m, g])
+                    prec -= (B[g] - 1.)*utils.psd_pinv(rc[3][m, g])
+                    cov_coeff[m, g] = utils.psd_pinv(prec)
 
-        # pointwise std of the gradient, extracted from the covariance
-        if std:
-            std_bcm = utils.extract_std(cov_bcm)
+        # reconstruct adiabatic gradients from the aggregated per-model
+        # mean/gradient/gcov, one geometry at a time
+        for g in range(ngm):
+            gg, gs, gcv = self.comm.reconstruct_gradient(
+                              mean_coeff[:, g], grad_coeff[:, g, :],
+                              cov_coeff[:, g, :, :], sts, std, cov)
+            grad_bcm[:, g, :] = gg
+            if std:
+                std_bcm[:, g, :] = gs
+            if cov:
+                cov_bcm[:, g, :, :] = gcv
 
         # one-line notice when the noise floor regularised the analytic
         # gradient (only fires when default-active and triggered)
@@ -731,18 +755,18 @@ class GRBCM():
 
         enforce_size : balance the k-means clusters (see _partition).
         """
-        sts = list(range(self.nstates))
-        n_c = self.comm.descriptors[0].shape[0]
+        n_c = self.comm.model_descriptors().shape[0]
 
-        # collect all data: D_c, then each local subset D_i
-        descr_blocks = [self.comm.descriptors[0]]
-        ener_blocks  = [np.array([self.comm.training[st] for st in sts])]
+        # collect all data: D_c, then each local subset D_i. Everything is
+        # in the surrogate's internal target space (coefficients for CP),
+        # via the storage hooks -- representation-agnostic.
+        descr_blocks = [self.comm.model_descriptors()]
+        tgt_blocks   = [self.comm.model_targets()]
         for expert in self.surrogates:
-            descr_blocks.append(expert.descriptors[0][n_c:])
-            ener_blocks.append(np.array([expert.training[st][n_c:]
-                                         for st in sts]))
+            descr_blocks.append(expert.model_descriptors()[n_c:])
+            tgt_blocks.append(expert.model_targets()[:, n_c:])
         all_descr = np.vstack(descr_blocks)            # (N, nfeat)
-        all_ener  = np.hstack(ener_blocks)             # (nstates, N)
+        all_tgt   = np.hstack(tgt_blocks)              # (nmodel, N)
         N         = all_descr.shape[0]
 
         # communication expert + (M + 1) enhanced experts
@@ -759,14 +783,14 @@ class GRBCM():
 
         # rebuild the communication expert, then the enhanced experts
         self.comm = self._fit_expert_descr(all_descr[comm_idx],
-                                           all_ener[:, comm_idx],
+                                           all_tgt[:, comm_idx],
                                            template)
         self.surrogates = []
         for g in groups:
             aug = np.concatenate([comm_idx, g])
             self.surrogates.append(
                 self._fit_expert_descr(all_descr[aug],
-                                       all_ener[:, aug], template))
+                                       all_tgt[:, aug], template))
 
     # -----------------------------------------------------------------
     # persistence
