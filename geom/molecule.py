@@ -7,7 +7,7 @@ import numpy as np
 import scipy.interpolate as sp_interpolate
 from itertools import chain
 import constants as constants
-import intc as intc
+from . import intc
 
 
 ref_masses = {'Ghost': 0, 'X': 0., 'H':1.008, 'He':4.002602,
