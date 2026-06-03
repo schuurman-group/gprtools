@@ -50,7 +50,7 @@ def test_roundtrip(nstates):
     # eps>0 deliberately perturbs the spectrum by the gap floor
     cp = surrogate.CP(nstates, IdentityDescriptor(), degeneracy_eps=0.0)
     targets = cp._to_targets(E)            # (nstates, npts)
-    _, z, E_rec = cp._reconstruct(targets) # E_rec (npts, nstates)
+    _, z, E_rec, _ = cp._reconstruct(targets)  # E_rec (npts, nstates)
 
     E_sorted = np.sort(E, axis=0).T        # (npts, nstates)
     err = np.max(np.abs(E_rec - E_sorted))
@@ -164,10 +164,45 @@ def test_degeneracy_eps():
     print(f'  CI gap: eps=0 -> {gap0:.3e}, eps=2e-2 -> {gapE:.3e}; '
           f'|gradE| finite = {np.all(np.isfinite(gE))}, '
           f'max|gradE| = {np.max(np.abs(gE)):.3e}')
-    assert gapE > gap0                          # tip lifted
-    assert abs(gapE - 2e-2) < 5e-3              # min gap ~ eps
+    # the c_{n-2} softplus floor lifts the gap to O(eps) (the smooth
+    # transition keeps it a few x eps above the bare floor), not to a hard
+    # eps; the point is it's bounded away from 0, finite, smooth-gradient
+    assert gapE > gap0                          # tip lifted off ~0
+    assert 2e-2 < gapE < 1e-1                   # floored to O(eps), not 0
     assert np.all(np.isfinite(gE))             # smooth, no blow-up
     assert np.max(np.abs(gE)) < 1.0            # bounded (cone slope is 1)
+
+
+def test_smooth_through_ci():
+    """The c_{n-2} softplus floor (eps>0) removes the sqrt(-c0) cusp: along
+    a dense line cut through the CI the lower-state surface is smooth (small
+    discrete curvature), vs eps=0 which has a genuine cusp (large curvature).
+    Trains on an annulus so the seam is extrapolated and c0 overshoots."""
+    rng = np.random.default_rng(8)
+    pts = []
+    while len(pts) < 250:
+        p = rng.uniform(-1, 1, size=2)
+        if 0.2 < np.hypot(*p) < 1.0:
+            pts.append(p)
+    Xtr = np.array(pts)
+    cp = surrogate.CP(2, IdentityDescriptor())
+    cp.create([Xtr, cone_energies(Xtr)], states=[0, 1])
+
+    xline = np.linspace(-0.5, 0.5, 401)              # dense cut through origin
+    Xd = np.column_stack([xline, np.zeros_like(xline)])
+
+    def cusp(eps):
+        cp.degeneracy_eps = eps
+        E = cp.evaluate(Xd)                          # (2, 401)
+        assert np.all(np.isfinite(E))
+        return float(np.abs(np.diff(E[0], 2)).max())  # max |2nd diff|, lower state
+
+    k0 = cusp(0.0)
+    ke = cusp(2e-2)
+    print(f'  cusp metric max|2nd-diff E0|: eps=0 -> {k0:.4f}, '
+          f'eps=2e-2 -> {ke:.4f}  (ratio {ke/k0:.2f})')
+    assert ke < 0.5 * k0      # floor markedly smooths the cusp
+    assert ke < 0.05          # and is small in absolute terms (C^inf)
 
 
 def test_diabatic_deferred():
@@ -215,6 +250,8 @@ if __name__ == '__main__':
         test_fit_and_gradient(n)
     print('degeneracy_eps (cone vs hyperboloid):')
     test_degeneracy_eps()
+    print('smoothness through CI (softplus floor removes cusp):')
+    test_smooth_through_ci()
     print('diabatic deferral:')
     test_diabatic_deferred()
     print('Adiabat._num_gradient multistate regression:')

@@ -5,6 +5,7 @@ import os
 import copy as copy
 import numpy as np
 import pickle as pickle
+from scipy.special import expit
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
 import gpr as gpr
 import utils as utils
@@ -73,14 +74,20 @@ class CP(Surrogate):
           of the later shared-base refactor.
     """
 
-    # warn if a companion-matrix eigenvalue strays this far off the
-    # real axis (au); with degeneracy_eps>0 the warn threshold is raised
-    # to eps, since small overshoots are absorbed by the tip smoothing
+    # warn if a companion-matrix eigenvalue strays this far off the real
+    # axis (au). With degeneracy_eps>0 the sign-definite coefficient
+    # c_{n-2} is floored < 0, so a 2-state polynomial is always real-
+    # rooted; this fires only for n>2 residual complex roots.
     _ROOT_IM_TOL = 1.0e-6
     # last-ditch nan guard for an *exact* root coincidence when
     # degeneracy_eps==0 (faithful/MECI mode); the physical singularity
     # is otherwise left intact
     _PPRIME_TOL = 1.0e-12
+    # softplus transition width as a multiple of the floor depth
+    # delta=(degeneracy_eps/2)^2. S = factor*delta makes the c_{n-2}
+    # floor a gentle (C^inf) hyperboloid rather than a sharp corner;
+    # factor ~ 10 reproduces the smooth surface validated on real data.
+    _C2_SMOOTH_FACTOR = 10.0
 
     #
     def __init__(self, nstates,
@@ -106,13 +113,14 @@ class CP(Surrogate):
         # representations; the flag only selects how the recovered roots
         # are labelled at reconstruction
         self.representation = representation
-        # tip-smoothing scale (Eh). >0 -> hyperboloid (min gap ~eps,
-        # smooth bounded gradient): the DEFAULT, since trajectory
-        # propagation only needs smooth gradients and a good eps is not
-        # obvious. Set 0 -> faithful cone (exact degeneracies, singular
-        # gradient) for the easy, explicit case of reproducing a CI /
-        # MECI optimisation. Default 1e-3 Eh (~0.027 eV) only flattens
-        # the surface where the true gap < ~eps; tune per system.
+        # minimum-gap floor (Eh). >0 -> the sign-definite coefficient
+        # c_{n-2} is smoothly bounded < 0 (softplus, see _floor_c2), so the
+        # adiabatic gap can never close: a C^inf 'hyperboloid' surface with
+        # min gap ~eps and smooth, bounded gradients/variance. This is the
+        # DEFAULT (trajectory propagation needs smooth surfaces). Set 0 ->
+        # faithful 'cone' (gap can reach 0, singular gradient at a genuine
+        # CI) for MECI optimisation. Default 1e-3 Eh (~0.027 eV); raise it
+        # for a gentler, larger floor (the transition softens with eps).
         self.degeneracy_eps = degeneracy_eps
         # one-shot diagnostic flags: reconstruction near a seam fires the
         # complex-root / exact-coincidence notices on essentially every
@@ -271,31 +279,55 @@ class CP(Surrogate):
 
     #
     # -- reconstruction helpers --------------------------------------
+    def _floor_c2(self, c2):
+        """
+        Smooth floor on the sign-definite coefficient c_{n-2} (= -gap^2/4
+        for two states, guaranteed <= 0 by eq 5). Bound it <= -delta with
+        delta = (degeneracy_eps/2)^2 via a softplus, so the recovered gap
+        cannot close and sqrt(-c_{n-2}) stays differentiable -> a smooth
+        (C^inf) 'hyperboloid' surface. The transition width
+        S = _C2_SMOOTH_FACTOR * delta makes the floor a gentle bend rather
+        than a sharp corner.
+
+            c2_eff = -delta - S*softplus(-(c2 + delta)/S)   (<= -delta)
+
+        degeneracy_eps = 0 -> identity (faithful 'cone'; gap can reach 0,
+        for MECI). Returns (c2_eff, slope = d c2_eff/d c2 in (0, 1]); the
+        slope -> 0 where c2 overshoots, which auto-bounds the delta-method
+        variance.
+        """
+        eps = self.degeneracy_eps
+        if eps <= 0.:
+            return c2, np.ones_like(c2)
+        delta  = 0.25 * eps * eps                       # (eps/2)^2
+        S      = self._C2_SMOOTH_FACTOR * delta
+        u      = -(c2 + delta) / S
+        c2_eff = -delta - S * np.logaddexp(0., u)
+        return c2_eff, expit(u)
+
+    #
     def _reconstruct(self, raw_mean):
         """
         Recover states from the internal target means.
 
             raw_mean.shape = (nstates, ngm)
-            returns omega (ngm,), z (ngm, nstates), E (ngm, nstates)
+            returns omega (ngm,), z (ngm, nstates), E (ngm, nstates),
+                    c2_slope (ngm,)
 
         z are the companion-matrix eigenvalues (roots of p^Z) sorted
-        ascending; E = omega + z. Warns if any root carries an
-        imaginary part above `_ROOT_IM_TOL`.
+        ascending; E = omega + z; c2_slope = d c2_eff/d c2 is carried out
+        for the jacobian chain rule.
 
-        If `degeneracy_eps` (eps) > 0 the recovered spectrum is tip-
-        smoothed: each adjacent gap d is floored as sqrt(d^2 + eps^2),
-        which (i) lifts the cone to a hyperboloid with minimum gap ~eps,
-        (ii) guarantees min pairwise spacing >= eps so the implicit-diff
-        jacobian's p'(z_i) stays bounded -> smooth bounded gradients, and
-        (iii) absorbs small (|Im| <~ eps) complex overshoots into the
-        floor instead of discarding them. eps = 0 -> faithful cone
-        (exact degeneracies, singular gradient), for MECI optimisation.
+        `degeneracy_eps` > 0 floors the sign-definite coefficient c_{n-2}
+        strictly below 0 (see _floor_c2) so the gap can never close ->
+        C^inf surface with min gap ~ degeneracy_eps and smooth, bounded
+        gradients/variance. `degeneracy_eps` = 0 -> faithful cone (gap can
+        reach 0, singular gradient at a genuine CI), for MECI.
 
-        Limitation: the floor uses |gap| = 2*sqrt(disc^+), so the
-        smoothed gap is C^0 but has a slope kink exactly on the
-        discriminant-zero locus (seam onset). The C^1 fix is to smooth
-        the *signed* squared spacing (discriminant) with conjugate-pair
-        tracking; deferred.
+        For two states this guarantees real roots. For n > 2 only c_{n-2}
+        is sign-constrained; residual complex roots from the other
+        coefficients are handled by taking real parts (full hyperbolicity
+        for >=3 states needs the deferred hyperbolic-cone projection).
         """
         if self.representation == 'diabatic':
             # Learning is representation-agnostic, but recovering diabatic
@@ -313,60 +345,57 @@ class CP(Surrogate):
         omega  = raw_mean[0]
         z      = np.zeros((ngm, n), dtype=float)
         if n == 1:
-            return omega, z, omega[:, None].copy()
+            return (omega, z, omega[:, None].copy(),
+                    np.ones(ngm, dtype=float))
+
+        # smooth floor on the sign-definite coefficient c_{n-2} = raw_mean[n-1]
+        c2_eff, c2_slope = self._floor_c2(raw_mean[n - 1])
+        rm = raw_mean.copy()
+        rm[n - 1] = c2_eff
 
         max_im = 0.
         for g in range(ngm):
-            # monic coeffs, highest-first: [1, 0, c_{n-2}, ..., c_0]
+            # monic coeffs, highest-first: [1, 0, c_{n-2}^eff, ..., c_0]
             coeffs     = np.empty(n + 1, dtype=float)
             coeffs[0]  = 1.0
             coeffs[1]  = 0.0                       # c_{n-1}^Z == 0
-            coeffs[2:] = raw_mean[1:, g][::-1]     # c_{n-2} .. c_0
+            coeffs[2:] = rm[1:, g][::-1]
             r          = np.roots(coeffs)
             max_im     = max(max_im, float(np.max(np.abs(r.imag))))
             z[g]       = np.sort(r.real)
 
-        eps = self.degeneracy_eps
-        # with tip smoothing, overshoots up to ~eps are absorbed, so only
-        # warn on imaginary parts the floor cannot account for (once per
-        # instance -- near a seam this fires on essentially every query)
-        if max_im > max(self._ROOT_IM_TOL, eps) and not self._warned_im:
+        # n=2 is always real-rooted now (c_{n-2} <= -delta < 0 when eps>0);
+        # this fires only for eps=0 overshoots or n>2 un-constrained roots
+        if max_im > self._ROOT_IM_TOL and not self._warned_im:
             print(f'WARNING: CP companion roots have |Im| up to '
-                  f'{max_im:.3e} au; taking real part. Coefficient GPs '
-                  f'may be extrapolating beyond a real-rooted region. '
-                  f'(further such warnings suppressed for this surrogate)')
+                  f'{max_im:.3e} au; taking real part (eps=0 overshoot or '
+                  f'n>2 un-constrained coefficients). (further warnings '
+                  f'suppressed for this surrogate)')
             self._warned_im = True
 
-        if eps > 0.:
-            # floor each adjacent gap to sqrt(d^2 + eps^2); rebuild the
-            # spectrum keeping the trace (sum z = -c_{n-1} = 0). Min
-            # pairwise spacing is then >= eps, bounding p'(z_i).
-            d      = np.diff(z, axis=1)                      # (ngm, n-1)
-            d_reg  = np.sqrt(d**2 + eps**2)
-            pos    = np.concatenate(
-                        (np.zeros((ngm, 1)), np.cumsum(d_reg, axis=1)),
-                        axis=1)                              # (ngm, n)
-            z      = pos - pos.mean(axis=1, keepdims=True)
-
-        return omega, z, z + omega[:, None]
+        return omega, z, z + omega[:, None], c2_slope
 
     #
-    def _state_jacobian(self, z):
+    def _state_jacobian(self, z, c2_slope):
         """
         Jacobian of each recovered state E_i w.r.t. the internal
         targets, by implicit differentiation of p^Z(z_i) = 0.
 
-            z.shape = (ngm, nstates)
+            z.shape = (ngm, nstates), c2_slope.shape = (ngm,)
             returns jac.shape = (ngm, nstates, ntargets) with
                 jac[:, i, 0]    = dE_i/domega      = 1
                 jac[:, i, m>=1] = dE_i/dc_{m-1}^Z  = -z_i^{m-1}/p'(z_i)
 
-        p'(z_i) = prod_{j!=i}(z_i - z_j). When `degeneracy_eps` > 0 the
-        spectrum reaching this point is tip-smoothed (min pairwise
-        spacing >= eps), so p'(z_i) is bounded and the gradient is smooth
-        with no special-casing. When eps == 0 (faithful/MECI mode) p'(z_i)
-        diverges at a genuine CI -- physical; `_PPRIME_TOL` is only a
-        last-ditch nan guard for an *exact* root coincidence.
+        The c_{n-2} column is multiplied by c2_slope = d c2_eff/d c2 (the
+        softplus floor's chain rule; = 1 when degeneracy_eps = 0), so the
+        slope -> 0 where c_{n-2} overshoots and the gradient/variance stay
+        bounded.
+
+        p'(z_i) = prod_{j!=i}(z_i - z_j); with degeneracy_eps > 0 the
+        c_{n-2} floor keeps the two-state gap >= ~eps so p'(z_i) is
+        bounded. When eps == 0 (faithful/MECI) p'(z_i) diverges at a
+        genuine CI -- physical; `_PPRIME_TOL` is only a last-ditch nan
+        guard for an *exact* root coincidence.
         """
         ngm, n = z.shape
         jac = np.zeros((ngm, n, n), dtype=float)
@@ -389,6 +418,8 @@ class CP(Surrogate):
                              else np.copysign(self._PPRIME_TOL, pprime)
                 powers        = z[g, i] ** np.arange(n - 1)  # z^0..z^{n-2}
                 jac[g, i, 1:] = -powers / pprime
+        # softplus floor chain rule on the c_{n-2} coefficient column
+        jac[:, :, n - 1] *= c2_slope[:, None]
         return jac
 
     #
@@ -468,9 +499,9 @@ class CP(Surrogate):
         ns       = len(states)
         need_cov = std or cov
 
-        _, z, E = self._reconstruct(raw_mean)        # E (ngm, nstates)
+        _, z, E, c2_slope = self._reconstruct(raw_mean)   # E (ngm, nstates)
         if need_cov:
-            jac = self._state_jacobian(z)            # (ngm, nstates, ntar)
+            jac = self._state_jacobian(z, c2_slope)  # (ngm, nstates, ntar)
 
         evals = np.zeros((ns, ngm),      dtype=float)
         estd  = np.zeros((ns, ngm),      dtype=float)
@@ -526,8 +557,8 @@ class CP(Surrogate):
             gcov_E_st = sum_m J[st, m]^2 coeff_gcov[m]   (delta-method)
         with J the state jacobian at the roots of coeff_mean.
         """
-        _, z, _ = self._reconstruct(np.asarray(coeff_mean)[:, None])
-        J  = self._state_jacobian(z)[0]            # (nstates, ntargets)
+        _, z, _, c2_slope = self._reconstruct(np.asarray(coeff_mean)[:, None])
+        J  = self._state_jacobian(z, c2_slope)[0]  # (nstates, ntargets)
         ns = len(states)
         nc = coeff_grad.shape[-1]
         grad = np.zeros((ns, nc),     dtype=float)
@@ -604,8 +635,8 @@ class CP(Surrogate):
                 gcov_cart[m] = np.einsum(
                     'aik,akl,ajl->aij', d_grad, cov_d, d_grad)
 
-        _, z, _ = self._reconstruct(raw_mean)
-        jac = self._state_jacobian(z)               # (ng, nstates, ntar)
+        _, z, _, c2_slope = self._reconstruct(raw_mean)
+        jac = self._state_jacobian(z, c2_slope)     # (ng, nstates, ntar)
 
         # dE_i/dR = sum_t jac[:,i,t] grad_cart[t];  gcov via jac^2
         grad_recon = np.einsum('git,tgc->igc', jac, grad_cart)
@@ -670,8 +701,8 @@ class CP(Surrogate):
             if cov:
                 gcov_cart[m] = d_grad @ gcov_d @ d_grad.swapaxes(-2, -1)
 
-        _, z, E = self._reconstruct(raw_mean)
-        jac = self._state_jacobian(z)               # (ngm, nstates, ntar)
+        _, z, E, c2_slope = self._reconstruct(raw_mean)
+        jac = self._state_jacobian(z, c2_slope)     # (ngm, nstates, ntar)
 
         grad_recon = np.einsum('git,tgc->igc', jac, grad_cart)
         if std:
