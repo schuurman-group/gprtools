@@ -2,6 +2,7 @@
 
 import numpy as np
 import numpy.linalg as la
+import constants
 
 def normalize(vec):
     """normalize a vector. If norm is zero, return zero vector"""
@@ -11,6 +12,47 @@ def normalize(vec):
         return vec/n
     else:
         return np.zeros(vec.shape[0], dtype=float)
+
+# Cordero et al. covalent radii (Dalton Trans. 2008, 2832), angstrom.
+# Converted to a.u. on use; lower-case element-symbol keys.
+COVALENT_RADII = {
+    'h' :0.31, 'he':0.28,
+    'li':1.28, 'be':0.96, 'b' :0.84, 'c' :0.76, 'n' :0.71, 'o' :0.66,
+    'f' :0.57, 'ne':0.58,
+    'na':1.66, 'mg':1.41, 'al':1.21, 'si':1.11, 'p' :1.07, 's' :1.05,
+    'cl':1.02, 'ar':1.06,
+    'k' :2.03, 'ca':1.76, 'br':1.20, 'i' :1.39,
+}
+
+def prim_angle(xyz, i, j, k):
+    """return the angle (rad) at vertex j subtended by atoms i and k"""
+    u = xyz[i] - xyz[j]
+    v = xyz[k] - xyz[j]
+    c = np.dot(u, v) / (la.norm(u) * la.norm(v))
+    return np.arccos(np.clip(c, -1., 1.))
+
+def detect_bonds(geom, atoms, scale=1.3):
+    """detect bonded atom pairs from a cartesian geometry (a.u.).
+
+       Bonded if r_ij < scale*(rcov_i + rcov_j) using Cordero covalent
+       radii. 'geom' may be flat (3*na,) or (na,3); 'atoms' is a list of
+       element symbols. Returns a sorted list of (i,j) pairs with i<j."""
+
+    xyz = np.reshape(np.asarray(geom, dtype=float), (-1, 3))
+    na  = xyz.shape[0]
+    try:
+        rcov = np.array([COVALENT_RADII[a.lower()] for a in atoms])
+    except KeyError as e:
+        raise KeyError('no covalent radius tabulated for element '+str(e))
+    rcov *= constants.ang2bohr
+
+    bonds = []
+    for i in range(na):
+        for j in range(i + 1, na):
+            if la.norm(xyz[i] - xyz[j]) < scale * (rcov[i] + rcov[j]):
+                bonds.append((i, j))
+
+    return bonds
 
 # class that defines a single internal coordinate
 class Intc:
@@ -180,6 +222,87 @@ class Intdef:
 
     def q_coefs(self, i):
             return self.intcoords[i].coefs
+
+    def generate_redundant(self, geom, atoms, coords='internals',
+                           scale=1.3, lin_tol=5.0):
+        """build a redundant primitive internal-coordinate set directly
+           from a cartesian geometry (a.u.) and element labels.
+
+           coords  : 'bonds'     -> stretches only
+                     'internals' -> stretches + bends + torsions + oop
+           scale   : bond cutoff, bonded if r_ij < scale*(rcov_i+rcov_j)
+           lin_tol : angles within lin_tol degrees of 0/180 are treated as
+                     linear and the (singular) coordinate is skipped.
+
+           Bonding is detected ONCE here (at the supplied geometry, meant
+           to be the reference minimum) and the resulting coordinate set is
+           held fixed for all later geometries -- a bond that stretches and
+           breaks keeps its primitive (and smoothly plateaus in a baseline),
+           rather than the set changing discontinuously along a trajectory.
+
+           Each generated coordinate is a single primitive (coef = 1.0).
+           Returns the detected bond list [(i,j), ...]."""
+
+        xyz   = np.reshape(np.asarray(geom, dtype=float), (-1, 3))
+        na    = xyz.shape[0]
+        bonds = detect_bonds(xyz, atoms, scale=scale)
+
+        # adjacency from the (static) bond list
+        nbr = [[] for _ in range(na)]
+        for (i, j) in bonds:
+            nbr[i].append(j)
+            nbr[j].append(i)
+
+        lin = lin_tol * np.pi / 180.
+        def _linear(i, j, k):
+            """angle i-j-k (vertex j) within lin_tol of 0/180"""
+            a = prim_angle(xyz, i, j, k)
+            return (a < lin) or (a > np.pi - lin)
+
+        def _add(typ, atms):
+            ic = Intc()
+            ic.add_prim(typ, 1.0, atms)
+            self.intcoords.append(ic)
+
+        self.intcoords = []
+
+        # --- stretches: one per detected bond ---
+        for (i, j) in bonds:
+            _add('stre', [i, j])
+
+        if coords == 'bonds':
+            return bonds
+
+        # --- bends: each pair of bonds sharing a central atom (vertex) ---
+        for b in range(na):
+            ns = nbr[b]
+            for m in range(len(ns)):
+                for n in range(m + 1, len(ns)):
+                    a, c = ns[m], ns[n]
+                    if not _linear(a, b, c):
+                        _add('bend', [a, c, b])        # vertex is atms[2]
+
+        # --- torsions: A-B-C-D about each bond B-C ---
+        for (b, c) in bonds:
+            for a in nbr[b]:
+                if a == c or _linear(a, b, c):
+                    continue
+                for d in nbr[c]:
+                    if d == b or d == a or _linear(b, c, d):
+                        continue
+                    _add('tors', [a, b, c, d])         # central bond atms[1]-atms[2]
+
+        # --- out-of-plane: every atom with exactly three neighbors ---
+        for b in range(na):
+            ns = nbr[b]
+            if len(ns) != 3:
+                continue
+            a, c, d = ns
+            for apex, p1, p2 in ((a, c, d), (c, a, d), (d, a, c)):
+                if not _linear(p1, b, p2):
+                    _add('out', [apex, p1, p2, b])     # center is atms[3]
+
+        return bonds
 
 class Cart2int:
     """Class constructor for cart2int object"""

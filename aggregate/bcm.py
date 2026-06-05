@@ -2,6 +2,7 @@
 The Surface ABC
 """
 import os
+import copy as copy
 from abc import ABC, abstractmethod
 import numpy as np
 import pickle as pickle
@@ -23,6 +24,11 @@ class BCM():
 
         self.Kmax           = 1000
         self.surrogate      = surrogate
+        # the common Delta-learning baseline shared (by reference) by every
+        # expert: the template's initially, replaced by a data-pooled
+        # consensus at each re-sort. Held FIXED; experts are born on it
+        # (grow) or reconciled to it (add of a pre-built surrogate).
+        self._common        = surrogate.baseline
         self.nstates        = surrogate.nstates
         self.surrogates     = []
         self.sdata          = []
@@ -39,58 +45,200 @@ class BCM():
 
     #
     @timer.timed
-    def grow(self, data, states, hparam=None, nrestart=None,
-                                                  enforce_size=False):
+    def grow(self, data, id=None, states=[], hparam=None, nrestart=None,
+                                                          enforce_size=False):
         """
-        grow the current surrogate by the data in grow
+        Grow the BCM by raw data. `id` selects which expert receives the data
+        (negative indexes from the end, -1 = last); `id=None` or an out-of-
+        range id creates a NEW template-type expert from the data. A targeted
+        expert exceeding Kmax triggers a re-sort.
         """
-
+        # shape a single hyperparameter set to (nstate, nparam) if given
+        hp_use = None
         if hparam is not None:
-            # just a single set of hparams, copy to the 
-            # number of states
-            ndim = len(hparam.shape)
-            # just a single set of hparams, change shape to
-            # hp.shape = (1, nstate, nparam)
+            ndim = len(np.shape(hparam))
             if ndim == 1:
-                hp = np.repeat([[hparam]],repeats=self.nstates, axis=1)
-            # a single set of hparams for a single surrogate (i.e.
-            # a set per state). Nest just one layer
-            if ndim == 2:
+                hp = np.repeat([[hparam]], repeats=self.nstates, axis=1)
+            elif ndim == 2:
                 hp = np.array([hparam], dtype=float)
             else:
                 hp = hparam
+            hp_use = hp[-1]
 
-        if self.n_estimators() == 0:
-            hyper = self.add(data, states=states, 
-                                       hparam=hp[-1], nrestart=nrestart)
-        else:
-            hyper = self.surrogates[-1].update(data, states=states,
-                                       hparam=hp[-1], nrestart=nrestart)
-            if max(self.surrogates[-1].train_size()) > self.Kmax:
+        M   = self.n_estimators()
+        tgt = None
+        if id is not None:
+            j = id if id >= 0 else M + id             # -1 -> last expert
+            if 0 <= j < M:
+                tgt = j
+
+        if tgt is None:                               # None / out of range -> new expert
+            hyper = self._new_expert(data, states=states,
+                                           hparam=hp_use, nrestart=nrestart)
+        else:                                         # add data to an existing expert
+            hyper = self.surrogates[tgt].update(data, states=states,
+                                           hparam=hp_use, nrestart=nrestart)
+            if max(self.surrogates[tgt].train_size()) > self.Kmax:
                 hyper = self._resort(enforce_size=enforce_size)
+        return hyper
 
+    #
+    def _new_expert(self, data, states=[], hparam=None, nrestart=None):
+        """Create a new template-type expert from raw data (on the common
+        [template] baseline) and append it."""
+        new          = self.surrogate.copy()
+        new.baseline = self._common                  # born on the common baseline
+        hyper = new.create(data, states=states, hparam=hparam, nrestart=nrestart)
+        new.prior_covar    = self.prior_covar
+        new.numerical_grad = self.numerical_grad
+        self.surrogates.append(new)
         return hyper
 
     #
     @timer.timed
-    def add(self, data, states=[], hparam=None, nrestart=None):
+    def add(self, surr, resort=False, enforce_size=False):
         """
-        create a surrogate with training data, data
+        Add a PRE-BUILT surrogate OBJECT as an expert (strict compat check:
+        type / nstates / descriptor / degeneracy_eps; baselines are reconciled,
+        not required to match). The surrogate is moved onto the common baseline
+        -- the template's for an incremental add, or a fresh consensus when
+        resort=True (which re-sorts the full pooled data).
         """
+        self._check_compatible(surr)
+        surr.prior_covar    = self.prior_covar
+        surr.numerical_grad = self.numerical_grad
+        if resort:
+            self.surrogates.append(surr)              # _resort reconciles all to consensus
+            return self._resort(enforce_size=enforce_size)
+        # reconcile to the current common baseline; no-op for non-baselined
+        # surrogates (Adiabat has no _rebase_to)
+        if hasattr(surr, '_rebase_to'):
+            surr._rebase_to(self._common)
+        self.surrogates.append(surr)
+        return self.n_estimators()
 
-        #self.sdata.append(data)
-        new = self.surrogate.copy()
-        hyper = new.create(data, states=states, 
-                                     hparam=hparam, 
-                                     nrestart=nrestart)
+    #
+    # -- merging pre-built surrogates (heterogeneous baselines) ----------
+    def _check_compatible(self, surr):
+        """Strict compatibility for an injected surrogate: same type, nstates,
+        descriptor type, and degeneracy_eps as the template. Baselines need
+        NOT match -- they are reconciled to a common baseline on injection."""
+        t = self.surrogate
+        if type(surr) is not type(t):
+            raise TypeError(f'BCM: surrogate type {type(surr).__name__} != '
+                            f'template {type(t).__name__}')
+        if surr.nstates != t.nstates:
+            raise ValueError(f'BCM: nstates {surr.nstates} != {t.nstates}')
+        if type(surr.descriptor) is not type(t.descriptor):
+            raise TypeError('BCM: descriptor type mismatch with template')
+        if getattr(surr, 'degeneracy_eps', None) != \
+                                       getattr(t, 'degeneracy_eps', None):
+            raise ValueError('BCM: degeneracy_eps mismatch with template')
 
-        # propagate the prior_covar and numerical_grad variables
-        # to the child surrogates
-        new.prior_covar    = self.prior_covar
-        new.numerical_grad = self.numerical_grad
-        self.surrogates.append(new)
+    #
+    def _pool_geoms_omega(self, surrogates):
+        """Gather (geoms, omega) across surrogates; omega is recovered per
+        surrogate from its retained geometries + its OWN baseline."""
+        gs, ws = [], []
+        for s in surrogates:
+            if s.geoms is None:
+                raise RuntimeError('BCM: surrogate has no retained geometries '
+                                   '(needed to reconcile/consensus baselines)')
+            gs.append(np.asarray(s.geoms, dtype=float))
+            ws.append(s.targets[0] + s._baseline_omega(s.geoms))
+        return np.vstack(gs), np.concatenate(ws)
 
-        return hyper
+    #
+    def _consensus_baseline(self, surrogates):
+        """Common baseline for a re-sort: copy the template baseline and refit
+        it (.update) on the pooled (geoms, omega) of all surrogates -- data-
+        weighted by construction. None if the template carries no baseline."""
+        base = self.surrogate.baseline
+        if base is None:
+            return None
+        cons = copy.deepcopy(base)
+        g, w = self._pool_geoms_omega(surrogates)
+        cons.update(g, w)
+        return cons
+
+    #
+    @timer.timed
+    def build(self, surrogates, n_experts=None):
+        """Build the BCM atomically from a list of pre-built surrogates.
+        Reconciles heterogeneous baselines to a consensus, pools, k-means
+        re-clusters, and rebuilds experts -- no intermediate state. Each
+        surrogate must be compatible with the template (type/nstates/
+        descriptor/degeneracy_eps); baselines are reconciled, not required
+        to match."""
+        for s in surrogates:
+            self._check_compatible(s)
+        M = n_experts if n_experts is not None else max(len(surrogates), 1)
+        self._rebuild(surrogates, M)
+        return self.n_estimators()
+
+    #
+    def _rebuild(self, surrogates, n_experts, enforce_size=False):
+        """Pool a list of surrogates onto a CONSENSUS baseline, k-means re-
+        cluster into n_experts (descriptor space), and rebuild self.surrogates
+        (retaining geoms). Shared by build() and _resort(): the re-sort point
+        is where heterogeneous baselines are reconciled to one common baseline.
+        """
+        # reconcile heterogeneous baselines to a consensus -- only for
+        # baselined surrogates (CP w/ a baseline). cons is None for Adiabat /
+        # no-baseline surrogates, in which case nothing is reconciled.
+        cons = self._consensus_baseline(surrogates)     # pooled (geoms, omega)
+        if cons is not None:
+            self._common = cons                          # the new common baseline
+            for s in surrogates:
+                s._rebase_to(cons)                       # every expert onto it
+
+        nmod     = surrogates[0].n_models()
+        all_desc = np.vstack([s.model_descriptors() for s in surrogates])
+        all_tgt  = np.hstack([s.model_targets()      for s in surrogates])
+        N        = all_desc.shape[0]
+        # retain geoms when the surrogate carries them (CP); Adiabat does not
+        has_geoms = all(getattr(s, 'geoms', None) is not None for s in surrogates)
+        all_geom  = np.vstack([s.geoms for s in surrogates]) if has_geoms else None
+        hp       = np.array([[s.models[m].kernel_.theta for m in range(nmod)]
+                              for s in surrogates], dtype=float)
+        M        = max(n_experts, 1)
+
+        km     = KMeans(n_clusters=M, n_init=10, random_state=0).fit(all_desc)
+        labels = km.labels_
+        if enforce_size:
+            cap   = int(np.ceil(N / M))
+            dists = np.linalg.norm(all_desc[:, None, :]
+                                   - km.cluster_centers_[None, :, :], axis=2)
+            pt_idx, cl_idx = np.unravel_index(np.argsort(dists.ravel()),
+                                              dists.shape)
+            labels = -np.ones(N, dtype=int); counts = np.zeros(M, dtype=int)
+            for pt, cl in zip(pt_idx, cl_idx):
+                if labels[pt] == -1 and counts[cl] < cap:
+                    labels[pt] = cl; counts[cl] += 1
+                if (labels >= 0).all():
+                    break
+
+        template = surrogates[0]                         # reconciled to cons; has models
+        nsrc     = len(surrogates)
+        self.surrogates = []
+        for k in range(M):
+            idx = np.where(labels == k)[0]
+            new = template.copy()
+            new.baseline       = self._common            # share the common by reference
+            new.prior_covar    = self.prior_covar
+            new.numerical_grad = self.numerical_grad
+            new.set_model_data(all_desc[idx], all_tgt[:, idx])
+            if has_geoms:
+                new.geoms = all_geom[idx]                # retain geoms for future re-sorts
+            hp_init = hp[min(k, nsrc - 1)]               # warm-start hyperparameters
+            for m in range(nmod):
+                # fit on the local arrays (representation-agnostic: CP stores
+                # targets, Adiabat stores energies/training -- both go through
+                # set_model_data above, but fit directly avoids touching either)
+                new.models[m].kernel_.theta = hp_init[m]
+                new.models[m].fit(all_desc[idx], all_tgt[m, idx])
+            self.surrogates.append(new)
+        return self.n_estimators()
 
     #
     @timer.timed
@@ -143,6 +291,11 @@ class BCM():
                 k_m * self.surrogates[0].models[m]._y_train_std**2)
             agg_cov[m]  = utils.psd_pinv(prec_sum[m] - (M - 1)*sig_qq_inv)
             agg_mean[m] = agg_cov[m] @ mean_sum[m]
+
+        # fold the shared (deterministic) Delta-learning baseline into the
+        # aggregated omega channel ONCE, before reconstruction (no-op if the
+        # surrogate has no baseline). The experts learn/aggregate Delta-omega.
+        self.surrogates[0].fold_baseline_mean(agg_mean, Xq)
 
         # reconstruct adiabatic energies (and variance) from the
         # aggregated internal-GP mean/cov
@@ -312,6 +465,10 @@ class BCM():
                 coeff_grad[m] = dCinv * e_bcm[m] + Cinv * CdCC[m]
                 coeff_mean[m] = Cinv * e_bcm[m]
 
+            # fold the shared baseline force into the aggregated omega
+            # channel once, before reconstruction (no-op without a baseline)
+            self.surrogates[0].fold_baseline_grad(coeff_grad, Xq[i])
+
             # reconstruct the adiabatic gradient (and covariance) from the
             # aggregated coefficient mean/gradient/gcov
             g_rec, gstd_rec, gcov_rec = \
@@ -473,6 +630,13 @@ class BCM():
         else:
             return hessall
 
+    # NB: no baseline re-fitting hook here by design. A Delta-learning
+    # baseline used with BCM is held FIXED -- refitting it would staleify
+    # every expert's Delta-omega and force a full rebuild, defeating the
+    # partitioning BCM exists for. The baseline is cheap/global; fix it once
+    # up front (build the experts on a fixed surrogate.baseline). In-place
+    # baseline refinement lives on the single CP surrogate (update_baseline).
+
     #
     def save(self, file_name):
         """
@@ -485,88 +649,18 @@ class BCM():
     @timer.timed
     def _resort(self, enforce_size=False):
         """
-        Collect all training data from the current M surrogates, partition
-        it into M+1 clusters of ~Ktarget points using k-means in descriptor
-        space, and rebuild the BCM with one additional surrogate.
+        Re-partition all current experts into M+1 k-means clusters and rebuild.
+        Pools every expert's data onto a fresh CONSENSUS baseline (so a re-sort
+        is also where heterogeneous baselines are reconciled), retains geoms,
+        and warm-starts hyperparameters. Delegates to _rebuild.
 
-        enforce_size : if True, post-process the k-means assignment so that
-                       each cluster contains at most ceil(N / (M+1)) points,
-                       keeping distortion low via greedy assignment by distance.
+        enforce_size : cap each cluster at ceil(N / (M+1)) points via greedy
+                       distance-ordered assignment.
         """
-        M   = len(self.surrogates)
-
-        # if no surrogates exist, exit now
+        M = len(self.surrogates)
         if M == 0:
             return None
-        
-        nmod  = self.surrogates[0].n_models()
-        n_new = M + 1
-
-        # collect the shared descriptors and per-model targets (energies
-        # for Adiabat, {omega, c_k} coefficients for CP) from all experts.
-        # Aggregation/re-fitting happens in the experts' native target
-        # space via the storage hooks, so this is representation-agnostic.
-        all_desc = np.vstack([self.surrogates[j].model_descriptors()
-                               for j in range(M)])             # (N, nf)
-        all_tgt  = np.hstack([self.surrogates[j].model_targets()
-                               for j in range(M)])             # (nmod, N)
-
-        N      = all_desc.shape[0]
-        hp     = np.array([[self.surrogates[i].models[m].kernel_.theta
-                             for m in range(nmod)]
-                             for i in range(M)], dtype=float)
-        nhyper = hp.shape[2]
-
-        # k-means in descriptor space: aim for ~Ktarget points per cluster
-        km     = KMeans(n_clusters=n_new, n_init=10,
-                        random_state=0).fit(all_desc)
-        labels = km.labels_
-
-        if enforce_size:
-            # greedy balanced reassignment: sort all (point, cluster) pairs
-            # by distance to center and assign in order, capping each cluster
-            # at ceil(N / n_new) points
-            cap   = int(np.ceil(N / n_new))
-            dists = np.linalg.norm(
-                        all_desc[:, None, :] - km.cluster_centers_[None, :, :],
-                        axis=2)                                # (N, n_new)
-            pt_idx, cl_idx = np.unravel_index(
-                                 np.argsort(dists.ravel()), dists.shape)
-            labels = -np.ones(N, dtype=int)
-            counts = np.zeros(n_new, dtype=int)
-            for pt, cl in zip(pt_idx, cl_idx):
-                if labels[pt] == -1 and counts[cl] < cap:
-                    labels[pt] = cl
-                    counts[cl] += 1
-                if (labels >= 0).all():
-                    break
-
-        # copy first surrogate as model template (kernel, structure, warm-start
-        # hyperparameters) before clearing the surrogate list
-        template = self.surrogates[0]
-        self.surrogates = []
-        hparams = np.zeros((n_new, nmod, nhyper), dtype=float)
-
-        for k in range(n_new):
-            idx = np.where(labels == k)[0]
-            new = template.copy()
-            new.prior_covar    = self.prior_covar
-            new.numerical_grad = self.numerical_grad
-            # the initial hyper parameters are taken from previous
-            # surrogates. No guarantee hp[i] now algins with data in
-            # surrogate[i], but it's much better than nothing
-            hp_init = hp[min(k,M-1)]
-            # store the re-clustered data in the surrogate's native layout
-            new.set_model_data(all_desc[idx], all_tgt[:, idx])
-            for m in range(nmod):
-                # use the previous hyperparameters as a warm start
-                new.models[m].kernel_.theta = hp_init[m]
-                new.models[m].fit(all_desc[idx], all_tgt[m, idx])
-                hparams[k, m] = new.models[m].kernel_.theta
-            self.surrogates.append(new)
-
-        # return the optimized hyper params
-        return hparams
+        return self._rebuild(self.surrogates, M + 1, enforce_size=enforce_size)
 
     #
     @classmethod

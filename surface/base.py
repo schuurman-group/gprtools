@@ -25,3 +25,9 @@ class Surface(ABC):
     @abstractmethod
     def coupling(self):
         pass
+
+    def update(self, geoms, energies):
+        """optional online-refit hook for refinable surfaces (e.g. a
+           Delta-learning baseline). No-op for ground-truth surfaces, so
+           an active-learning loop can call it uniformly."""
+        return None

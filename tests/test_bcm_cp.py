@@ -53,7 +53,7 @@ def test_single_expert_matches_surrogate():
     Ead = np.vstack([0.5*(Xtr[:, 0]**2 + Xtr[:, 1]**2) - 1.0,
                      0.5*(Xtr[:, 0]**2 + Xtr[:, 1]**2) + 1.0])
     b = bcm_mod.BCM(surrogate.Adiabat(2, IdentityDescriptor()))
-    b.add([Xtr, Ead], states=[0, 1])
+    b.grow([Xtr, Ead], states=[0, 1])
     ad = surrogate.Adiabat(2, IdentityDescriptor())
     ad.create([Xtr, Ead], states=[0, 1])
     err = maxerr_pointwise(b, ad)
@@ -62,7 +62,7 @@ def test_single_expert_matches_surrogate():
 
     # CP: cone
     b = bcm_mod.BCM(surrogate.CP(2, IdentityDescriptor(), degeneracy_eps=1e-6))
-    b.add([Xtr, cone(Xtr)], states=[0, 1])
+    b.grow([Xtr, cone(Xtr)], states=[0, 1])
     cp = surrogate.CP(2, IdentityDescriptor(), degeneracy_eps=1e-6)
     cp.create([Xtr, cone(Xtr)], states=[0, 1])
     err = maxerr_pointwise(b, cp)
@@ -78,8 +78,8 @@ def test_cp_bcm_near_ci():
 
     cp = surrogate.CP(2, IdentityDescriptor(), degeneracy_eps=1e-6)
     b  = bcm_mod.BCM(cp)
-    b.add([X1, cone(X1)], states=[0, 1])
-    b.add([X2, cone(X2)], states=[0, 1])
+    b.grow([X1, cone(X1)], states=[0, 1])
+    b.grow([X2, cone(X2)], states=[0, 1])
 
     worst = 0.0
     for r in (0.2, 0.05, 0.01, 1e-3):
@@ -108,7 +108,7 @@ def test_gradient_single_expert_matches_surrogate():
     Ead = np.vstack([0.5*(Xtr[:, 0]**2 + Xtr[:, 1]**2) - 1.0,
                      0.5*(Xtr[:, 0]**2 + Xtr[:, 1]**2) + 1.0])
     b = bcm_mod.BCM(surrogate.Adiabat(2, IdentityDescriptor()))
-    b.add([Xtr, Ead], states=[0, 1])
+    b.grow([Xtr, Ead], states=[0, 1])
     ad = surrogate.Adiabat(2, IdentityDescriptor())
     ad.create([Xtr, Ead], states=[0, 1])
     err = max(np.max(np.abs(b.gradient(xq) - ad.gradient(xq))) for xq in Xq)
@@ -116,7 +116,7 @@ def test_gradient_single_expert_matches_surrogate():
     assert err < 1e-4, err
 
     b = bcm_mod.BCM(surrogate.CP(2, IdentityDescriptor(), degeneracy_eps=1e-6))
-    b.add([Xtr, cone(Xtr)], states=[0, 1])
+    b.grow([Xtr, cone(Xtr)], states=[0, 1])
     cp = surrogate.CP(2, IdentityDescriptor(), degeneracy_eps=1e-6)
     cp.create([Xtr, cone(Xtr)], states=[0, 1])
     err = max(np.max(np.abs(b.gradient(xq) - cp.gradient(xq))) for xq in Xq)
@@ -136,8 +136,8 @@ def test_cp_bcm_gradient():
     X2 = rng.uniform(-1, 1, size=(150, 2))
 
     b = bcm_mod.BCM(surrogate.CP(2, IdentityDescriptor(), degeneracy_eps=1e-6))
-    b.add([X1, cone(X1)], states=[0, 1])
-    b.add([X2, cone(X2)], states=[0, 1])
+    b.grow([X1, cone(X1)], states=[0, 1])
+    b.grow([X2, cone(X2)], states=[0, 1])
 
     # finite, bounded gradient through the CI (cone slope ~ 1)
     for r in (0.2, 0.02, 1e-3):
@@ -189,7 +189,7 @@ def test_gradient_vs_fd_wellconditioned():
     Ead = lambda X: np.vstack([0.5*(X[:, 0]**2 + X[:, 1]**2) - 1.0,
                                0.5*(X[:, 0]**2 + X[:, 1]**2) + 1.0])
     ba = bcm_mod.BCM(surrogate.Adiabat(2, IdentityDescriptor()))
-    ba.add([X1, Ead(X1)], states=[0, 1]); ba.add([X2, Ead(X2)], states=[0, 1])
+    ba.grow([X1, Ead(X1)], states=[0, 1]); ba.grow([X2, Ead(X2)], states=[0, 1])
 
     # the discriminating check: at a well-conditioned point the analytic-vs-FD
     # gap GROWS as h shrinks -> the gap is FD roundoff (the analytic gradient
@@ -203,6 +203,110 @@ def test_gradient_vs_fd_wellconditioned():
     assert coarse < 5e-2          # gap << |grad|~2.5: analytic is accurate
 
 
+class _QuadBaseline:
+    """Duck-typed 1-state baseline omega_base = 0.5*k*|x|^2 (CP needs only
+    evaluate/gradient) for exercising the Delta-learning fold."""
+    def __init__(self, k=0.3):
+        self.k = k
+    def evaluate(self, gms, states=None):
+        g = np.asarray(gms, float); s = g.ndim == 1; G = g[None, :] if s else g
+        e = (0.5*self.k*np.sum(G**2, axis=1))[None, :]
+        return e[:, 0] if s else e
+    def gradient(self, gms, states=None, numerical=False):
+        g = np.asarray(gms, float); s = g.ndim == 1; G = g[None, :] if s else g
+        gr = (self.k*G)[None, :, :]
+        return gr[:, 0, :] if s else gr
+    def update(self, geoms, energies):                  # for the consensus baseline
+        a = 0.5*np.sum(np.atleast_2d(geoms)**2, axis=1)
+        self.k = float((a @ np.asarray(energies, float)) / (a @ a))
+
+
+def test_merge():
+    """Combine independently-built CP surrogates with DIFFERENT baselines:
+    build() reconciles them to a data-pooled consensus baseline and recovers
+    the surface; add(object) injects a pre-built expert; grow(id) targets an
+    existing one; strict compat checks fire."""
+    kt = 0.4
+    def trueE(X):
+        w = 0.5*kt*np.sum(X**2, axis=1)
+        return np.vstack([w - 0.5, w + 0.5])           # gap=1 -> c0 const
+    rng = np.random.default_rng(20)
+    def mkcp(k0):
+        X = rng.uniform(-1, 1, size=(80, 2))
+        cp = surrogate.CP(2, IdentityDescriptor(), baseline=_QuadBaseline(k0))
+        cp.create([X, trueE(X)], states=[0, 1])
+        return cp
+    cps = [mkcp(k) for k in (0.2, 0.6, 0.9)]           # heterogeneous baselines
+
+    b = bcm_mod.BCM(surrogate.CP(2, IdentityDescriptor(), baseline=_QuadBaseline(0.4)))
+    b.build(cps, n_experts=3)
+    Xq  = rng.uniform(-0.8, 0.8, size=(8, 2))
+    mae = np.mean(np.abs(b.evaluate(Xq) - np.sort(trueE(Xq), axis=0)))
+    kc  = b.surrogates[0].baseline.k
+    print(f'  build merge: consensus k={kc:.3f} (true {kt}); energy MAE={mae:.2e}')
+    assert abs(kc - kt) < 0.05                          # consensus recovered from pooled data
+    assert mae < 5e-2
+    assert all(s.geoms is not None for s in b.surrogates)               # geoms retained
+    assert len(set(round(s.baseline.k, 6) for s in b.surrogates)) == 1  # one common baseline
+
+    # add(object): inject a pre-built expert, reconciled to the common
+    n0 = b.n_estimators()
+    b.add(mkcp(0.7))
+    assert b.n_estimators() == n0 + 1
+    assert np.mean(np.abs(b.evaluate(Xq) - np.sort(trueE(Xq), axis=0))) < 5e-2
+
+    # grow(data, id): data goes to the targeted expert
+    sz0 = b.surrogates[0].train_size()[0]
+    Xg  = rng.uniform(-1, 1, size=(20, 2))
+    b.grow([Xg, trueE(Xg)], id=0, states=[0, 1])
+    print(f'  add(object): experts {n0}->{b.n_estimators()}; '
+          f'grow(id=0): expert0 {sz0}->{b.surrogates[0].train_size()[0]}')
+    assert b.surrogates[0].train_size()[0] == sz0 + 20
+
+    # strict compat
+    for bad in (surrogate.CP(3, IdentityDescriptor()),
+                surrogate.Adiabat(2, IdentityDescriptor())):
+        try:
+            b.add(bad); raise AssertionError('compat check did not fire')
+        except (TypeError, ValueError):
+            pass
+
+
+def test_baseline_single_expert():
+    """A 1-expert BCM with a Delta-learning baseline reproduces the
+    standalone CP+baseline (eval and gradient): the shared omega_base is
+    folded into the aggregated omega channel exactly once, matching the
+    single-surrogate fold."""
+    rng = np.random.default_rng(5)
+    Xtr = rng.uniform(-1, 1, size=(150, 2))
+    Etr = cone(Xtr)
+    Xq  = rng.uniform(-0.7, 0.7, size=(8, 2))
+    Xq  = Xq[np.hypot(Xq[:, 0], Xq[:, 1]) > 0.3]      # away from the CI
+
+    def mk():
+        return surrogate.CP(2, IdentityDescriptor(),
+                            degeneracy_eps=1e-6, baseline=_QuadBaseline())
+
+    cp = mk(); cp.create([Xtr, Etr], states=[0, 1])
+    b  = bcm_mod.BCM(mk()); b.grow([Xtr, Etr], states=[0, 1])
+
+    # M=1 is the identity per single query point (cf. the no-baseline test)
+    de = max(np.max(np.abs(b.evaluate(xq) - cp.evaluate(xq))) for xq in Xq)
+    dg = max(np.max(np.abs(b.gradient(xq) - cp.gradient(xq))) for xq in Xq)
+    # same band as the no-baseline M=1 test (cone + eps=1e-6 root map is
+    # sensitive; well-separated states match to ~1e-15)
+    print(f'  M=1 BCM+baseline vs standalone CP+baseline: dE={de:.2e}, dG={dg:.2e}')
+    assert de < 1e-4, de
+    assert dg < 1e-3, dg
+
+    # the recovered energies are the true cone (baseline folded back, not
+    # the learned Delta-omega)
+    mae = np.mean([np.max(np.abs(b.evaluate(xq).ravel()
+                  - np.sort([-np.hypot(*xq), np.hypot(*xq)]))) for xq in Xq])
+    print(f'  M=1 BCM+baseline energy vs cone: MAE = {mae:.2e}')
+    assert mae < 5e-2, mae
+
+
 def test_resort():
     """_resort collects per-model data via the storage hooks, re-clusters,
     and rebuilds with one extra expert -- for both Adiabat and CP (CP has
@@ -214,8 +318,8 @@ def test_resort():
 
     # CP cone
     b = bcm_mod.BCM(surrogate.CP(2, IdentityDescriptor(), degeneracy_eps=1e-6))
-    b.add([X1, cone(X1)], states=[0, 1])
-    b.add([X2, cone(X2)], states=[0, 1])
+    b.grow([X1, cone(X1)], states=[0, 1])
+    b.grow([X2, cone(X2)], states=[0, 1])
     n0 = b.n_estimators()
     b._resort()
     print(f'  CP:      experts {n0} -> {b.n_estimators()}, '
@@ -230,8 +334,8 @@ def test_resort():
     Ead = lambda X: np.vstack([0.5*(X[:, 0]**2 + X[:, 1]**2) - 1.0,
                                0.5*(X[:, 0]**2 + X[:, 1]**2) + 1.0])
     ba = bcm_mod.BCM(surrogate.Adiabat(2, IdentityDescriptor()))
-    ba.add([X1, Ead(X1)], states=[0, 1])
-    ba.add([X2, Ead(X2)], states=[0, 1])
+    ba.grow([X1, Ead(X1)], states=[0, 1])
+    ba.grow([X2, Ead(X2)], states=[0, 1])
     n0 = ba.n_estimators()
     ba._resort()
     finite = np.all(np.isfinite(ba.evaluate(Xq)))
@@ -251,6 +355,10 @@ if __name__ == '__main__':
     test_cp_bcm_gradient()
     print('analytic gradient == d/dx(evaluate), well-conditioned:')
     test_gradient_vs_fd_wellconditioned()
+    print('Delta-learning baseline folded once (M=1 == standalone):')
+    test_baseline_single_expert()
+    print('merge pre-built surrogates (build / add(object) / grow(id) / consensus):')
+    test_merge()
     print('_resort (storage hooks):')
     test_resort()
     print('\nALL BCM-CP TESTS PASSED')

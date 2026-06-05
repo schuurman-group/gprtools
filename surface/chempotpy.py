@@ -216,7 +216,8 @@ class ChemPotPy(Surface):
                 # Central difference to approximate second derivative w.r.t coordinate k
                 # For each state, calculate second derivative matrix element for k-th column
                 # hessall[:, i, :, k] = (p_grad - m_grad) / (2 * delta)
-                hessall[0, i, :, k] = (p_grad - m_grad) / (2 * delta)
+                # p_grad/m_grad are (nstates, 1, nc); fill every state's column
+                hessall[:, i, :, k] = ((p_grad - m_grad) / (2 * delta))[:, 0, :]
 
             # Symmetrize Hessian for each state and geometry
             for s in range(nstates):

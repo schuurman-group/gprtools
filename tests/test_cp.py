@@ -205,6 +205,110 @@ def test_smooth_through_ci():
     assert ke < 0.05          # and is small in absolute terms (C^inf)
 
 
+class QuadBaseline:
+    """Duck-typed 1-state baseline omega_base = 0.5*k*|x|^2. CP only needs
+    evaluate/gradient from a baseline, so a full Surface isn't required."""
+    def __init__(self, k=0.4):
+        self.k = k
+    def evaluate(self, gms, states=None):
+        g = np.asarray(gms, float); s = g.ndim == 1
+        G = g[None, :] if s else g
+        e = (0.5*self.k*np.sum(G**2, axis=1))[None, :]
+        return e[:, 0] if s else e
+    def gradient(self, gms, states=None, numerical=False):
+        g = np.asarray(gms, float); s = g.ndim == 1
+        G = g[None, :] if s else g
+        gr = (self.k*G)[None, :, :]
+        return gr[:, 0, :] if s else gr
+    def update(self, geoms, energies):
+        """refit k by least squares so 0.5*k*|x|^2 ~ omega (mimics
+        ValenceFF.update refitting Morse depths to the omega-rise)."""
+        a = 0.5*np.sum(np.atleast_2d(geoms)**2, axis=1)
+        y = np.asarray(energies, float)
+        self.k = float((a @ y) / (a @ a))
+
+
+def test_baseline():
+    """omega-only Delta-learning against a baseline: targets store
+    Delta-omega = omega - omega_base (c_k stay raw), evaluate adds
+    omega_base back (recovering E), the analytic gradient carries the
+    baseline force, and save/load round-trips the baseline."""
+    import tempfile, os
+    rng = np.random.default_rng(11)
+    Xtr = rng.uniform(-1, 1, size=(120, 2))
+    Etr = smooth_energies(Xtr, 2)
+    bl  = QuadBaseline()
+
+    cp = surrogate.CP(2, IdentityDescriptor(), baseline=bl)
+    cp.create([Xtr, Etr], states=[0, 1])
+
+    # targets[0] holds omega - omega_base, not omega; c_k untouched
+    omega = Etr.mean(axis=0)
+    wbase = bl.evaluate(Xtr).mean(axis=0)
+    terr  = np.max(np.abs(cp.targets[0] - (omega - wbase)))
+    print(f'  targets[0] == omega - omega_base: max|err| = {terr:.3e}')
+    assert terr < 1e-12, terr
+
+    # Delta-learning reproduces the true energies at the training points
+    emae = np.mean(np.abs(cp.evaluate(Xtr) - np.sort(Etr, axis=0)))
+    print(f'  train-set energy MAE (with baseline) = {emae:.3e}')
+    assert emae < 1e-3, emae
+
+    # raw_predict returns Delta-omega (what an aggregator weights), not E
+    rm, _ = cp.raw_predict(Xtr[:5])
+    rerr  = np.max(np.abs(rm[0] - (omega - wbase)[:5]))
+    print(f'  raw_predict[0] is Delta-omega: max|err| = {rerr:.3e}')
+    assert rerr < 1e-3, rerr
+
+    # analytic gradient includes the baseline force (matches numerical)
+    Xq = rng.uniform(-0.8, 0.8, size=(8, 2))
+    g_ana = cp.gradient(Xq)
+    cp.numerical_grad = True
+    g_num = cp.gradient(Xq)
+    cp.numerical_grad = False
+    gerr = np.max(np.abs(g_ana - g_num))
+    print(f'  max|grad_analytic - grad_numerical| = {gerr:.3e}')
+    assert gerr < 5e-5, gerr
+
+    # save/load must restore the baseline (targets are Delta-omega)
+    d = tempfile.mkdtemp(); p = os.path.join(d, 'cpbl')
+    cp.save(p)
+    cp2 = surrogate.CP(2, IdentityDescriptor())
+    cp2.load(p)
+    lerr = np.max(np.abs(cp2.evaluate(Xq) - cp.evaluate(Xq)))
+    print(f'  save/load: baseline restored={cp2.baseline is not None}, '
+          f'energy max|err|={lerr:.3e}')
+    assert cp2.baseline is not None
+    assert lerr < 1e-12, lerr
+
+
+def test_update_baseline():
+    """update(update_baseline=True) refits the baseline IN PLACE from the
+    surrogate's RETAINED geometries (no external bookkeeping) and re-derives
+    Delta-omega: a too-high baseline relaxes to match omega so the learned
+    residual collapses, with energies still recovered."""
+    rng = np.random.default_rng(12)
+    X  = rng.uniform(-1, 1, size=(150, 2))
+    k_true = 0.4
+    omega  = 0.5*k_true*np.sum(X**2, axis=1)
+    E  = np.vstack([omega - 0.5, omega + 0.5])     # gap=1 -> c0=-0.25 const
+
+    cp = surrogate.CP(2, IdentityDescriptor(), baseline=QuadBaseline(k=0.8))
+    cp.create([X[:75], E[:, :75]], states=[0, 1])
+    res0 = np.max(np.abs(cp.targets[0]))           # |Delta-omega| with wrong k=0.8
+    # append the rest AND refit the baseline in place from the retained geoms
+    cp.update([X[75:], E[:, 75:]], states=[0, 1], update_baseline=True)
+    res1 = np.max(np.abs(cp.targets[0]))           # baseline matches omega -> ~0
+    mae  = np.mean(np.abs(cp.evaluate(X) - np.sort(E, axis=0)))
+    print(f'  update_baseline: k 0.8->{cp.baseline.k:.3f} (true {k_true}); '
+          f'geoms retained {cp.geoms.shape}; |Delta-omega| {res0:.3f}->{res1:.3f}; '
+          f'energy MAE {mae:.2e}')
+    assert cp.geoms.shape == (150, 2)               # geometries retained in-surrogate
+    assert abs(cp.baseline.k - k_true) < 0.05
+    assert res1 < 0.1*res0                          # residual collapsed
+    assert mae < 1e-3
+
+
 def test_diabatic_deferred():
     cp = surrogate.CP(2, IdentityDescriptor(), representation='diabatic')
     X = np.random.default_rng(3).uniform(-1, 1, size=(10, 2))
@@ -252,6 +356,10 @@ if __name__ == '__main__':
     test_degeneracy_eps()
     print('smoothness through CI (softplus floor removes cusp):')
     test_smooth_through_ci()
+    print('Delta-learning baseline (omega-only):')
+    test_baseline()
+    print('update(update_baseline=True): in-place rebaseline from retained geoms:')
+    test_update_baseline()
     print('diabatic deferral:')
     test_diabatic_deferred()
     print('Adiabat._num_gradient multistate regression:')

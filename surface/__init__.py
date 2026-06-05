@@ -9,5 +9,6 @@ from .base import Surface
 from .graci import Graci
 from .kdc import Kdc, Kdc_ham
 from .chempotpy import ChemPotPy
+from .valence import ValenceFF
 
-__all__ = ['Surface', 'Graci', 'Kdc', 'Kdc_ham', 'ChemPotPy']
+__all__ = ['Surface', 'Graci', 'Kdc', 'Kdc_ham', 'ChemPotPy', 'ValenceFF']

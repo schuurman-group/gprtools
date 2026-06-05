@@ -18,6 +18,7 @@ Implementation is staged:
   Stage A.5(todo)  -- incremental add()/grow()/_resort()
 """
 import os
+import copy as copy
 import numpy as np
 import pickle as pickle
 from sklearn.cluster import KMeans
@@ -39,6 +40,10 @@ class GRBCM():
         self.Kmax           = 2000        # resort when an expert exceeds this
         self.Ktarget        = 1000        # target points per subset
         self.surrogate      = surrogate   # template (untrained) surrogate
+        # common Delta-learning baseline shared (by reference) by comm + all
+        # enhanced experts: the template's initially, a data-pooled consensus
+        # at each re-sort. Held FIXED.
+        self._common        = surrogate.baseline
         self.nstates        = surrogate.nstates
         self.comm           = None        # communication expert M_c
         self.surrogates     = []          # enhanced experts M_{+i}
@@ -108,7 +113,8 @@ class GRBCM():
         train a single surrogate (communication or enhanced) from a
         geometry/energy subset, propagating the GRBCM-level settings
         """
-        new = self.surrogate.copy()
+        new          = self.surrogate.copy()
+        new.baseline = self._common                  # born on the common baseline
         new.create([geoms, eners], states=states,
                                    hparam=hparam, nrestart=nrestart)
         new.prior_covar    = self.prior_covar
@@ -116,25 +122,83 @@ class GRBCM():
         return new
 
     #
-    def _fit_expert_descr(self, descr, targets, template):
+    def _fit_expert_descr(self, descr, targets, template, geoms=None):
         """
         build a trained surrogate directly from descriptor-space data,
         copying template for the model structure (kernel + warm-start
-        hyperparameters). Used by add() and _resort(), where the raw
-        geometries are no longer available -- only stored descriptors.
+        hyperparameters). Used by build()/add()/_resort().
 
           descr.shape   = (npts, nfeat)
           targets.shape = (nmodel, npts)   internal targets (energies for
                           Adiabat, {omega, c_k} coefficients for CP)
+          geoms         = (npts, nc) raw cartesians, retained (when given) so a
+                          future re-sort can pool omega; None for Adiabat.
         """
-        new = template.copy()
+        new          = template.copy()
+        new.baseline = self._common                  # share the common baseline
         new.prior_covar    = self.prior_covar
         new.numerical_grad = self.numerical_grad
         descr = np.asarray(descr, dtype=float)
         new.set_model_data(descr, targets)
+        if geoms is not None:
+            new.geoms = np.asarray(geoms, dtype=float)
         for m in range(new.n_models()):
             new.models[m].fit(descr, np.asarray(targets[m], dtype=float))
         return new
+
+    #
+    # -- merging pre-built surrogates (heterogeneous baselines) ----------
+    def _check_compatible(self, surr):
+        """Strict compat for an injected surrogate: same type/nstates/
+        descriptor/degeneracy_eps. Baselines are reconciled, not checked."""
+        t = self.surrogate
+        if type(surr) is not type(t):
+            raise TypeError(f'GRBCM: surrogate type {type(surr).__name__} != '
+                            f'template {type(t).__name__}')
+        if surr.nstates != t.nstates:
+            raise ValueError(f'GRBCM: nstates {surr.nstates} != {t.nstates}')
+        if type(surr.descriptor) is not type(t.descriptor):
+            raise TypeError('GRBCM: descriptor type mismatch with template')
+        if getattr(surr, 'degeneracy_eps', None) != \
+                                       getattr(t, 'degeneracy_eps', None):
+            raise ValueError('GRBCM: degeneracy_eps mismatch with template')
+
+    #
+    def _consensus_from(self, geoms, omega):
+        """Build a consensus baseline = copy(template baseline) refit on the
+        supplied pooled (geoms, omega). None if the template has no baseline."""
+        base = self.surrogate.baseline
+        if base is None:
+            return None
+        cons = copy.deepcopy(base)
+        cons.update(geoms, omega)
+        return cons
+
+    #
+    def _partition_build(self, all_desc, all_tgt, all_geom, template,
+                         n_experts, enforce_size=False):
+        """Draw a fresh communication subset + (n_experts-1) enhanced experts
+        from pooled descriptor/target/geom data (already reconciled to the
+        common baseline) and rebuild self.comm + self.surrogates."""
+        N        = all_desc.shape[0]
+        M        = max(n_experts, 2)
+        n_groups = M - 1
+        n_comm   = max(N // M, 1)
+        comm_idx, groups = self._partition(N, n_comm, n_groups, all_desc,
+                                           enforce_size=enforce_size)
+
+        gsel = (lambda idx: all_geom[idx]) if all_geom is not None \
+                                           else (lambda idx: None)
+        self.comm = self._fit_expert_descr(all_desc[comm_idx],
+                                           all_tgt[:, comm_idx], template,
+                                           gsel(comm_idx))
+        self.surrogates = []
+        for grp in groups:
+            aug = np.concatenate([comm_idx, grp])
+            self.surrogates.append(
+                self._fit_expert_descr(all_desc[aug], all_tgt[:, aug],
+                                       template, gsel(aug)))
+        return self.n_estimators()
 
     #
     @timer.timed
@@ -153,7 +217,14 @@ class GRBCM():
         remaining N - n_comm points are split into M-1 disjoint k-means
         clusters {D_i}, and an enhanced expert is trained on each
         D_{+i} = D_c u D_i.
+
+        `data` may instead be a LIST OF PRE-BUILT SURROGATES, in which case
+        their (heterogeneous-baseline) data is pooled onto a consensus
+        baseline, reconciled, and partitioned into a fresh comm + enhanced set.
         """
+        if hasattr(data[0], 'model_targets'):        # a list of surrogates
+            return self._build_from_surrogates(data, n_experts)
+
         geoms = data[0]
         eners = data[1]
         N     = geoms.shape[0]
@@ -185,65 +256,114 @@ class GRBCM():
 
         return self.n_estimators()
 
+    #
+    @timer.timed
+    def _build_from_surrogates(self, surrogates, n_experts=None):
+        """Atomic merge: pool pre-built surrogates onto a consensus baseline,
+        reconcile, and partition into a fresh comm + enhanced set."""
+        for s in surrogates:
+            self._check_compatible(s)
+
+        # consensus + reconcile (baselined surrogates only; full pool, since
+        # independently-built surrogates do not share a D_c)
+        if self.surrogate.baseline is not None:
+            gs = np.vstack([np.asarray(s.geoms, float) for s in surrogates])
+            ws = np.concatenate([s.targets[0] + s._baseline_omega(s.geoms)
+                                 for s in surrogates])
+            cons = self._consensus_from(gs, ws)
+            self._common = cons
+            for s in surrogates:
+                if hasattr(s, '_rebase_to'):
+                    s._rebase_to(cons)
+
+        all_desc  = np.vstack([s.model_descriptors() for s in surrogates])
+        all_tgt   = np.hstack([s.model_targets()      for s in surrogates])
+        has_geoms = all(getattr(s, 'geoms', None) is not None for s in surrogates)
+        all_geom  = np.vstack([s.geoms for s in surrogates]) if has_geoms else None
+        M = n_experts if n_experts is not None else max(len(surrogates), 2)
+        return self._partition_build(all_desc, all_tgt, all_geom,
+                                     surrogates[0], M)
+
     # -----------------------------------------------------------------
     # Stage A.5: incremental construction
     # -----------------------------------------------------------------
 
     #
     @timer.timed
-    def add(self, data, states=[], hparam=None, nrestart=None):
+    def add(self, surr, resort=False, enforce_size=False):
         """
-        add a new local data subset to the GRBCM.
-
-        The first call establishes the communication subset D_c. Every
-        subsequent call trains a new enhanced expert M_{+i} on the
-        augmented set D_c u D_new.
-
-          data = [geometries, energies], energies of shape
-          (nstates, npts). The GRBCM is built over all states.
+        Add a PRE-BUILT surrogate OBJECT (strict compat; baseline reconciled
+        to the common). The first add establishes the COMMUNICATION expert --
+        the object is a valid standalone comm. Each subsequent add EXTRACTS the
+        object's data and builds a new ENHANCED expert on D_c u (its data):
+        an arbitrary object can't be grafted as an enhanced expert (it must
+        contain D_c, or GRBCM's -(B-1)Sigma_c^-1 correction over-subtracts).
+        resort=True re-sorts the whole GRBCM afterwards.
         """
-        geoms = data[0]
-        eners = data[1]
-        sts   = list(range(self.nstates))
+        self._check_compatible(surr)
+        surr.prior_covar    = self.prior_covar
+        surr.numerical_grad = self.numerical_grad
+        if hasattr(surr, '_rebase_to'):
+            surr._rebase_to(self._common)            # reconcile to the common baseline
 
-        # first call -- this data establishes the communication subset
-        if self.comm is None:
-            self.comm = self._make_expert(geoms, eners, sts,
-                                          hparam, nrestart)
-            return self.n_estimators()
+        if self.comm is None:                        # first -> the object IS the comm
+            self.comm = surr
+        else:                                        # enhanced expert on D_c u surr-data
+            aug_descr = np.vstack([self.comm.model_descriptors(),
+                                   surr.model_descriptors()])
+            aug_tgt   = np.hstack([self.comm.model_targets(),
+                                   surr.model_targets()])
+            aug_geom  = None
+            if getattr(self.comm, 'geoms', None) is not None and \
+               getattr(surr, 'geoms', None) is not None:
+                aug_geom = np.vstack([self.comm.geoms, surr.geoms])
+            self.surrogates.append(
+                self._fit_expert_descr(aug_descr, aug_tgt, self.comm, aug_geom))
 
-        # otherwise -- a new enhanced expert on D_c u D_new. Work in the
-        # surrogate's internal target space: the comm expert already
-        # stores its targets, and the new energies are mapped with
-        # to_targets (identity for Adiabat, energies->coefficients for CP).
-        descr_new = self.surrogate.descriptor.generate(geoms)
-        aug_descr = np.vstack([self.comm.model_descriptors(), descr_new])
-        aug_tgt   = np.hstack([self.comm.model_targets(),
-                               self.comm.to_targets(eners)])
-        self.surrogates.append(
-            self._fit_expert_descr(aug_descr, aug_tgt, self.comm))
+        if resort:
+            return self._resort(enforce_size=enforce_size)
         return self.n_estimators()
 
     #
     @timer.timed
-    def grow(self, data, states=[], hparam=None, nrestart=None,
-                                                 enforce_size=False):
+    def grow(self, data, id=None, states=[], hparam=None, nrestart=None,
+                                                          enforce_size=False):
         """
-        incrementally grow the GRBCM with a new data subset.
+        Grow the GRBCM by raw data. The first call establishes the
+        communication subset D_c. Afterwards `id` selects which ENHANCED
+        expert receives the data (-1 = last); None/out-of-range creates a NEW
+        enhanced expert on D_c u data. A targeted expert exceeding Kmax
+        triggers a re-sort. (`id` addresses enhanced experts only; the comm is
+        special and is established on the first grow.)
+        """
+        sts          = list(range(self.nstates)) if len(states) == 0 else states
+        geoms, eners = data[0], data[1]
 
-          no communication expert : establish D_c.
-          no enhanced experts yet : create the first enhanced expert.
-          otherwise               : extend the most recent enhanced
-            expert; if it then exceeds Kmax, trigger a _resort().
-        """
-        if self.comm is None or len(self.surrogates) == 0:
-            self.add(data, states=states,
-                           hparam=hparam, nrestart=nrestart)
-        else:
-            self.surrogates[-1].update(data,
-                                       states=list(range(self.nstates)),
-                                       hparam=hparam, nrestart=nrestart)
-            if max(self.surrogates[-1].train_size()) > self.Kmax:
+        if self.comm is None:                        # first call -> communication expert
+            self.comm = self._make_expert(geoms, eners, sts, hparam, nrestart)
+            return self.n_estimators()
+
+        M   = len(self.surrogates)
+        tgt = None
+        if id is not None:
+            j = id if id >= 0 else M + id             # -1 -> last enhanced
+            if 0 <= j < M:
+                tgt = j
+
+        if tgt is None:                              # new enhanced expert on D_c u data
+            descr_new = self.surrogate.descriptor.generate(geoms)
+            aug_descr = np.vstack([self.comm.model_descriptors(), descr_new])
+            aug_tgt   = np.hstack([self.comm.model_targets(),
+                                   self.comm.project_targets(eners, geoms)])
+            aug_geom  = None
+            if getattr(self.comm, 'geoms', None) is not None:
+                aug_geom = np.vstack([self.comm.geoms, np.asarray(geoms, float)])
+            self.surrogates.append(
+                self._fit_expert_descr(aug_descr, aug_tgt, self.comm, aug_geom))
+        else:                                        # extend an existing enhanced expert
+            self.surrogates[tgt].update(data, states=sts,
+                                        hparam=hparam, nrestart=nrestart)
+            if max(self.surrogates[tgt].train_size()) > self.Kmax:
                 self._resort(enforce_size=enforce_size)
         return self.n_estimators()
 
@@ -343,6 +463,11 @@ class GRBCM():
 
             agg_cov[m]  = utils.psd_pinv(prec_A)
             agg_mean[m] = agg_cov[m] @ rhs_A
+
+        # fold the shared (deterministic) Delta-learning baseline into the
+        # aggregated omega channel ONCE, before reconstruction (no-op if the
+        # surrogate has no baseline)
+        self.comm.fold_baseline_mean(agg_mean, Xq)
 
         # reconstruct adiabatic energies (and variance) from the
         # aggregated per-model mean/cov
@@ -588,6 +713,10 @@ class GRBCM():
                     prec -= (B[g] - 1.)*utils.psd_pinv(rc[3][m, g])
                     cov_coeff[m, g] = utils.psd_pinv(prec)
 
+        # fold the shared baseline force into the aggregated omega-channel
+        # gradient once, before reconstruction (no-op without a baseline)
+        self.comm.fold_baseline_grad(grad_coeff, Xq)
+
         # reconstruct adiabatic gradients from the aggregated per-model
         # mean/gradient/gcov, one geometry at a time
         for g in range(ngm):
@@ -755,46 +884,57 @@ class GRBCM():
 
         enforce_size : balance the k-means clusters (see _partition).
         """
-        n_c = self.comm.model_descriptors().shape[0]
+        if self.comm is None:
+            return None
+        n_c     = self.comm.model_descriptors().shape[0]
+        experts = [self.comm] + self.surrogates
 
-        # collect all data: D_c, then each local subset D_i. Everything is
-        # in the surrogate's internal target space (coefficients for CP),
-        # via the storage hooks -- representation-agnostic.
+        # Build a consensus baseline from the UNIQUE pooled (geoms, omega) --
+        # comm in full + each enhanced expert's LOCAL part (rows beyond the
+        # leading n_c D_c rows, avoiding D_c double-counting) -- then reconcile
+        # every expert onto it. (Baselined + geom-carrying surrogates only;
+        # Adiabat / no-baseline skip this.)
+        has_geoms = all(getattr(e, 'geoms', None) is not None for e in experts)
+        if self.surrogate.baseline is not None and has_geoms:
+            gs = [np.asarray(self.comm.geoms, float)]
+            ws = [self.comm.targets[0]
+                  + self.comm._baseline_omega(self.comm.geoms)]
+            for e in self.surrogates:
+                w = e.targets[0] + e._baseline_omega(e.geoms)
+                gs.append(np.asarray(e.geoms, float)[n_c:]); ws.append(w[n_c:])
+            cons = self._consensus_from(np.vstack(gs), np.concatenate(ws))
+            self._common = cons
+            for e in experts:
+                if hasattr(e, '_rebase_to'):
+                    e._rebase_to(cons)
+
+        # pool the UNIQUE descriptor/target/geom data (now reconciled)
         descr_blocks = [self.comm.model_descriptors()]
         tgt_blocks   = [self.comm.model_targets()]
-        for expert in self.surrogates:
-            descr_blocks.append(expert.model_descriptors()[n_c:])
-            tgt_blocks.append(expert.model_targets()[:, n_c:])
-        all_descr = np.vstack(descr_blocks)            # (N, nfeat)
-        all_tgt   = np.hstack(tgt_blocks)              # (nmodel, N)
-        N         = all_descr.shape[0]
+        geom_blocks  = [np.asarray(self.comm.geoms, float)] if has_geoms else None
+        for e in self.surrogates:
+            descr_blocks.append(e.model_descriptors()[n_c:])
+            tgt_blocks.append(e.model_targets()[:, n_c:])
+            if has_geoms:
+                geom_blocks.append(np.asarray(e.geoms, float)[n_c:])
+        all_descr = np.vstack(descr_blocks)
+        all_tgt   = np.hstack(tgt_blocks)
+        all_geom  = np.vstack(geom_blocks) if has_geoms else None
 
-        # communication expert + (M + 1) enhanced experts
-        n_experts = len(self.surrogates) + 2
-        n_groups  = n_experts - 1
-        n_comm    = N // n_experts
-
-        comm_idx, groups = self._partition(N, n_comm, n_groups,
-                                           all_descr,
-                                           enforce_size=enforce_size)
-
-        # the (old) communication expert is the model-structure template
-        template = self.comm
-
-        # rebuild the communication expert, then the enhanced experts
-        self.comm = self._fit_expert_descr(all_descr[comm_idx],
-                                           all_tgt[:, comm_idx],
-                                           template)
-        self.surrogates = []
-        for g in groups:
-            aug = np.concatenate([comm_idx, g])
-            self.surrogates.append(
-                self._fit_expert_descr(all_descr[aug],
-                                       all_tgt[:, aug], template))
+        # communication expert + (M + 1) enhanced experts; comm is the template
+        return self._partition_build(all_descr, all_tgt, all_geom,
+                                     self.comm, len(self.surrogates) + 2,
+                                     enforce_size=enforce_size)
 
     # -----------------------------------------------------------------
     # persistence
     # -----------------------------------------------------------------
+
+    # NB: no baseline re-fitting hook here by design (see BCM). A Delta-
+    # learning baseline used with GRBCM is held FIXED -- refitting it would
+    # staleify every expert's Delta-omega and force a full rebuild, defeating
+    # the partitioning. Fix the baseline once up front; in-place baseline
+    # refinement lives on the single CP surrogate (update_baseline).
 
     #
     def save(self, file_name):

@@ -95,7 +95,8 @@ class CP(Surrogate):
                        kernel='RBF',
                        hparam=[10, 1],
                        representation='adiabatic',
-                       degeneracy_eps=1.0e-3):
+                       degeneracy_eps=1.0e-3,
+                       baseline=None):
         super().__init__()
 
         if representation not in ('adiabatic', 'diabatic'):
@@ -122,6 +123,13 @@ class CP(Surrogate):
         # CI) for MECI optimisation. Default 1e-3 Eh (~0.027 eV); raise it
         # for a gentler, larger floor (the transition softens with eps).
         self.degeneracy_eps = degeneracy_eps
+        # optional Delta-learning baseline (surface.Surface or None): when
+        # set, the omega channel learns Delta-omega = omega - <baseline>;
+        # the c_k are learned raw. omega is a pure additive shift on every
+        # state (E_i = omega + z_i; the roots z_i and the jacobian depend
+        # only on the c_k), so the baseline never enters root-finding,
+        # the c0 floor, or the delta-method variance.
+        self.baseline       = baseline
         # one-shot diagnostic flags: reconstruction near a seam fires the
         # complex-root / exact-coincidence notices on essentially every
         # query (e.g. throughout a MECI search), so warn once per instance
@@ -130,6 +138,9 @@ class CP(Surrogate):
         self.models         = []
         self.descriptors    = None      # shared (npts, nfeat) over all targets
         self.targets        = None      # (nstates, npts): omega + CP coeffs
+        self.geoms          = None      # (npts, nc) raw cartesians, retained so
+                                        # the baseline can be refit in place
+                                        # (SOAP descriptors aren't invertible)
         self.prior_covar    = False
         self.numerical_grad = False
 
@@ -160,6 +171,49 @@ class CP(Surrogate):
             if not key.startswith('__'):
                 setattr(new, key, copy.deepcopy(value))
         return new
+
+    #
+    def _baseline_omega(self, gms):
+        """omega_base at gms = mean over the baseline's states (the
+        omega = Tr/N definition). Returns 0.0 (broadcasts) if no baseline.
+        gms is (ngm, nc) -> (ngm,)."""
+        if self.baseline is None:
+            return 0.0
+        return self.baseline.evaluate(gms).mean(axis=0)
+
+    #
+    def _baseline_omega_grad(self, gms):
+        """d omega_base / dR at gms = mean over the baseline's states.
+        Returns 0.0 if no baseline. gms is (ngm, nc) -> (ngm, nc)."""
+        if self.baseline is None:
+            return 0.0
+        return self.baseline.gradient(gms).mean(axis=0)
+
+    #
+    def project_targets(self, energies, gms):
+        """energies -> stored targets with omega Delta-learnt against the
+        baseline (omega row gets omega_base subtracted; c_k stay raw). The
+        baseline-aware generalisation of to_targets; used by create/update
+        and by aggregator add()/build() paths so stored targets are Delta-
+        omega everywhere."""
+        t = self._to_targets(energies)
+        t[0] -= self._baseline_omega(gms)
+        return t
+
+    #
+    def fold_baseline_mean(self, coeff_mean, gms):
+        """Add omega_base back into AGGREGATED coefficient means (omega is
+        model 0). Called by BCM/GRBCM once after coefficient-space
+        aggregation; no-op if there is no baseline."""
+        coeff_mean[0] += self._baseline_omega(gms)
+        return coeff_mean
+
+    #
+    def fold_baseline_grad(self, coeff_grad, gms):
+        """Add d omega_base/dR back into AGGREGATED coefficient gradients
+        (omega channel); no-op if there is no baseline."""
+        coeff_grad[0] += self._baseline_omega_grad(gms)
+        return coeff_grad
 
     #
     def _require_full_state_set(self, states, op):
@@ -215,8 +269,11 @@ class CP(Surrogate):
         self._require_full_state_set(states, 'create')
         X, E = data
 
-        self.targets     = self._to_targets(E)
+        # project to targets, Delta-learning omega against the baseline
+        # (c_k stay raw); project_targets is a no-op shift if baseline=None
+        self.targets     = self.project_targets(E, X)
         self.descriptors = self.descriptor.generate(X)
+        self.geoms       = np.asarray(X, dtype=float).copy()   # retain raw geoms
 
         nres = 1 if nrestart is None else nrestart
         self.models = []
@@ -236,15 +293,29 @@ class CP(Surrogate):
 
     #
     @timer.timed
-    def update(self, data, states=[], hparam=None, nrestart=None):
-        """Append new (geometry, energies), recompute targets, refit."""
+    def update(self, data, states=[], hparam=None, nrestart=None,
+                                                   update_baseline=False):
+        """Append new (geometry, energies), recompute targets, refit.
+
+        update_baseline=True additionally refits the Delta-learning baseline
+        on ALL retained geometries (the omega channel) and re-derives every
+        Delta-omega target against it -- the occasional in-loop baseline
+        refresh. OFF by default (the incremental, fixed-baseline path; the
+        surrogate now retains the cartesians passed to create/update, so no
+        external bookkeeping is needed). Use sparingly and only on data that
+        reaches dissociation -- De is a dissociation-region parameter and
+        collapses if fit from near-equilibrium data (see _rebaseline)."""
         self._require_full_state_set(states, 'update')
         X, E = data
 
-        new_t = self._to_targets(E)
+        new_t = self.project_targets(E, X)           # Delta-omega for new points
         new_d = self.descriptor.generate(X)
+        self.geoms       = np.vstack([self.geoms, np.asarray(X, dtype=float)])
         self.descriptors = np.vstack([self.descriptors, new_d])
         self.targets     = np.hstack([self.targets, new_t])
+
+        if update_baseline and self.baseline is not None:
+            self._rebaseline()
 
         for m in range(self.nstates):
             if hparam is not None:
@@ -258,6 +329,44 @@ class CP(Surrogate):
                                                            dtype=float)
 
     #
+    def _rebaseline(self):
+        """Refit the baseline on all retained geometries (omega channel) and
+        re-derive every Delta-omega target against it (the c_k are
+        unaffected). Requires self.geoms (set by create/update). NB: De is a
+        dissociation-region parameter; ValenceFF.update constrains the fit
+        (shared De per element-pair + a floor) so it stays well-behaved on
+        partial data, but De only MOVES meaningfully once the retained data
+        spans the dissociation region -- so trigger this then (e.g. once the
+        trajectory is on the hot, dissociating ground state)."""
+        if self.geoms is None:
+            raise RuntimeError('CP._rebaseline: no retained geometries '
+                               '(build via create/update, not set_model_data).')
+        omega = self.targets[0] + self._baseline_omega(self.geoms)   # true omega
+        self.baseline.update(self.geoms, omega)                      # refit De
+        self.targets[0] = omega - self._baseline_omega(self.geoms)   # Delta-omega
+
+    #
+    def _rebase_to(self, new_baseline):
+        """Re-express this surrogate's omega channel against a DIFFERENT
+        baseline (used when merging surrogates with heterogeneous baselines
+        into an aggregator -- everyone is reconciled to one common baseline).
+
+        Recovers true omega from the retained geometries + the CURRENT
+        baseline, re-derives Delta-omega against new_baseline, swaps it in,
+        and re-fits ONLY model[0]: the c_k are coefficients of the traceless
+        splitting Z = E - omega, hence baseline-invariant, so models[1:] and
+        targets[1:] are untouched. A no-op (up to a refit) if new_baseline is
+        functionally identical. Handles None either way (omega_base = 0).
+        Requires self.geoms (set by create/update)."""
+        if self.geoms is None:
+            raise RuntimeError('CP._rebase_to: no retained geometries '
+                               '(build via create/update).')
+        omega         = self.targets[0] + self._baseline_omega(self.geoms)  # old baseline
+        self.baseline = new_baseline
+        self.targets[0] = omega - self._baseline_omega(self.geoms)          # new baseline
+        self.models[0].fit(self.descriptors, self.targets[0])              # omega GP only
+
+    #
     def load(self, model_name):
         """Load the CP model bundle from file."""
         with open(f"{model_name}_cp.pkl", 'rb') as f:
@@ -265,6 +374,11 @@ class CP(Surrogate):
         self.models      = bundle['models']
         self.targets     = bundle['targets']
         self.descriptors = bundle['descriptors']
+        self.geoms       = bundle.get('geoms', None)   # for in-place rebaseline
+        # targets store Delta-omega, so the baseline is needed to add omega
+        # back; .get for back-compat with pre-baseline bundles. A non-
+        # picklable baseline (e.g. ChemPotPy) must be re-attached by hand.
+        self.baseline    = bundle.get('baseline', None)
 
     #
     def save(self, model_name):
@@ -273,6 +387,8 @@ class CP(Surrogate):
             'models':      self.models,
             'targets':     self.targets,
             'descriptors': self.descriptors,
+            'geoms':       self.geoms,
+            'baseline':    self.baseline,
         }
         with open(f"{model_name}_cp.pkl", 'wb') as fid:
             pickle.dump(bundle, fid)
@@ -439,6 +555,9 @@ class CP(Surrogate):
         need_cov = std or cov
 
         raw_mean, raw_cov = self.raw_predict(Xq, need_cov=need_cov)
+        # fold the (deterministic) baseline back into the omega channel
+        # before reconstruction; variance is unaffected
+        raw_mean[0] += self._baseline_omega(Xq)
         evals, estd, ecov = self.reconstruct_energy(
                                 raw_mean, raw_cov, sts, std, cov)
 
@@ -595,9 +714,13 @@ class CP(Surrogate):
 
     def set_model_data(self, descriptors, targets):
         """Replace the (unfitted) training storage; targets (nstates, npts)
-        are coefficient targets. The caller refits the models."""
+        are coefficient targets. The caller refits the models. Raw geometries
+        are not available in this descriptor-space path (used by aggregator
+        _resort), so geoms is cleared -- in-place rebaseline is unavailable
+        on a surrogate rebuilt this way."""
         self.descriptors = np.asarray(descriptors, dtype=float)
         self.targets     = np.asarray(targets, dtype=float)
+        self.geoms       = None
 
     #
     @timer.timed
@@ -634,6 +757,11 @@ class CP(Surrogate):
             if need_cov:
                 gcov_cart[m] = np.einsum(
                     'aik,akl,ajl->aij', d_grad, cov_d, d_grad)
+
+        # add the baseline force into the omega channel; jac[:,:,0]=1 then
+        # spreads d omega_base/dR onto every state. (z/jac are omega-
+        # independent, so raw_mean[0] is left as-is here.)
+        grad_cart[0] += self._baseline_omega_grad(Xq)
 
         _, z, _, c2_slope = self._reconstruct(raw_mean)
         jac = self._state_jacobian(z, c2_slope)     # (ng, nstates, ntar)
@@ -700,6 +828,11 @@ class CP(Surrogate):
             grad_cart[m] = np.einsum('aij,aj->ai', d_grad, grad_d)
             if cov:
                 gcov_cart[m] = d_grad @ gcov_d @ d_grad.swapaxes(-2, -1)
+
+        # fold the baseline back into the omega channel (mean for E,
+        # gradient for the force) before reconstruction
+        raw_mean[0]  += self._baseline_omega(Xq)
+        grad_cart[0] += self._baseline_omega_grad(Xq)
 
         _, z, E, c2_slope = self._reconstruct(raw_mean)
         jac = self._state_jacobian(z, c2_slope)     # (ngm, nstates, ntar)
