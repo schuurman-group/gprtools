@@ -540,12 +540,18 @@ class CP(Surrogate):
 
     #
     @timer.timed
-    def evaluate(self, gms, states=None, std=False, cov=False):
+    def evaluate(self, gms, states=None, std=False, cov=False, gradient=False):
         """
         Evaluate the recovered states E_0..E_{N-1} (ascending), or the
         requested `states`. Variance, if asked for, is the delta-method
-        propagation through the root map.
+        propagation through the root map. With gradient=True, additionally
+        return the state gradients (and gradient covariance) via
+        _evaluate_and_gradient -- i.e. returns (e, estd, g, gcov) rather than
+        just energies.
         """
+        if gradient:
+            return self._evaluate_and_gradient(gms, states=states,
+                                                std=std, cov=cov)
         if states is None:
             sts = list(range(self.nstates))
         else:
@@ -792,7 +798,7 @@ class CP(Surrogate):
 
     #
     @timer.timed
-    def evaluate_and_gradient(self, gms, states=None, descrip=None,
+    def _evaluate_and_gradient(self, gms, states=None, descrip=None,
                               grad_descrip=None, std=False, cov=False):
         """
         Jointly evaluate states and gradients, sharing the kernel

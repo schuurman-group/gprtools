@@ -259,10 +259,15 @@ class Adiabat(Surrogate):
 
     #
     @timer.timed
-    def evaluate(self, gms, states=None, std=False, cov=False):
+    def evaluate(self, gms, states=None, std=False, cov=False, gradient=False):
         """
-        evaluate teh surrogate at gms
+        evaluate the surrogate at gms. With gradient=True, additionally return
+        the gradients (and gradient covariance) via _evaluate_and_gradient --
+        returns (e, estd, g, gcov) rather than just energies.
         """
+        if gradient:
+            return self._evaluate_and_gradient(gms, states=states,
+                                                std=std, cov=cov)
 
         # if no specific states are requested, return all state
         # energies
@@ -394,7 +399,7 @@ class Adiabat(Surrogate):
 
     #
     @timer.timed
-    def evaluate_and_gradient(self, gms, states=None, descrip=None,
+    def _evaluate_and_gradient(self, gms, states=None, descrip=None,
                               grad_descrip=None, std=False, cov=False):
         """
         Jointly evaluate energy (with optional std) and gradient (with
@@ -854,15 +859,20 @@ class OrderedAdiabat(Adiabat):
 
     #
     @timer.timed
-    def evaluate(self, gms, states=None, std=False, cov=False):
+    def evaluate(self, gms, states=None, std=False, cov=False, gradient=False):
         """
         Evaluate the adiabats E_0..E_{N-1} (or the requested subset
         of `states`, which is interpreted as adiabat indices, not the
         internal lower-plus-gap indices).
 
         Variance returned is for the reconstructed E_i via the
-        delta-method propagation.
+        delta-method propagation. With gradient=True, additionally return the
+        gradients (and gradient covariance) via _evaluate_and_gradient --
+        returns (e, estd, g, gcov) rather than just energies.
         """
+        if gradient:
+            return self._evaluate_and_gradient(gms, states=states,
+                                                std=std, cov=cov)
         if states is None:
             sts = list(range(self.nstates))
         else:
@@ -978,12 +988,12 @@ class OrderedAdiabat(Adiabat):
 
     #
     @timer.timed
-    def evaluate_and_gradient(self, gms, states=None, descrip=None,
+    def _evaluate_and_gradient(self, gms, states=None, descrip=None,
                               grad_descrip=None, std=False, cov=False):
         """
         Jointly evaluate adiabats and their gradients, sharing kernel
         computation. Returns: (e, estd, g, gcov) with the same shapes
-        as Adiabat.evaluate_and_gradient.
+        as Adiabat._evaluate_and_gradient (reachable via evaluate(gradient=True)).
         """
         if states is None:
             sts = list(range(self.nstates))

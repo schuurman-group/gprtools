@@ -84,8 +84,8 @@ def test_fit_and_gradient(nstates):
     print(f'  [{nstates}-state] max|grad_analytic - grad_numerical| = {gerr:.3e}')
     assert gerr < 1e-5, gerr
 
-    # evaluate_and_gradient must agree with evaluate / gradient
-    e_j, estd_j, g_j, gcov_j = cp.evaluate_and_gradient(Xq, std=True, cov=True)
+    # evaluate(gradient=True) must agree with evaluate / gradient
+    e_j, estd_j, g_j, gcov_j = cp.evaluate(Xq, std=True, cov=True, gradient=True)
     e_e, estd_e = cp.evaluate(Xq, std=True)
     g_g = cp.gradient(Xq)
     print(f'  [{nstates}-state] joint vs separate: '
