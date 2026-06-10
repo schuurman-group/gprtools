@@ -1,6 +1,7 @@
 """
 ValenceFF baseline surface: analytic gradient, dissociation boundedness,
-Seminario force constants, the coords toggle, and online Dr_e refit.
+Seminario force constants, the coords toggle, online De refit, and the
+bounded Gaussian-well bend (boundedness + online well-depth refit).
 
   python tests/test_valence.py
 
@@ -192,6 +193,50 @@ def test_update_constrained():
     assert min(de) >= 0.03 - 1e-9                         # floored, no collapse
 
 
+def test_angle_well():
+    """bend/oop Gaussian well: energy stays bounded under large-amplitude
+    bending (force decays, unlike the divergent harmonic), and update() refits
+    the well depth D from angle-distorting data (the angular analog of the
+    Morse-De refit)."""
+    x0, atms, re, _ = _hoh()
+    ref = SimpleNamespace(x=x0, atms=atms)
+    ff  = VF(ref, hessian=None, coords='internals')
+    types = [ff.intdef.q_types(i)[0] for i in range(ff.intdef.n_q())]
+    bidx  = types.index('bend')
+    k_b   = ff.params[bidx]['k']
+    q0    = ff.params[bidx]['q0']
+
+    # open the H-O-H angle at fixed bond length -> isolate the bend term
+    geoms, thetas = [], []
+    for thd in np.linspace(104.5, 164.5, 14):
+        g, _, _, _ = _hoh(re=re, th0deg=thd)
+        geoms.append(g); thetas.append(ff.c2i.cart2intc(g)[bidx])
+    geoms  = np.array(geoms); thetas = np.array(thetas)
+
+    # bounded: energy <= the well depth, and far flatter than harmonic
+    E      = ff.evaluate(geoms)[0]
+    D_seed = ff.params[bidx]['D']
+    harm   = 0.5*k_b*(thetas - q0)**2
+    print(f'  angle well: max E={E.max():.4f} (seed D={D_seed}), '
+          f'harmonic@max={harm.max():.4f}')
+    assert np.all(np.isfinite(E))
+    assert E.max() < D_seed + 1e-6           # bounded by the well depth
+    assert E.max() < 0.5*harm.max()          # much flatter than harmonic
+
+    # refit: synthetic omega from a SHALLOWER well -> D relaxes toward it
+    D_true = 0.008
+    omega  = D_true*(1. - np.exp(-(k_b/(2.*D_true))*(thetas - q0)**2))
+    d0     = ff.params[bidx]['D']
+    rms0   = np.sqrt(np.mean((ff.evaluate(geoms)[0] - omega)**2))
+    ff.update(geoms, omega)
+    rms1   = np.sqrt(np.mean((ff.evaluate(geoms)[0] - omega)**2))
+    print(f'  update: bend D {d0:.4f} -> {ff.params[bidx]["D"]:.4f} '
+          f'(true {D_true}), rms {rms0:.4f} -> {rms1:.4f}')
+    assert ff.params[bidx]['D'] < d0                    # relaxed downward
+    assert abs(ff.params[bidx]['D'] - D_true) < 0.003   # recovered ~D_true
+    assert rms1 < 0.3*rms0                              # fit improved
+
+
 if __name__ == '__main__':
     print('Seminario force constants:')
     test_seminario_force_constants()
@@ -205,4 +250,6 @@ if __name__ == '__main__':
     test_update_de()
     print('constrained De refit (shared per element-pair + floor):')
     test_update_constrained()
+    print('Gaussian-well bend (bounded + online D refit):')
+    test_angle_well()
     print('\nALL VALENCEFF TESTS PASSED')

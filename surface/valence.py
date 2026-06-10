@@ -2,10 +2,13 @@
 ValenceFF: an analytic valence force-field surface.
 
 A sum of internal-coordinate energy terms -- Morse on bond stretches (so
-they dissociate to a finite plateau), harmonic on bends and out-of-plane
-wags, periodic on torsions -- evaluated over a redundant internal set
+they dissociate to a finite plateau), a bounded Gaussian well on bends and
+out-of-plane wags (force decays to zero at large amplitude rather than
+diverging), periodic on torsions -- evaluated over a redundant internal set
 auto-generated from the molecular connectivity
-(geom.intc.Intdef.generate_redundant).
+(geom.intc.Intdef.generate_redundant). NB the default coordinate set is
+'bonds' (stretches only); the angle terms are opt-in via coords='internals'
+-- see the ValenceFF class docstring for why.
 
 Intended as a cheap, transferable baseline for Delta-learning the mean
 energy omega of a CP surrogate: it supplies the smooth, bounded-asymptote
@@ -19,14 +22,30 @@ from .base import Surface
 from geom.intc import Intdef, Cart2int
 
 class ValenceFF(Surface):
-    """analytic valence force field over auto-generated redundant internals"""
+    """analytic valence force field over auto-generated redundant internals,
+    intended as a Delta-learning baseline for the mean energy omega.
+
+    Default is coords='bonds' (Morse stretches ONLY). This is deliberate: a
+    ground-state-geometry-seeded force field is a GOOD baseline only where its
+    reference minimum is the right shape, and for excited-state dynamics that
+    fails for at least one ANGULAR coordinate -- the GS minimum and the excited
+    minimum differ in geometry (e.g. NH3: pyramidal S0 vs planar S1), so any
+    bend/oop term restoring toward the GS angles fights the (flat) excited-state
+    surface, overshoots its gradient, and DESTABILISES the surrogate (see
+    bend_well below). The robust, general use of the baseline is therefore the
+    Morse BONDS only: they bound dissociation so the surrogate cannot run away
+    in the low-data region beyond the trained shell, which is the one place a
+    raw GP genuinely breaks. coords='internals' adds the (Gaussian-well) angle
+    terms for systems where the bend really is well-described by the GS shape;
+    use it knowingly."""
 
     # crude per-type force constants (a.u.), used only when no reference
     # Hessian is supplied; the GPR residual absorbs the imprecision
     _DEFAULT_K = {'stre':0.35, 'bend':0.10, 'tors':0.02, 'out':0.10}
 
-    def __init__(self, ref_geom, hessian=None, coords='internals',
-                 de_init=0.2, e0=0.0, scale=1.3, lin_tol=5.0, k_floor=1.e-4):
+    def __init__(self, ref_geom, hessian=None, coords='bonds',
+                 de_init=0.2, e0=0.0, scale=1.3, lin_tol=5.0, k_floor=1.e-4,
+                 bend_well=0.02):
         """
         ref_geom : reference Geometry (a.u.; .x flat, .atms element symbols),
                    meant to be the minimum -- fixes connectivity and r_e/q0.
@@ -35,17 +54,39 @@ class ValenceFF(Surface):
                    Seminario method. Torsions/out-of-plane take per-type
                    defaults (a minimum Hessian doesn't reliably determine
                    them). If None, all force constants are crude defaults.
-        coords   : 'internals' (stre+bend+tors+out) | 'bonds' (stre only).
+        coords   : 'bonds' (Morse stretches only; DEFAULT, robust for
+                   excited-state dynamics -- see class docstring) | 'internals'
+                   (adds Gaussian-well bend/oop + periodic tors).
         de_init  : initial Morse depth per bond (a.u.); seed HIGH and let
                    .update() relax it toward the omega-rise (over-confining
                    fails safe).
         e0       : additive energy offset (a.u.) anchoring omega_base so the
                    learned residual is ~0 at the minimum (optional).
+        bend_well: depth D (a.u.) of the bounded "Gaussian well" used for the
+                   bend/out-of-plane terms, a bend analog of the bond Morse:
+                       E = D (1 - exp(-(k/2D)(q-q0)^2))
+                       F = k (q-q0) exp(-(k/2D)(q-q0)^2)
+                   instead of the harmonic 1/2 k (q-q0)^2. Near q0 it reduces to
+                   the harmonic term (same Seminario curvature k); the force
+                   RISES, peaks at |q-q0|=sqrt(D/k), then DECAYS MONOTONICALLY to
+                   zero (no periodicity / reversal, unlike a cosine). This is
+                   essential for large-amplitude bending (e.g. NH3 umbrella
+                   inversion on an excited state): the harmonic force grows
+                   unbounded as the molecule planarises, overshooting the (flat)
+                   true mean energy by ~5x and destabilising the Delta-learning
+                   GP -- the well lets the baseline gracefully GET OUT OF THE WAY
+                   where a fixed angle term would otherwise lie about the slope.
+                   D is seeded per bend/out term and is REFITTABLE online by
+                   update() from accumulating large-amplitude data (the angular
+                   analog of the Morse-De refit). Smaller D saturates earlier
+                   (D->0 recovers a bonds-only baseline). Stretches (Morse) and
+                   torsions (already periodic) are unaffected.
         """
         super().__init__()
-        self.atms    = ref_geom.atms
-        self.nstates = 1
-        self.e0      = float(e0)
+        self.atms     = ref_geom.atms
+        self.nstates  = 1
+        self.e0        = float(e0)
+        self.bend_well = float(bend_well)
 
         # build the (frozen) redundant coordinate set + transformer
         self.intdef = Intdef()
@@ -89,7 +130,10 @@ class ValenceFF(Surface):
                 De = float(de_init)
                 self.params.append({'De':De, 'a':np.sqrt(k/(2.*De)),
                                     're':self.q0[i], 'k':k})
-            else:
+            elif typ in ('bend', 'out'):
+                self.params.append({'k':k, 'q0':self.q0[i],
+                                    'D':float(self.bend_well)})
+            else:                                  # tors (periodic, no well)
                 self.params.append({'k':k, 'q0':self.q0[i]})
 
     #
@@ -153,8 +197,8 @@ class ValenceFF(Surface):
             e = 1. - np.exp(-p['a']*(q - p['re']))
             return p['De']*e*e
         elif typ in ('bend', 'out'):
-            d = q - p['q0']
-            return 0.5*p['k']*d*d
+            d = q - p['q0']; D = p['D']            # bounded Gaussian well
+            return D * (1. - np.exp(-(p['k']/(2.*D))*d*d))
         elif typ == 'tors':
             return p['k']*(1. - np.cos(q - p['q0']))
         return 0.
@@ -166,7 +210,8 @@ class ValenceFF(Surface):
             ex = np.exp(-p['a']*(q - p['re']))
             return 2.*p['De']*p['a']*ex*(1. - ex)
         elif typ in ('bend', 'out'):
-            return p['k']*(q - p['q0'])
+            d = q - p['q0']; D = p['D']            # bounded Gaussian well
+            return p['k']*d * np.exp(-(p['k']/(2.*D))*d*d)
         elif typ == 'tors':
             return p['k']*np.sin(q - p['q0'])
         return 0.
@@ -252,61 +297,78 @@ class ValenceFF(Surface):
         raise NotImplementedError('ValenceFF is single-state; no couplings')
 
     #
-    def update(self, geoms, energies, fit_offset=True, de_floor=0.03):
-        """refit the stretch Morse depths D_e (and, optionally, the energy
-           offset e0) to (geoms, omega_true) by least squares, holding r_e,
-           the force constants k, and the non-stretch terms fixed -- a is
-           recomputed as a=sqrt(k/2D_e) as D_e varies. No-op without stretches.
+    def update(self, geoms, energies, fit_offset=True, de_floor=0.03,
+               d_floor=1.e-3):
+        """refit the stretch Morse depths D_e AND the bend/out Gaussian-well
+           depths D (and, optionally, the energy offset e0) to (geoms,
+           omega_true) by least squares, holding r_e/q0, the force constants k,
+           and the torsions fixed (a = sqrt(k/2D_e) recomputed as D_e varies).
+           No-op if there are no refinable (stretch or bend/out) terms.
 
            CONSTRAINED for robustness on partial / low-dimensional AL data:
-             * stretches of the same ELEMENT-PAIR type share ONE D_e, so
-               chemically equivalent bonds cannot diverge and a single
-               dissociating bond constrains all of them. (An unconstrained
-               per-bond fit collapses the non-varying bonds toward 0 and lets
-               symmetric bonds disagree -- e.g. NH3 -> De=[0.036,0.001,0.003].)
-             * D_e is bounded below by de_floor so it cannot collapse toward 0
-               (which would remove the Morse wall) when the data does not yet
-               reach dissociation.
-           D_e is a dissociation-region parameter: with these constraints
-           update is safe to call on partial data, but D_e only MOVES
-           meaningfully once the training data spans the dissociation region.
-           Fit in log-space (D_e > 0); bounded below at log(de_floor)."""
-
-        sidx = [i for i in range(self.intdef.n_q())
-                if self.intdef.q_types(i)[0] == 'stre']
-        if not sidx:
-            return None
+             * stretches of the same ELEMENT-PAIR type share ONE D_e, and
+               bend/out terms of the same (type, element-set) share ONE D, so
+               chemically equivalent coordinates cannot diverge and a single
+               dissociating/inverting coordinate constrains all equivalents.
+               (An unconstrained per-coordinate fit collapses the non-varying
+               ones toward 0 -- e.g. NH3 De=[0.036,0.001,0.003].)
+             * D_e / D are bounded below (de_floor / d_floor) so they cannot
+               collapse to 0 when the data does not yet reach the
+               dissociation / large-amplitude region.
+           Both are large-amplitude-region parameters: with these constraints
+           update is safe to call on partial data, but each only MOVES
+           meaningfully once the training data spans its region (near q0 the
+           well energy ~ 1/2 k d^2 is D-independent, so undistorted angles leave
+           D put). Fit in log-space (depths > 0); floored below."""
 
         from scipy.optimize import least_squares
+
+        typ_of = lambda i: self.intdef.q_types(i)[0]
+        sidx = [i for i in range(self.intdef.n_q()) if typ_of(i) == 'stre']
+        aidx = [i for i in range(self.intdef.n_q()) if typ_of(i) in ('bend','out')]
+        if not sidx and not aidx:
+            return None
 
         gms = np.atleast_2d(np.asarray(geoms,    dtype=float))
         om  = np.asarray(energies, dtype=float).ravel()
 
-        # group stretches by element-pair type -> one shared D_e per group
-        def _btype(i):
+        # group stretches by element-pair, bend/out by (type, element-set);
+        # one shared depth per group
+        def _skey(i):
             a, b = self.intdef.q_atms(i)[0]
-            return tuple(sorted((self.atms[a].lower(), self.atms[b].lower())))
-        groups = {}
-        for i in sidx:
-            groups.setdefault(_btype(i), []).append(i)
-        gkeys = list(groups)
+            return ('stre', tuple(sorted((self.atms[a].lower(),
+                                          self.atms[b].lower()))))
+        def _akey(i):
+            ats = tuple(sorted(self.atms[a].lower()
+                               for a in self.intdef.q_atms(i)[0]))
+            return (typ_of(i), ats)
+        sgroups, agroups = {}, {}
+        for i in sidx: sgroups.setdefault(_skey(i), []).append(i)
+        for i in aidx: agroups.setdefault(_akey(i), []).append(i)
+        sk, ak = list(sgroups), list(agroups)
 
-        logDe0 = np.log([max(np.mean([self.params[i]['De'] for i in groups[k]]),
-                             de_floor) for k in gkeys])
-        lo = [np.log(de_floor)]*len(gkeys)
-        hi = [np.inf]*len(gkeys)
+        logDe0 = [np.log(max(np.mean([self.params[i]['De'] for i in sgroups[k]]),
+                             de_floor)) for k in sk]
+        logD0  = [np.log(max(np.mean([self.params[i]['D']  for i in agroups[k]]),
+                             d_floor))  for k in ak]
+        ns, na = len(sk), len(ak)
+        lo = [np.log(de_floor)]*ns + [np.log(d_floor)]*na
+        hi = [np.inf]*(ns + na)
+        p0 = logDe0 + logD0
         if fit_offset:
-            p0 = np.concatenate([logDe0, [self.e0]])
-            lo = lo + [-np.inf]; hi = hi + [np.inf]
-        else:
-            p0 = np.asarray(logDe0, dtype=float)
+            p0 = p0 + [self.e0]; lo = lo + [-np.inf]; hi = hi + [np.inf]
+        p0 = np.asarray(p0, dtype=float)
 
         def _apply(p):
-            for g, k in enumerate(gkeys):
+            for g, k in enumerate(sk):
                 De = float(np.exp(p[g]))
-                for i in groups[k]:
+                for i in sgroups[k]:
                     self.params[i]['De'] = De
                     self.params[i]['a']  = np.sqrt(self.params[i]['k']/(2.*De))
+            for g, k in enumerate(ak):
+                D = float(np.exp(p[ns + g]))
+                for i in agroups[k]:
+                    self.params[i]['D'] = D
             if fit_offset:
                 self.e0 = float(p[-1])
 
