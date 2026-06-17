@@ -33,7 +33,23 @@ class BCM():
         self.surrogates     = []
         self.sdata          = []
         self.prior_covar    = False
-        self.frozen_wts     = False
+        # frozen_wts: drop the weight-derivative (dC) terms in the gradient,
+        # i.e. treat the per-expert precision weights as locally constant ->
+        # the BCM gradient is the precision-weighted average of the expert
+        # gradients. DEFAULT TRUE: this is the accurate AND stable choice, not
+        # just a speed option. The full (non-frozen) weight-derivative is
+        # P^-1 sum_j dbeta_j (mu_j - mu) -- genuinely tiny when the experts
+        # agree (<0.1% of the force in well-sampled regions) -- but the
+        # implementation routes it through O(beta^2)=O(1/v^2) intermediates
+        # that CATASTROPHICALLY CANCEL where the predictive variance v is
+        # small (saturated-variance / training-dense points, and any surrogate
+        # without a noise floor): verified to blow up to O(1e3) for Adiabat at
+        # an in-data point while frozen matches d/dx(evaluate) to ~1e-5. The
+        # noise floor bounds v for CP, but frozen is the robust default for all
+        # surrogates. (frozen_wts=False keeps the full term for users who want
+        # it and understand the saturated-variance fragility; a cancellation-
+        # free reformulation + a sane variance floor would make it safe.)
+        self.frozen_wts     = True
         self.numerical_grad = False
 
     #
@@ -286,11 +302,20 @@ class BCM():
         agg_mean = np.zeros((nmod, ngm),      dtype=float)
         agg_cov  = np.zeros((nmod, ngm, ngm), dtype=float)
         for m in range(nmod):
-            k_m        = self.surrogates[0].models[m].kernel_(d_data)
-            sig_qq_inv = utils.psd_pinv(
-                k_m * self.surrogates[0].models[m]._y_train_std**2)
+            model_m    = self.surrogates[0].models[m]
+            k_m        = model_m.kernel_(d_data)
+            sig_qq_inv = utils.psd_pinv(k_m * model_m._y_train_std**2)
             agg_cov[m]  = utils.psd_pinv(prec_sum[m] - (M - 1)*sig_qq_inv)
-            agg_mean[m] = agg_cov[m] @ mean_sum[m]
+            # BCM divides out the shared prior M-1 times:
+            #   beta_comb mu_comb = sum_i beta_i mu_i - (M-1) beta_prior mu_prior
+            # normalize_y makes each GP's prior mean its DATA mean (not 0), so
+            # omitting the mu_prior term biases any channel whose mean is far
+            # from 0 -- e.g. a constant-gap c-channel (the bias the noise floor
+            # exposed in merge). Use surrogate[0]'s prior mean, consistent with
+            # the kernel/std used for sig_qq_inv above. (No-op at M=1.)
+            mu_prior    = float(np.ravel(model_m._y_train_mean)[0])
+            agg_mean[m] = agg_cov[m] @ (mean_sum[m]
+                                        - (M - 1)*sig_qq_inv @ (mu_prior*np.ones(ngm)))
 
         # fold the shared (deterministic) Delta-learning baseline into the
         # aggregated omega channel ONCE, before reconstruction (no-op if the

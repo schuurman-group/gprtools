@@ -55,7 +55,7 @@ def cone_train(rng, n=300):
 def test_meci_penalty():
     rng = np.random.default_rng(1)
     Xtr, Etr = cone_train(rng)
-    cp = surrogate.CP(2, IdentityDescriptor(), degeneracy_eps=1e-6)
+    cp = surrogate.CP(2, IdentityDescriptor(), degeneracy_eps=0.0)
     cp.create([Xtr, Etr], states=[0, 1])
 
     opt = optimize.Optimizer(cp)
@@ -72,7 +72,7 @@ def test_meci_penalty():
 def test_meci_branching():
     rng = np.random.default_rng(2)
     Xtr, Etr = cone_train(rng)
-    cp = surrogate.CP(2, IdentityDescriptor(), degeneracy_eps=1e-6)
+    cp = surrogate.CP(2, IdentityDescriptor(), degeneracy_eps=0.0)
     cp.create([Xtr, Etr], states=[0, 1])
 
     opt = optimize.Optimizer(cp)
@@ -86,7 +86,9 @@ def test_meci_branching():
 
 
 def test_floor_warning(capsys=None):
-    """Crossing search warns when degeneracy_eps>0 (gap can't vanish)."""
+    """Crossing search on a SMOOTH surface (degeneracy_eps>0) warns and cannot
+    reach a tight gap_tol: the log-reparametrised gap is strictly positive
+    (regularised well above eps), so a MECI cannot close it."""
     rng = np.random.default_rng(3)
     Xtr, Etr = cone_train(rng)
     cp = surrogate.CP(2, IdentityDescriptor(), degeneracy_eps=1e-3)
@@ -96,9 +98,9 @@ def test_floor_warning(capsys=None):
     res = opt.meci(np.array([0.2, 0.1]), states=(0, 1),
                                 method='penalty', gap_tol=1e-4,
                                 sigma_max=1e2)
-    print(f'  floored MECI: converged={res.converged}, gap={res.gap:.3e} '
-          f'(floored ~eps=1e-3, should not reach 1e-4)')
-    assert not res.converged                 # gap floored at ~eps
+    print(f'  smooth-surface MECI: converged={res.converged}, gap={res.gap:.3e} '
+          f'(reparam gap stays > 0, cannot reach gap_tol=1e-4)')
+    assert not res.converged                 # smooth gap cannot vanish
     assert res.gap > 5e-4
 
 

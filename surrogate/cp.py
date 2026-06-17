@@ -5,12 +5,12 @@ import os
 import copy as copy
 import numpy as np
 import pickle as pickle
-from scipy.special import expit
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
 import gpr as gpr
 import utils as utils
 import timer as timer
 from .base import Surrogate
+from .companion import make_companion
 
 class CP(Surrogate):
     """
@@ -64,30 +64,18 @@ class CP(Surrogate):
         var(E_i)  = var(omega) + sum_k (z_i^k / p'(z_i))^2 var(c_k).
 
     Caveats
-        * The independently-fit c_k need not yield N real roots away
-          from the data; companion roots are taken as Re(.), sorted,
-          with a warning when |Im| exceeds `_ROOT_IM_TOL`.
+        * The sign-definite c_{n-2} is log-reparametrised (the GP learns
+          g = log(-c_{n-2}), reconstructed as -exp(g) < 0), so the 2-state
+          gap is always real and strictly positive. For n > 2 the other
+          independently-fit c_k need not yield N real roots away from the
+          data; companion roots are taken as Re(.), sorted, with a warning
+          when |Im| exceeds `_ROOT_IM_TOL`.
         * coupling() is not provided -- omega-CP recovers energies only.
         * BCM/GRBCM aggregation across experts (precision-weight the
           coefficient GPs, then root-find) is deferred. The N-GP fit
           machinery here duplicates Adiabat's and is the natural target
           of the later shared-base refactor.
     """
-
-    # warn if a companion-matrix eigenvalue strays this far off the real
-    # axis (au). With degeneracy_eps>0 the sign-definite coefficient
-    # c_{n-2} is floored < 0, so a 2-state polynomial is always real-
-    # rooted; this fires only for n>2 residual complex roots.
-    _ROOT_IM_TOL = 1.0e-6
-    # last-ditch nan guard for an *exact* root coincidence when
-    # degeneracy_eps==0 (faithful/MECI mode); the physical singularity
-    # is otherwise left intact
-    _PPRIME_TOL = 1.0e-12
-    # softplus transition width as a multiple of the floor depth
-    # delta=(degeneracy_eps/2)^2. S = factor*delta makes the c_{n-2}
-    # floor a gentle (C^inf) hyperboloid rather than a sharp corner;
-    # factor ~ 10 reproduces the smooth surface validated on real data.
-    _C2_SMOOTH_FACTOR = 10.0
 
     #
     def __init__(self, nstates,
@@ -96,7 +84,8 @@ class CP(Surrogate):
                        hparam=[10, 1],
                        representation='adiabatic',
                        degeneracy_eps=1.0e-3,
-                       baseline=None):
+                       baseline=None,
+                       companion='frobenius'):
         super().__init__()
 
         if representation not in ('adiabatic', 'diabatic'):
@@ -114,15 +103,18 @@ class CP(Surrogate):
         # representations; the flag only selects how the recovered roots
         # are labelled at reconstruction
         self.representation = representation
-        # minimum-gap floor (Eh). >0 -> the sign-definite coefficient
-        # c_{n-2} is smoothly bounded < 0 (softplus, see _floor_c2), so the
-        # adiabatic gap can never close: a C^inf 'hyperboloid' surface with
-        # min gap ~eps and smooth, bounded gradients/variance. This is the
-        # DEFAULT (trajectory propagation needs smooth surfaces). Set 0 ->
-        # faithful 'cone' (gap can reach 0, singular gradient at a genuine
-        # CI) for MECI optimisation. Default 1e-3 Eh (~0.027 eV); raise it
-        # for a gentler, larger floor (the transition softens with eps).
-        self.degeneracy_eps = degeneracy_eps
+        # companion-matrix strategy (init-time choice): owns the coefficient
+        # basis, the reconstruction (companion matrix + eigensolver) and the
+        # implicit-diff root jacobian, so 'frobenius' (default), 'schmeisser'
+        # and 'colleague' are swappable behind one interface. It also owns the
+        # sign-definite-coefficient regularisation, hence `degeneracy_eps`:
+        #   > 0  SMOOTH (DEFAULT, trajectory): gap recovered strictly positive
+        #        (no floor/damping), min gap ~eps near the data.
+        #   == 0 FAITHFUL (MECI): gap can reach 0 at a genuine CI.
+        # (see surrogate.companion). degeneracy_eps is exposed as a property
+        # delegating to the companion. Default 1e-3 Eh (~0.027 eV).
+        self.ctype     = companion
+        self.companion = make_companion(companion, nstates, degeneracy_eps)
         # optional Delta-learning baseline (surface.Surface or None): when
         # set, the omega channel learns Delta-omega = omega - <baseline>;
         # the c_k are learned raw. omega is a pure additive shift on every
@@ -130,27 +122,39 @@ class CP(Surrogate):
         # only on the c_k), so the baseline never enters root-finding,
         # the c0 floor, or the delta-method variance.
         self.baseline       = baseline
-        # one-shot diagnostic flags: reconstruction near a seam fires the
-        # complex-root / exact-coincidence notices on essentially every
-        # query (e.g. throughout a MECI search), so warn once per instance
-        self._warned_im    = False
-        self._warned_coinc = False
         self.models         = []
         self.descriptors    = None      # shared (npts, nfeat) over all targets
         self.targets        = None      # (nstates, npts): omega + CP coeffs
         self.geoms          = None      # (npts, nc) raw cartesians, retained so
                                         # the baseline can be refit in place
                                         # (SOAP descriptors aren't invertible)
+        self.energies       = None      # (nstates, npts) raw input energies,
+                                        # retained so refit() can re-express the
+                                        # surrogate in another gap representation
         self.prior_covar    = False
         self.numerical_grad = False
 
         if kernel == 'RBF':
             # length_scale lower bound mirrors Adiabat: keeps the hparam
-            # optimiser off pathologically small length scales
+            # optimiser off pathologically small length scales. The
+            # WhiteKernel noise floor is ESSENTIAL for the log-reparametrised
+            # c_{n-2} channel (degeneracy_eps>0): a noiseless GP memorises the
+            # rough log-gap target via a runaway amplitude (-> 1e5 upper
+            # bound), and c_{n-2}=-exp(g) then DETONATES in extrapolation (real
+            # NH3 gap -> 1e13 eV). The fitted noise breaks the memorisation
+            # (amplitude self-corrects ~316^2 -> ~3^2); its lower bound 1e-6
+            # lets clean/dense channels still interpolate near-exactly, and it
+            # rises to ~0.04 on the rough c-channel. Shared across all N GPs
+            # (omega overfits too). See [[project-cp]] for the controlled
+            # experiment: regularising raw c0 instead does NOT help (still
+            # wrong-sign -> floored), so reparam + noise floor together are the
+            # win, not either alone.
             self.kernel = C(hparam[0],
                             constant_value_bounds=(1e-5, 1e5)) * \
                           RBF(hparam[1],
-                            length_scale_bounds=(0.25, 1e3))
+                            length_scale_bounds=(0.25, 1e3)) + \
+                          WhiteKernel(noise_level=1e-3,
+                            noise_level_bounds=(1e-6, 1e1))
         elif kernel == 'WhiteNoise':
             self.kernel = C(hparam[0]) * RBF(hparam[1],
                           length_scale_bounds=(1, 1e3)) + WhiteKernel(
@@ -160,13 +164,26 @@ class CP(Surrogate):
             os.abort()
 
     #
+    @property
+    def degeneracy_eps(self):
+        """Sign-definite-coefficient regularisation; lives on the companion.
+        Exposed here so `cp.degeneracy_eps = x` and external reads (e.g.
+        optimize.Optimizer) keep working."""
+        return self.companion.degeneracy_eps
+
+    @degeneracy_eps.setter
+    def degeneracy_eps(self, value):
+        self.companion.degeneracy_eps = value
+
+    #
     def copy(self):
         """copy surrogate object (fully deep-copied, independent)."""
         new = CP(self.nstates,
                  self.descriptor,
                  kernel=self.ktype,
                  hparam=self.hparam,
-                 representation=self.representation)
+                 representation=self.representation,
+                 companion=self.ctype)
         for key, value in self.__dict__.items():
             if not key.startswith('__'):
                 setattr(new, key, copy.deepcopy(value))
@@ -235,13 +252,14 @@ class CP(Surrogate):
 
             energies.shape = (nstates, npts)
             returns targets.shape = (nstates, npts) with
-                targets[0]    = omega     = mean over states
-                targets[m>=1] = c_{m-1}^Z (CP coefficient)
+                targets[0]    = omega = mean over states (companion-independent)
+                targets[1:]   = the companion's learned coefficients of the
+                                traceless splitting spectrum Z = E - omega
+                                (basis- and regularisation-dependent; see
+                                surrogate.companion.Companion.to_coeffs)
 
-        c_k^Z is read off np.poly of the splitting energies z = E-omega
-        (highest-degree-first), discarding the structural c_{N-1}^Z (0)
-        and c_N^Z (1). Symmetric in the rows of `energies`, so input
-        ordering is irrelevant.
+        omega and the splitting coefficients are symmetric functions of the
+        input energies, so input row ordering is irrelevant.
         """
         E = np.asarray(energies, dtype=float)
         if E.ndim != 2 or E.shape[0] != self.nstates:
@@ -250,16 +268,13 @@ class CP(Surrogate):
                 f'(nstates={self.nstates}, npts), got {E.shape}')
         n, npts = E.shape
         omega   = E.mean(axis=0)
-        Z       = E - omega
         targets = np.empty((n, npts), dtype=float)
         targets[0] = omega
         if n == 1:
             return targets
-        for p in range(npts):
-            # np.poly -> [1, c_{n-1}, c_{n-2}, ..., c_0]; c_k = poly[n-k]
-            poly = np.poly(Z[:, p])
-            for m in range(1, n):
-                targets[m, p] = poly[n - m + 1]
+        # the companion maps the traceless splitting spectrum to its learned
+        # coefficient basis (incl. any sign-definite-coefficient reparam)
+        targets[1:] = self.companion.to_coeffs(E - omega)
         return targets
 
     #
@@ -274,6 +289,7 @@ class CP(Surrogate):
         self.targets     = self.project_targets(E, X)
         self.descriptors = self.descriptor.generate(X)
         self.geoms       = np.asarray(X, dtype=float).copy()   # retain raw geoms
+        self.energies    = np.asarray(E, dtype=float).copy()   # retain for refit()
 
         nres = 1 if nrestart is None else nrestart
         self.models = []
@@ -313,6 +329,11 @@ class CP(Surrogate):
         self.geoms       = np.vstack([self.geoms, np.asarray(X, dtype=float)])
         self.descriptors = np.vstack([self.descriptors, new_d])
         self.targets     = np.hstack([self.targets, new_t])
+        # maintain raw energies only if we are already tracking them; a
+        # descriptor-space expert (set_model_data / aggregator-rebuilt) keeps
+        # energies=None so refit() falls back to recovering them from targets
+        if self.energies is not None:
+            self.energies = np.hstack([self.energies, np.asarray(E, dtype=float)])
 
         if update_baseline and self.baseline is not None:
             self._rebaseline()
@@ -327,6 +348,54 @@ class CP(Surrogate):
 
         return np.array([model.kernel_.theta for model in self.models],
                                                            dtype=float)
+
+    #
+    @timer.timed
+    def refit(self, degeneracy_eps=None, companion=None, nrestart=None):
+        """Re-express and re-fit the surrogate in a DIFFERENT gap representation
+        on the SAME training data -- no oracle re-query. The intended use is the
+        two-phase workflow: propagate / active-learn with the SMOOTH log-c0
+        model (degeneracy_eps>0 -- C^inf, bounded forces through a seam: a
+        faithful c0 force blows up like 1/gap at the seam), then refit a
+        FAITHFUL raw-c0 PRODUCTION model (degeneracy_eps=0 -- accurate, traces
+        the cusp, MECI-ready) once the data is in. Rebuilds the companion with
+        the new degeneracy_eps (and optional companion kind), re-derives the
+        targets from the retained training energies, and refits the GPs on the
+        existing descriptors. Returns the fitted kernel thetas."""
+        if self.targets is None or self.descriptors is None:
+            raise RuntimeError('CP.refit: nothing fitted yet (call create '
+                               'first).')
+        # the retained raw energies are the source of truth; fall back to
+        # reconstructing them from the stored targets for pre-refit bundles /
+        # descriptor-space rebuilds (exact except where the log-c0 floor clipped
+        # a sub-eps-gap training point)
+        E = (self.energies if self.energies is not None
+             else self._recover_energies())
+        if companion is not None:
+            self.ctype = companion
+        eps = (self.degeneracy_eps if degeneracy_eps is None
+               else degeneracy_eps)
+        self.companion = make_companion(self.ctype, self.nstates, eps)
+        self.targets   = self.project_targets(E, self.geoms)
+        nres = 1 if nrestart is None else nrestart
+        for m in range(self.nstates):
+            self.models[m].set_params(n_restarts_optimizer=nres)
+            self.models[m].fit(self.descriptors, self.targets[m])
+        return np.array([model.kernel_.theta for model in self.models],
+                                                           dtype=float)
+
+    #
+    def _recover_energies(self):
+        """Reconstruct the training energies (nstates, npts) from the stored
+        targets: true omega (Delta-omega + baseline) plus the splitting roots
+        the current companion recovers. Exact except where the log-c0 floor
+        clipped a sub-eps-gap point. Fallback for refit() when the raw energies
+        were not retained (old bundle / set_model_data rebuild)."""
+        omega = self.targets[0] + self._baseline_omega(self.geoms)
+        if self.nstates == 1:
+            return omega[None, :]
+        z, _ = self.companion.to_roots(self.targets[1:])   # (npts, nstates)
+        return omega[None, :] + z.T
 
     #
     def _rebaseline(self):
@@ -375,10 +444,19 @@ class CP(Surrogate):
         self.targets     = bundle['targets']
         self.descriptors = bundle['descriptors']
         self.geoms       = bundle.get('geoms', None)   # for in-place rebaseline
+        self.energies    = bundle.get('energies', None) # for refit() (.get: old
+                                                        # bundles -> recover path)
         # targets store Delta-omega, so the baseline is needed to add omega
         # back; .get for back-compat with pre-baseline bundles. A non-
         # picklable baseline (e.g. ChemPotPy) must be re-attached by hand.
         self.baseline    = bundle.get('baseline', None)
+        # the companion (coefficient basis + reconstruction strategy + its
+        # degeneracy_eps); .get for back-compat -- keep the __init__ one if a
+        # pre-companion bundle is loaded.
+        comp = bundle.get('companion', None)
+        if comp is not None:
+            self.companion = comp
+            self.ctype     = bundle.get('ctype', self.ctype)
 
     #
     def save(self, model_name):
@@ -388,62 +466,30 @@ class CP(Surrogate):
             'targets':     self.targets,
             'descriptors': self.descriptors,
             'geoms':       self.geoms,
+            'energies':    self.energies,    # raw energies, for refit()
             'baseline':    self.baseline,
+            'companion':   self.companion,   # basis + reconstruction strategy
+            'ctype':       self.ctype,
         }
         with open(f"{model_name}_cp.pkl", 'wb') as fid:
             pickle.dump(bundle, fid)
 
     #
     # -- reconstruction helpers --------------------------------------
-    def _floor_c2(self, c2):
-        """
-        Smooth floor on the sign-definite coefficient c_{n-2} (= -gap^2/4
-        for two states, guaranteed <= 0 by eq 5). Bound it <= -delta with
-        delta = (degeneracy_eps/2)^2 via a softplus, so the recovered gap
-        cannot close and sqrt(-c_{n-2}) stays differentiable -> a smooth
-        (C^inf) 'hyperboloid' surface. The transition width
-        S = _C2_SMOOTH_FACTOR * delta makes the floor a gentle bend rather
-        than a sharp corner.
-
-            c2_eff = -delta - S*softplus(-(c2 + delta)/S)   (<= -delta)
-
-        degeneracy_eps = 0 -> identity (faithful 'cone'; gap can reach 0,
-        for MECI). Returns (c2_eff, slope = d c2_eff/d c2 in (0, 1]); the
-        slope -> 0 where c2 overshoots, which auto-bounds the delta-method
-        variance.
-        """
-        eps = self.degeneracy_eps
-        if eps <= 0.:
-            return c2, np.ones_like(c2)
-        delta  = 0.25 * eps * eps                       # (eps/2)^2
-        S      = self._C2_SMOOTH_FACTOR * delta
-        u      = -(c2 + delta) / S
-        c2_eff = -delta - S * np.logaddexp(0., u)
-        return c2_eff, expit(u)
-
-    #
     def _reconstruct(self, raw_mean):
         """
         Recover states from the internal target means.
 
             raw_mean.shape = (nstates, ngm)
             returns omega (ngm,), z (ngm, nstates), E (ngm, nstates),
-                    c2_slope (ngm,)
+                    slopes (ngm, nstates-1)
 
-        z are the companion-matrix eigenvalues (roots of p^Z) sorted
-        ascending; E = omega + z; c2_slope = d c2_eff/d c2 is carried out
-        for the jacobian chain rule.
-
-        `degeneracy_eps` > 0 floors the sign-definite coefficient c_{n-2}
-        strictly below 0 (see _floor_c2) so the gap can never close ->
-        C^inf surface with min gap ~ degeneracy_eps and smooth, bounded
-        gradients/variance. `degeneracy_eps` = 0 -> faithful cone (gap can
-        reach 0, singular gradient at a genuine CI), for MECI.
-
-        For two states this guarantees real roots. For n > 2 only c_{n-2}
-        is sign-constrained; residual complex roots from the other
-        coefficients are handled by taking real parts (full hyperbolicity
-        for >=3 states needs the deferred hyperbolic-cone projection).
+        omega = raw_mean[0] is added back to the splitting roots z that the
+        companion reconstructs from raw_mean[1:] (E = omega + z, sorted
+        ascending). `slopes` are the companion's per-coefficient chain-rule
+        factors carried out for the jacobian (surrogate.companion). The
+        smoothness / faithfulness of the recovered gap and the handling of
+        complex roots are companion- and degeneracy_eps-dependent.
         """
         if self.representation == 'diabatic':
             # Learning is representation-agnostic, but recovering diabatic
@@ -459,83 +505,33 @@ class CP(Surrogate):
 
         n, ngm = raw_mean.shape
         omega  = raw_mean[0]
-        z      = np.zeros((ngm, n), dtype=float)
         if n == 1:
-            return (omega, z, omega[:, None].copy(),
-                    np.ones(ngm, dtype=float))
+            return (omega, np.zeros((ngm, 1), dtype=float),
+                    omega[:, None].copy(), None)
 
-        # smooth floor on the sign-definite coefficient c_{n-2} = raw_mean[n-1]
-        c2_eff, c2_slope = self._floor_c2(raw_mean[n - 1])
-        rm = raw_mean.copy()
-        rm[n - 1] = c2_eff
-
-        max_im = 0.
-        for g in range(ngm):
-            # monic coeffs, highest-first: [1, 0, c_{n-2}^eff, ..., c_0]
-            coeffs     = np.empty(n + 1, dtype=float)
-            coeffs[0]  = 1.0
-            coeffs[1]  = 0.0                       # c_{n-1}^Z == 0
-            coeffs[2:] = rm[1:, g][::-1]
-            r          = np.roots(coeffs)
-            max_im     = max(max_im, float(np.max(np.abs(r.imag))))
-            z[g]       = np.sort(r.real)
-
-        # n=2 is always real-rooted now (c_{n-2} <= -delta < 0 when eps>0);
-        # this fires only for eps=0 overshoots or n>2 un-constrained roots
-        if max_im > self._ROOT_IM_TOL and not self._warned_im:
-            print(f'WARNING: CP companion roots have |Im| up to '
-                  f'{max_im:.3e} au; taking real part (eps=0 overshoot or '
-                  f'n>2 un-constrained coefficients). (further warnings '
-                  f'suppressed for this surrogate)')
-            self._warned_im = True
-
-        return omega, z, z + omega[:, None], c2_slope
+        z, slopes = self.companion.to_roots(raw_mean[1:])
+        return omega, z, z + omega[:, None], slopes
 
     #
-    def _state_jacobian(self, z, c2_slope):
+    def _state_jacobian(self, z, slopes):
         """
-        Jacobian of each recovered state E_i w.r.t. the internal
-        targets, by implicit differentiation of p^Z(z_i) = 0.
+        Jacobian of each recovered state E_i w.r.t. the internal targets.
 
-            z.shape = (ngm, nstates), c2_slope.shape = (ngm,)
-            returns jac.shape = (ngm, nstates, ntargets) with
-                jac[:, i, 0]    = dE_i/domega      = 1
-                jac[:, i, m>=1] = dE_i/dc_{m-1}^Z  = -z_i^{m-1}/p'(z_i)
+            z.shape = (ngm, nstates), slopes (ngm, nstates-1)
+            returns jac.shape = (ngm, nstates, nstates) with
+                jac[:, i, 0]  = dE_i/domega = 1   (companion-independent)
+                jac[:, i, 1:] = dE_i/d(stored coefficient_k)
 
-        The c_{n-2} column is multiplied by c2_slope = d c2_eff/d c2 (the
-        softplus floor's chain rule; = 1 when degeneracy_eps = 0), so the
-        slope -> 0 where c_{n-2} overshoots and the gradient/variance stay
-        bounded.
-
-        p'(z_i) = prod_{j!=i}(z_i - z_j); with degeneracy_eps > 0 the
-        c_{n-2} floor keeps the two-state gap >= ~eps so p'(z_i) is
-        bounded. When eps == 0 (faithful/MECI) p'(z_i) diverges at a
-        genuine CI -- physical; `_PPRIME_TOL` is only a last-ditch nan
-        guard for an *exact* root coincidence.
+        The omega column is identity (E_i = omega + z_i); the coefficient
+        columns are the companion's implicit-diff root jacobian dz_i/dc_k,
+        already carrying the per-coefficient chain-rule `slopes`.
         """
         ngm, n = z.shape
         jac = np.zeros((ngm, n, n), dtype=float)
         jac[:, :, 0] = 1.0
         if n == 1:
             return jac
-        for g in range(ngm):
-            for i in range(n):
-                pprime = np.prod(z[g, i] - np.delete(z[g], i))
-                if abs(pprime) < self._PPRIME_TOL:
-                    if not self._warned_coinc:
-                        print(f"WARNING: CP exact root coincidence at "
-                              f"degeneracy_eps=0; |p'(z_{i})|="
-                              f"{abs(pprime):.3e} au -- gradient singular. "
-                              f"Use a small degeneracy_eps (e.g. 1e-6) for "
-                              f"MECI to stay smooth. (further warnings "
-                              f"suppressed for this surrogate)")
-                        self._warned_coinc = True
-                    pprime = self._PPRIME_TOL if pprime == 0. \
-                             else np.copysign(self._PPRIME_TOL, pprime)
-                powers        = z[g, i] ** np.arange(n - 1)  # z^0..z^{n-2}
-                jac[g, i, 1:] = -powers / pprime
-        # softplus floor chain rule on the c_{n-2} coefficient column
-        jac[:, :, n - 1] *= c2_slope[:, None]
+        jac[:, :, 1:] = self.companion.root_jacobian(z, slopes)
         return jac
 
     #
@@ -727,6 +723,8 @@ class CP(Surrogate):
         self.descriptors = np.asarray(descriptors, dtype=float)
         self.targets     = np.asarray(targets, dtype=float)
         self.geoms       = None
+        self.energies    = None    # descriptor-space rebuild: refit() must
+                                   # recover energies from targets if needed
 
     #
     @timer.timed

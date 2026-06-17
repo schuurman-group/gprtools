@@ -28,13 +28,16 @@ Crossing-point searches:
                           a derivative-coupling / surrogate-supplied second
                           direction when available
 
-Note on CP surrogates: a MECI search wants a near-faithful surface. Set a
-*small* `degeneracy_eps` (e.g. 1e-6 Eh -- below any achievable degeneracy,
-but nonzero so the gradient stays smooth and avoids the exact-coincidence
-singularity); the propagation default of 1e-3 is too coarse and floors the
-gap well above MECI tolerances. The optimizer warns only when
-`degeneracy_eps >= gap_tol`, i.e. when the floor actually prevents reaching
-the requested gap.
+Note on CP surrogates: a MECI search wants the FAITHFUL surface, so set
+`degeneracy_eps = 0`. Then c_{n-2} is learned raw and the gap can reach 0 at a
+genuine CI (with a singular gradient there, as the physics demands -- the
+exact-coincidence warning is expected near convergence). Do NOT use a small
+nonzero `degeneracy_eps` for MECI: any `degeneracy_eps > 0` selects the
+log-reparametrised SMOOTH surface (for trajectory propagation), whose gap
+cannot reach 0 and which, in extrapolation, admits spurious zero-gap 'CIs'
+(g=log(-c_{n-2}) -> -inf) that mislead the search. The optimizer warns when a
+smooth-surface `degeneracy_eps >= gap_tol`, i.e. when its floor prevents
+reaching the requested gap.
 """
 import numpy as np
 import scipy.optimize as sp_opt
@@ -141,11 +144,12 @@ class Optimizer:
     #
     def _warn_if_floored(self, gap_tol):
         eps = getattr(self.surf, 'degeneracy_eps', 0.0)
-        if eps and eps >= gap_tol:
-            print(f'WARNING: Optimizer crossing search: surface '
-                  f'degeneracy_eps={eps:.3e} >= gap_tol={gap_tol:.3e}; the '
-                  f'gap is floored at ~eps and cannot reach gap_tol. Use a '
-                  f'smaller degeneracy_eps (e.g. 1e-6) for MECI/MECP.')
+        if eps and eps > 0.0:
+            print(f'WARNING: Optimizer crossing search on a SMOOTH CP surface '
+                  f'(degeneracy_eps={eps:.3e} > 0): the log-reparametrised gap '
+                  f'cannot reach 0 (so not gap_tol={gap_tol:.3e}) and admits '
+                  f'spurious zero-gap CIs in extrapolation. Set '
+                  f'degeneracy_eps=0 (faithful) for MECI/MECP.')
 
     #
     @timer.timed

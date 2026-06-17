@@ -121,8 +121,11 @@ def cone_energies(X):
 
 
 def test_degeneracy_eps():
-    """eps=0 faithful cone; eps>0 hyperboloid with bounded smooth grads.
-    Train on an annulus (avoid the exact seam) and probe near the CI."""
+    """Dual representation keyed on degeneracy_eps (fixed at create() time):
+      eps>0  SMOOTH (reparam): strictly positive, smooth-gradient gap at a CI,
+             no floor needed; eps is a target-side min-gap floor on the DATA.
+      eps==0 FAITHFUL (raw c_{n-2}): the gap can collapse toward 0 at a CI
+             (for MECI); the bulk is well-conditioned."""
     rng = np.random.default_rng(5)
     # annulus 0.15 < r < 1 so the seam itself is not in the training set
     pts = []
@@ -134,50 +137,63 @@ def test_degeneracy_eps():
     Xtr = np.array(pts)
     Etr = cone_energies(Xtr)
 
-    cp = surrogate.CP(2, IdentityDescriptor())
-    cp.create([Xtr, Etr], states=[0, 1])
-
     def gap(E):                       # E shape (2, ngm) -> (ngm,)
         return E[1] - E[0]
-
     Xb = np.array([[0.6, 0.4]])       # bulk: gap = 2r ~ 1.44 >> eps
     Xc = np.array([[0.0, 0.0]])       # the conical intersection
 
-    # --- bulk: analytic == numerical for both eps (smoothing negligible)
-    for eps in (0.0, 2e-2):
-        cp.degeneracy_eps = eps
+    def bulk_grad_ok(cp):
         g_ana = cp.gradient(Xb)
         cp.numerical_grad = True
         g_num = cp.gradient(Xb)
         cp.numerical_grad = False
-        err = np.max(np.abs(g_ana - g_num))
-        print(f'  bulk eps={eps:.0e}: analytic-vs-numerical grad = {err:.3e}')
-        assert err < 1e-4, err
+        return np.max(np.abs(g_ana - g_num))
 
-    # --- at the CI: eps=0 gap ~0; eps>0 gap ~eps, gradient finite/bounded
-    cp.degeneracy_eps = 0.0
-    gap0 = float(gap(cp.evaluate(Xc))[0])
-    cp.degeneracy_eps = 2e-2
-    eps_eval = cp.evaluate(Xc)
-    gapE = float(gap(eps_eval)[0])
-    gE = cp.gradient(Xc)
-    print(f'  CI gap: eps=0 -> {gap0:.3e}, eps=2e-2 -> {gapE:.3e}; '
-          f'|gradE| finite = {np.all(np.isfinite(gE))}, '
-          f'max|gradE| = {np.max(np.abs(gE)):.3e}')
-    # the c_{n-2} softplus floor lifts the gap to O(eps) (the smooth
-    # transition keeps it a few x eps above the bare floor), not to a hard
-    # eps; the point is it's bounded away from 0, finite, smooth-gradient
-    assert gapE > gap0                          # tip lifted off ~0
-    assert 2e-2 < gapE < 1e-1                   # floored to O(eps), not 0
-    assert np.all(np.isfinite(gE))             # smooth, no blow-up
-    assert np.max(np.abs(gE)) < 1.0            # bounded (cone slope is 1)
+    # --- SMOOTH (eps>0): bulk analytic==numerical; at the CI the gap is
+    #     strictly positive with finite, bounded gradient (reparam, no floor)
+    cps = surrogate.CP(2, IdentityDescriptor(), degeneracy_eps=2e-2)
+    cps.create([Xtr, Etr], states=[0, 1])
+    eb = bulk_grad_ok(cps)
+    gC = float(gap(cps.evaluate(Xc))[0])
+    gE = cps.gradient(Xc)
+    print(f'  smooth eps=2e-2: bulk grad err={eb:.3e}; CI gap={gC:.3e} (>0), '
+          f'max|gradE|={np.max(np.abs(gE)):.3e}')
+    assert eb < 1e-4
+    assert gC > 0.0                         # strictly positive by construction
+    assert np.all(np.isfinite(gE))          # smooth, no blow-up
+    assert np.max(np.abs(gE)) < 1.0         # bounded (cone slope is 1)
+
+    # --- FAITHFUL (eps==0): bulk analytic==numerical (raw representation)
+    cpf = surrogate.CP(2, IdentityDescriptor(), degeneracy_eps=0.0)
+    cpf.create([Xtr, Etr], states=[0, 1])
+    ebf = bulk_grad_ok(cpf)
+    print(f'  faithful eps=0 : bulk grad err={ebf:.3e}')
+    assert ebf < 1e-4
+
+    # --- target-side min-gap floor (deterministic, no GP): a sub-eps gap in
+    #     the DATA is lifted to ~eps when eps>0, kept faithful when eps=0; a
+    #     supra-eps gap is untouched either way (each call rebuilds targets).
+    cp2 = surrogate.CP(2, IdentityDescriptor())
+    def recon_gap(gap_in, eps):
+        cp2.degeneracy_eps = eps
+        E = np.array([[-0.5*gap_in], [0.5*gap_in]])    # (2,1), omega=0
+        _, _, Erec, _ = cp2._reconstruct(cp2._to_targets(E))
+        return float(Erec[0, 1] - Erec[0, 0])
+    eps = 2e-2
+    print(f'  target floor: gap 2e-3 -> faithful {recon_gap(2e-3,0.0):.2e}, '
+          f'floored {recon_gap(2e-3,eps):.2e} (~eps={eps:.0e})')
+    assert abs(recon_gap(2e-3, 0.0) - 2e-3) < 1e-6     # faithful: tiny gap kept
+    assert abs(recon_gap(2e-3, eps) - eps)  < 1e-3     # floored: lifted to ~eps
+    assert abs(recon_gap(0.5,  eps) - 0.5)  < 1e-6     # supra-eps gap untouched
 
 
 def test_smooth_through_ci():
-    """The c_{n-2} softplus floor (eps>0) removes the sqrt(-c0) cusp: along
-    a dense line cut through the CI the lower-state surface is smooth (small
-    discrete curvature), vs eps=0 which has a genuine cusp (large curvature).
-    Trains on an annulus so the seam is extrapolated and c0 overshoots."""
+    """The log-reparametrisation (SMOOTH, eps>0) removes the sqrt(-c0) cusp:
+    along a dense cut through the CI the lower-state surface has small discrete
+    curvature and a strictly positive gap, vs the FAITHFUL raw representation
+    (eps=0) which is jagged (c0 overshoots through 0 -> Re(roots) cusp). The
+    two eps select different target representations at create() time, so each
+    is a separate model. Trains on an annulus so the seam is extrapolated."""
     rng = np.random.default_rng(8)
     pts = []
     while len(pts) < 250:
@@ -185,23 +201,24 @@ def test_smooth_through_ci():
         if 0.2 < np.hypot(*p) < 1.0:
             pts.append(p)
     Xtr = np.array(pts)
-    cp = surrogate.CP(2, IdentityDescriptor())
-    cp.create([Xtr, cone_energies(Xtr)], states=[0, 1])
 
     xline = np.linspace(-0.5, 0.5, 401)              # dense cut through origin
     Xd = np.column_stack([xline, np.zeros_like(xline)])
 
     def cusp(eps):
-        cp.degeneracy_eps = eps
+        cp = surrogate.CP(2, IdentityDescriptor(), degeneracy_eps=eps)
+        cp.create([Xtr, cone_energies(Xtr)], states=[0, 1])
         E = cp.evaluate(Xd)                          # (2, 401)
         assert np.all(np.isfinite(E))
+        if eps > 0:
+            assert np.all(E[1] - E[0] > 0)           # reparam gap strictly positive
         return float(np.abs(np.diff(E[0], 2)).max())  # max |2nd diff|, lower state
 
-    k0 = cusp(0.0)
-    ke = cusp(2e-2)
-    print(f'  cusp metric max|2nd-diff E0|: eps=0 -> {k0:.4f}, '
-          f'eps=2e-2 -> {ke:.4f}  (ratio {ke/k0:.2f})')
-    assert ke < 0.5 * k0      # floor markedly smooths the cusp
+    k0 = cusp(0.0)            # faithful raw: jagged
+    ke = cusp(2e-2)          # reparam: smooth
+    print(f'  cusp metric max|2nd-diff E0|: faithful eps=0 -> {k0:.4f}, '
+          f'smooth eps=2e-2 -> {ke:.4f}  (reparam smooths, ratio {ke/k0:.2f})')
+    assert ke < 0.5 * k0      # reparam markedly smooths vs faithful raw
     assert ke < 0.05          # and is small in absolute terms (C^inf)
 
 
@@ -342,6 +359,92 @@ def test_adiabat_num_gradient_multistate(nstates):
     assert gerr < 1e-5, gerr
 
 
+def test_colleague_companion():
+    """Chebyshev colleague companion (Gutleb et al.): SAME learned targets and
+    root jacobian as Frobenius, reconstruction via the colleague matrix instead
+    of np.roots. Roundtrips to ~machine precision (n=2,3,4) and, on a smooth
+    well-separated 2-state fit, matches the Frobenius CP exactly (same poly,
+    different matrix) with analytic == numerical gradients."""
+    from surrogate.companion import Colleague
+    rng = np.random.default_rng(7)
+
+    # raw-coefficient roundtrip (eps=0): to_coeffs -> to_roots recovers sort(z)
+    for m in (2, 3, 4):
+        co = Colleague(m, 0.0)
+        z  = rng.uniform(-1, 1, m); z -= z.mean()
+        zc, _ = co.to_roots(co.to_coeffs(z[:, None]))
+        err = np.max(np.abs(np.sort(zc[0]) - np.sort(z)))
+        print(f'  [{m}-state] colleague roundtrip err = {err:.2e}')
+        assert err < 1e-8, (m, err)
+
+    # CP level: colleague == frobenius on a smooth, gap-bounded 2-state fit
+    # (eps>0 keeps c0=-exp(g)<0, so both stay real-rooted -- no Re()-clamp)
+    Xtr = rng.uniform(-1, 1, size=(120, 2))
+    Etr = smooth_energies(Xtr, 2)
+    cpf = surrogate.CP(2, IdentityDescriptor(), companion='frobenius')
+    cpc = surrogate.CP(2, IdentityDescriptor(), companion='colleague')
+    cpf.create([Xtr, Etr], states=[0, 1])
+    cpc.create([Xtr, Etr], states=[0, 1])
+    assert type(cpc.companion).__name__ == 'Colleague'
+    Xq = rng.uniform(-0.7, 0.7, size=(8, 2))
+    de = np.max(np.abs(cpf.evaluate(Xq) - cpc.evaluate(Xq)))
+    dg = np.max(np.abs(cpf.gradient(Xq) - cpc.gradient(Xq)))
+    print(f'  CP colleague-vs-frobenius: dE={de:.2e}, dG={dg:.2e}')
+    assert de < 1e-8 and dg < 1e-6
+
+    g_a = cpc.gradient(Xq)
+    cpc.numerical_grad = True
+    g_n = cpc.gradient(Xq)
+    cpc.numerical_grad = False
+    gerr = np.max(np.abs(g_a - g_n))
+    print(f'  colleague analytic-vs-numerical grad = {gerr:.2e}')
+    assert gerr < 1e-5, gerr
+
+
+def test_refit():
+    """refit() re-expresses the surrogate in another gap representation on the
+    SAME data, no oracle re-query -- the propagate-with-log-c0 (smooth seam
+    forces) -> refit-faithful-for-production (accurate, MECI-ready) workflow.
+    refit(eps=0) of a log-c0 model equals a fresh create(eps=0) (exact, via the
+    retained energies), genuinely changes the surface near a seam, and the
+    energy-recovery fallback (no retained energies) works for gap-bounded data."""
+    rng = np.random.default_rng(0)
+    X  = rng.uniform(-1, 1, size=(250, 2))
+    Xq = np.array([[0.05, 0.0], [0.3, 0.2], [-0.5, 0.4], [0.6, -0.3]])
+    Et = cone_energies(X)                              # seam at the origin
+
+    cp = surrogate.CP(2, IdentityDescriptor(), degeneracy_eps=1e-3)
+    cp.create([X, Et], states=[0, 1])
+    e_log = cp.evaluate(Xq)
+    cp.refit(degeneracy_eps=0.0)                       # log-c0 -> faithful raw c0
+    assert cp.degeneracy_eps == 0.0
+    fresh = surrogate.CP(2, IdentityDescriptor(), degeneracy_eps=0.0)
+    fresh.create([X, Et], states=[0, 1])
+    de  = np.max(np.abs(cp.evaluate(Xq) - fresh.evaluate(Xq)))
+    rep = np.max(np.abs(e_log - cp.evaluate(Xq)))
+    print(f'  refit(eps=0) == fresh create: max|dE|={de:.2e}; '
+          f'log->faithful changed eval by {rep:.2e}')
+    assert de < 1e-5                                   # same data/rep (refit warm-
+                                                       # starts the GPs -> ~1e-7)
+    assert rep > 1e-3                                  # representation really changed
+
+    # energy-recovery fallback (old bundle: no retained energies). Exact for
+    # gap-bounded data -- the log floor only clips sub-eps gaps.
+    Xb = rng.uniform(-1, 1, size=(120, 2))
+    Eb = np.vstack([0.5*(Xb[:, 0]**2 + Xb[:, 1]**2) - 0.5,   # constant gap 1 >> eps
+                    0.5*(Xb[:, 0]**2 + Xb[:, 1]**2) + 0.5])
+    cpb = surrogate.CP(2, IdentityDescriptor(), degeneracy_eps=1e-3)
+    cpb.create([Xb, Eb], states=[0, 1])
+    rec_err = np.max(np.abs(cpb._recover_energies() - np.sort(Eb, axis=0)))
+    print(f'  energy recovery from targets (gap-bounded): max|err|={rec_err:.2e}')
+    assert rec_err < 1e-9
+    cpb.energies = None                                # force the recovery path
+    cpb.refit(degeneracy_eps=0.0)
+    fb = surrogate.CP(2, IdentityDescriptor(), degeneracy_eps=0.0)
+    fb.create([Xb, Eb], states=[0, 1])
+    assert np.max(np.abs(cpb.evaluate(Xq) - fb.evaluate(Xq))) < 1e-6
+
+
 if __name__ == '__main__':
     print('roundtrip (machine precision):')
     for n in (2, 3):
@@ -354,7 +457,7 @@ if __name__ == '__main__':
         test_fit_and_gradient(n)
     print('degeneracy_eps (cone vs hyperboloid):')
     test_degeneracy_eps()
-    print('smoothness through CI (softplus floor removes cusp):')
+    print('smoothness through CI (log-reparam removes cusp, no floor):')
     test_smooth_through_ci()
     print('Delta-learning baseline (omega-only):')
     test_baseline()
@@ -365,4 +468,8 @@ if __name__ == '__main__':
     print('Adiabat._num_gradient multistate regression:')
     for n in (2, 3):
         test_adiabat_num_gradient_multistate(n)
+    print('Chebyshev colleague companion:')
+    test_colleague_companion()
+    print('refit (log-c0 <-> faithful representation flip on the same data):')
+    test_refit()
     print('\nALL CP SMOKE TESTS PASSED')

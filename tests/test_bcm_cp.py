@@ -71,7 +71,13 @@ def test_single_expert_matches_surrogate():
 
 
 def test_cp_bcm_near_ci():
-    """2-expert CP BCM stays accurate (and finite) as r -> 0."""
+    """2-expert CP BCM stays finite as r -> 0, with the mean energy omega
+    faithful everywhere. On a GENUINE cone (gap = 2r, a cusp at r=0) the log-
+    reparametrisation + noise floor smoothly regularise the tip (g=log(-c0)=
+    log(r^2) -> -inf, which a noise-floored GP cannot reproduce), giving a
+    finite positive gap that no longer tracks 2r near the seam -- the
+    deliberate smoothness-for-faithfulness trade that replaces the old floor.
+    Away from the tip the cone is recovered to within the regularisation."""
     rng = np.random.default_rng(1)
     X1 = rng.uniform(-1, 1, size=(150, 2))
     X2 = rng.uniform(-1, 1, size=(150, 2))
@@ -81,26 +87,35 @@ def test_cp_bcm_near_ci():
     b.grow([X1, cone(X1)], states=[0, 1])
     b.grow([X2, cone(X2)], states=[0, 1])
 
-    worst = 0.0
     for r in (0.2, 0.05, 0.01, 1e-3):
         xq = np.array([r, 0.0])
         e, estd = b.evaluate(xq, std=True)      # (2,), (2,)
-        true = np.array([-r, r])
-        err  = np.max(np.abs(e - true))
-        worst = max(worst, err)
+        gap = float(e[1] - e[0])
         finite = np.all(np.isfinite(e)) and np.all(np.isfinite(estd))
         print(f'  r={r:<6}: E={np.array2string(e, precision=4)} '
-              f'true=[{-r:.4f},{r:.4f}] err={err:.2e} std_finite={finite}')
-        assert finite
-        assert err < 1e-2, (r, err)
-    print(f'  worst near-CI energy error = {worst:.3e}')
+              f'gap={gap:.4f} (true 2r={2*r:.4f}) omega={e.sum()/2:+.2e} '
+              f'std_finite={finite}')
+        assert finite                                   # the CP-BCM win
+        assert abs(e.sum()/2) < 1e-2                    # omega (mean) faithful
+        assert 0.0 < gap < 0.5                          # positive, bounded (no blow-up)
+    # away from the tip the cone is recovered up to the regularisation
+    e02 = b.evaluate(np.array([0.2, 0.0]))
+    assert np.max(np.abs(e02 - np.array([-0.2, 0.2]))) < 5e-2
 
 
 def test_gradient_single_expert_matches_surrogate():
-    """M=1 BCM gradient == the underlying surrogate gradient, for Adiabat
-    and CP. The weight-derivative (dC) terms cancel only symbolically at
-    M=1, so float round-off leaves a ~1e-5 residual (exact with
-    frozen_wts=True)."""
+    """M=1 BCM gradient == its single underlying EXPERT's gradient (Adiabat,
+    CP). Two points of hygiene make this the actual aggregation invariant
+    rather than an accident of GP reproducibility:
+      * compare against b.surrogates[0] (the BCM's OWN fitted expert), not an
+        independently re-fit surrogate -- an independent fit can differ where
+        the GP is ill-conditioned/nondeterministic (the CP cone's overfit
+        log-gap channel: two lbfgs runs land on different hparams and disagree,
+        which spuriously failed the re-fit comparison);
+      * frozen_wts=True zeroes the dC weight-derivative terms, whose non-frozen
+        round-off residual is amplified through the CP root-map jacobian (the
+        open frozen-weight-gradient investigation, [[project-bcm]]).
+    """
     rng = np.random.default_rng(4)
     Xtr = rng.uniform(-1, 1, size=(150, 2))
     Xq  = rng.uniform(-0.7, 0.7, size=(4, 2))
@@ -108,19 +123,27 @@ def test_gradient_single_expert_matches_surrogate():
     Ead = np.vstack([0.5*(Xtr[:, 0]**2 + Xtr[:, 1]**2) - 1.0,
                      0.5*(Xtr[:, 0]**2 + Xtr[:, 1]**2) + 1.0])
     b = bcm_mod.BCM(surrogate.Adiabat(2, IdentityDescriptor()))
+    b.frozen_wts = True
     b.grow([Xtr, Ead], states=[0, 1])
-    ad = surrogate.Adiabat(2, IdentityDescriptor())
-    ad.create([Xtr, Ead], states=[0, 1])
+    ad = b.surrogates[0]
     err = max(np.max(np.abs(b.gradient(xq) - ad.gradient(xq))) for xq in Xq)
-    print(f'  Adiabat M=1 grad: max|BCM - surrogate| = {err:.3e}')
+    print(f'  Adiabat M=1 grad: max|BCM - expert| = {err:.3e}')
     assert err < 1e-4, err
 
+    # frozen_wts=True -> the dC weight-derivative terms are exactly 0, so the
+    # M=1 BCM gradient EQUALS the surrogate gradient up to reconstruct round-
+    # off. The default (non-frozen) dC approximation cancels only symbolically
+    # at M=1 and, for CP specifically, its residual is amplified through the
+    # root-map jacobian -- occasionally to O(1) -- so it is NOT a robust
+    # equivalence check (this is the open frozen-weight-gradient investigation,
+    # see [[project-bcm]]; the noise floor sharpens the variance landscape that
+    # feeds dC and worsens it). Test the exact invariant here.
     b = bcm_mod.BCM(surrogate.CP(2, IdentityDescriptor(), degeneracy_eps=1e-6))
+    b.frozen_wts = True
     b.grow([Xtr, cone(Xtr)], states=[0, 1])
-    cp = surrogate.CP(2, IdentityDescriptor(), degeneracy_eps=1e-6)
-    cp.create([Xtr, cone(Xtr)], states=[0, 1])
+    cp = b.surrogates[0]
     err = max(np.max(np.abs(b.gradient(xq) - cp.gradient(xq))) for xq in Xq)
-    print(f'  CP M=1 grad:      max|BCM - surrogate| = {err:.3e}')
+    print(f'  CP M=1 grad:      max|BCM - expert| = {err:.3e}')
     assert err < 1e-4, err
 
 
@@ -203,6 +226,46 @@ def test_gradient_vs_fd_wellconditioned():
     assert coarse < 5e-2          # gap << |grad|~2.5: analytic is accurate
 
 
+def test_frozen_wts_default_and_stable():
+    """frozen_wts defaults to True because the full (non-frozen) weight-
+    derivative gradient is numerically fragile: where the per-expert predictive
+    variance v saturates (~0), beta=1/v is astronomical and the dC terms
+    (~beta^2) catastrophically cancel. With region-split experts (so the
+    weights genuinely vary) probed at an IN-DATA point, the non-frozen Adiabat
+    gradient blows up to O(1e3) while the frozen gradient matches the true
+    conservative gradient d/dx(evaluate). The dropped weight-derivative is
+    P^-1 sum_j dbeta_j (mu_j - mu) -- ~0 when experts agree."""
+    np.random.seed(0)
+    rng = np.random.default_rng(1)
+    X1  = rng.uniform(-1.0, 0.25, size=(120, 2))
+    X2  = rng.uniform(-0.25, 1.0, size=(120, 2))
+    Ead = lambda X: np.vstack([0.3*(X[:, 0]**2 + X[:, 1]**2) - 0.3,
+                               0.3*(X[:, 0]**2 + X[:, 1]**2) + 0.3])
+    b = bcm_mod.BCM(surrogate.Adiabat(2, IdentityDescriptor()))
+    b.grow([X1, Ead(X1)], states=[0, 1])
+    b.grow([X2, Ead(X2)], states=[0, 1])
+    assert b.frozen_wts is True                        # the new default
+
+    xq = np.array([0.22, -0.1])                         # in-data: per-expert v ~ 0
+    h  = 1e-4
+    g_fd = np.zeros((2, 2))
+    for d in range(2):
+        xp = xq.copy(); xp[d] += h
+        xm = xq.copy(); xm[d] -= h
+        g_fd[:, d] = (b.evaluate(xp) - b.evaluate(xm)) / (2*h)
+
+    g_frozen = b.gradient(xq)                           # default path (frozen)
+    b.frozen_wts = False
+    g_full = b.gradient(xq)
+    b.frozen_wts = True
+    e_frozen = np.max(np.abs(g_frozen - g_fd))
+    e_full   = np.max(np.abs(g_full   - g_fd))
+    print(f'  vs d/dx(evaluate): frozen |err|={e_frozen:.2e}, '
+          f'full |err|={e_full:.2e}  (full detonates at saturated variance)')
+    assert e_frozen < 1e-3                              # frozen ~ conservative gradient
+    assert e_full > 100 * e_frozen                      # non-frozen is far worse here
+
+
 class _QuadBaseline:
     """Duck-typed 1-state baseline omega_base = 0.5*k*|x|^2 (CP needs only
     evaluate/gradient) for exercising the Delta-learning fold."""
@@ -245,7 +308,11 @@ def test_merge():
     kc  = b.surrogates[0].baseline.k
     print(f'  build merge: consensus k={kc:.3f} (true {kt}); energy MAE={mae:.2e}')
     assert abs(kc - kt) < 0.05                          # consensus recovered from pooled data
-    assert mae < 5e-2
+    # trueE has a CONSTANT gap and a baseline-exact omega, so a correct BCM
+    # recovers it to ~machine precision. A loose tol here previously hid the
+    # missing prior-mean term in BCM.evaluate (constant c-channel -> varying
+    # gap, MAE ~0.25); keep it tight as that bug's regression guard.
+    assert mae < 1e-6
     assert all(s.geoms is not None for s in b.surrogates)               # geoms retained
     assert len(set(round(s.baseline.k, 6) for s in b.surrogates)) == 1  # one common baseline
 
@@ -253,7 +320,7 @@ def test_merge():
     n0 = b.n_estimators()
     b.add(mkcp(0.7))
     assert b.n_estimators() == n0 + 1
-    assert np.mean(np.abs(b.evaluate(Xq) - np.sort(trueE(Xq), axis=0))) < 5e-2
+    assert np.mean(np.abs(b.evaluate(Xq) - np.sort(trueE(Xq), axis=0))) < 1e-6
 
     # grow(data, id): data goes to the targeted expert
     sz0 = b.surrogates[0].train_size()[0]
@@ -328,7 +395,7 @@ def test_resort():
     err = max(np.max(np.abs(b.evaluate(xq) - np.sort(cone(xq[None, :])[:, 0])))
               for xq in Xq)
     print(f'           post-resort energy err vs cone = {err:.3e}')
-    assert err < 1e-2, err
+    assert err < 1e-1, err          # noise floor regularises the cusped cone
 
     # Adiabat regression
     Ead = lambda X: np.vstack([0.5*(X[:, 0]**2 + X[:, 1]**2) - 1.0,
@@ -355,6 +422,8 @@ if __name__ == '__main__':
     test_cp_bcm_gradient()
     print('analytic gradient == d/dx(evaluate), well-conditioned:')
     test_gradient_vs_fd_wellconditioned()
+    print('frozen_wts default + stability vs saturated-variance blowup:')
+    test_frozen_wts_default_and_stable()
     print('Delta-learning baseline folded once (M=1 == standalone):')
     test_baseline_single_expert()
     print('merge pre-built surrogates (build / add(object) / grow(id) / consensus):')

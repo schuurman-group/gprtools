@@ -48,7 +48,11 @@ class GRBCM():
         self.comm           = None        # communication expert M_c
         self.surrogates     = []          # enhanced experts M_{+i}
         self.prior_covar    = False
-        self.frozen_wts     = False
+        # frozen_wts default TRUE: the accurate AND stable gradient choice (the
+        # full weight-derivative term is a sub-0.1% correction computed through
+        # O(1/v^2) intermediates that catastrophically cancel at saturated
+        # variance). See aggregate.bcm.BCM.__init__ for the full rationale.
+        self.frozen_wts     = True
         self.numerical_grad = False
 
     #
