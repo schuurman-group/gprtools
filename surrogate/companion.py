@@ -215,31 +215,104 @@ class Frobenius(Companion):
         return J
 
 
-class Schmeisser(Companion):
+class Schmeisser(Frobenius):
     """
-    Symmetric-tridiagonal Schmeisser companion (Gutleb et al. Algorithm 3):
-    build the real symmetric tridiagonal matrix whose characteristic polynomial
-    is p (via the polynomial-division recurrence, their Algorithm 1) and
-    diagonalise with eigh, which is GUARANTEED to return real eigenvalues -- so
-    the spurious-complex-root failure of Frobenius cannot occur. Real-rootedness
-    is enforceable by clamping the off-diagonal entries c_j <- max(0, c_j)
-    (their Lemma 3.2), the natural general-n analogue of the c_{n-2} floor.
+    Symmetric-tridiagonal Schmeisser companion (Gutleb et al. Algorithm 1 & 3).
+    Build the real symmetric tridiagonal matrix whose characteristic polynomial
+    is p -- diagonal = Jacobi alpha_k, off-diagonal = sqrt(c_k) -- via the
+    polynomial-division (Sturm) recurrence, and diagonalise with eigvalsh, which
+    is GUARANTEED to return REAL eigenvalues. So the spurious-complex-root
+    failure of the Frobenius companion (for n>=3 the cubic+ readily leaves the
+    real-rooted region -> complex pair -> Re()-clamp -> coincident roots ->
+    p'(z)=0 -> SINGULAR force) cannot occur: the off-diagonal-squared c_k are
+    clamped >= a floor, the natural GENERAL-n analogue of the 2-state c_{n-2}
+    floor (Lemma 3.2: positive off-diagonals => simple/distinct eigenvalues).
 
-    Deferred: the construction uses polynomial division (= deconvolution), which
-    the paper flags as ill-conditioned and possibly needing higher precision; and
-    the hard clamp is C^0, so a smooth variant is wanted for trajectory gradients.
+    `degeneracy_eps` sets that floor:
+      > 0  SMOOTH: c_k softplus-floored at delta=(eps/2)^2, so off-diagonals
+           stay >0 -> distinct roots -> BOUNDED, smooth forces through a seam.
+      == 0 FAITHFUL: c_k clamped >=0 (real roots; coincide only at a genuine CI,
+           singular force there as physics demands).
+
+    Learns RAW monomial coefficients (NOT the log-c_{n-2} reparam -- the
+    off-diagonal floor is the real-rootedness mechanism here). The implicit-diff
+    root jacobian dz_i/dc_k = -z_i^k/p'(z_i) is inherited from Frobenius and is
+    EXACT where the floor is inactive (real-rooted data); where it is active
+    (the regularised region) it is bounded-but-approximate -- the point being it
+    never blows up. The Algorithm-1 construction uses polynomial division
+    (deconvolution), which the paper flags as conditioning-sensitive for high n.
     """
     def to_coeffs(self, Z):
-        raise NotImplementedError(
-            "Schmeisser companion not yet implemented; use companion='frobenius'.")
+        # RAW monomial coefficients c_k (no log-reparam); real-rootedness is
+        # enforced by the off-diagonal clamp in to_roots, not by reparametrising
+        n, npts = Z.shape
+        out = np.empty((n - 1, npts), dtype=float)
+        for p in range(npts):
+            poly = np.poly(Z[:, p])
+            for k in range(n - 1):
+                out[k, p] = poly[n - k]
+        return out
 
     def to_roots(self, coeffs):
-        raise NotImplementedError(
-            "Schmeisser companion not yet implemented; use companion='frobenius'.")
+        ncoef, ngm = coeffs.shape
+        n      = ncoef + 1
+        delta  = (0.25 * self.degeneracy_eps**2
+                  if self.degeneracy_eps > 0. else 0.)
+        z = np.zeros((ngm, n), dtype=float)
+        for g in range(ngm):
+            mono       = np.empty(n + 1, dtype=float)
+            mono[0]    = 1.0
+            mono[1]    = 0.0                         # traceless: c_{n-1}=0
+            mono[2:]   = coeffs[::-1, g]             # c_{n-2}..c_0
+            z[g]       = self._schmeisser_eig(mono, delta)
+        return z, np.ones_like(coeffs).T            # slopes=1 (no reparam)
 
-    def root_jacobian(self, z, slopes):
-        raise NotImplementedError(
-            "Schmeisser companion not yet implemented; use companion='frobenius'.")
+    #
+    def _schmeisser_eig(self, mono, delta):
+        """Roots of the monic polynomial (highest-first) via the symmetric
+        tridiagonal Schmeisser matrix with the off-diagonal-squared floored."""
+        q, c = self._schmeisser_qc(mono[::-1])      # ascending coeffs in
+        n    = len(q)
+        if delta > 0.:
+            # smooth floor c >= delta: softplus, width delta (C^inf, distinct
+            # roots -> bounded forces). logaddexp guards the exp overflow.
+            c = delta + delta * np.logaddexp(0., (c - delta) / delta)
+        else:
+            c = np.maximum(c, 0.)                    # faithful: real, may coincide
+        A   = np.diag(q)
+        off = np.sqrt(c)
+        for k in range(n - 1):
+            A[k, k + 1] = A[k + 1, k] = off[k]
+        return np.sort(np.linalg.eigvalsh(A))
+
+    #
+    @staticmethod
+    def _schmeisser_qc(a_asc):
+        """Algorithm 1 (Gutleb et al.): monic poly (ascending coeffs
+        [a_0,...,a_{n-1},1]) -> Jacobi diagonal q (= alpha_k) and off-diagonal-
+        squared c (= beta_k^2) of the tridiagonal whose char-poly is the input.
+        Sturm/Euclidean recurrence with MONIC p'."""
+        n  = len(a_asc) - 1
+        pp = np.array([(i + 1) * a_asc[i + 1] for i in range(n)], dtype=float)
+        pp = pp / pp[-1]                             # MONIC p' (sets the scaling)
+        y1 = np.asarray(a_asc, dtype=float)
+        y2 = pp.copy()
+        q  = np.zeros(n, dtype=float)
+        c  = np.zeros(n, dtype=float)
+        for k in range(n):
+            u, r = np.polydiv(y1[::-1], y2[::-1])    # descending div
+            u = u[::-1]                              # quotient, ascending
+            r = r[::-1]                              # remainder, ascending
+            q[k] = -u[0]                             # alpha_k = -quotient(0)
+            if k < n - 1:
+                # pad a trimmed remainder back to degree deg(y2)-1
+                if len(r) < len(y2) - 1:
+                    r = np.concatenate([r, np.zeros(len(y2) - 1 - len(r))])
+                rl   = r[len(y2) - 2]                # leading coeff of remainder
+                c[k] = -rl
+                y1   = y2
+                y2   = r[:len(y2) - 1] / rl          # next monic divisor
+        return q, c
 
 
 class Colleague(Frobenius):

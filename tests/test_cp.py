@@ -445,6 +445,59 @@ def test_refit():
     assert np.max(np.abs(cpb.evaluate(Xq) - fb.evaluate(Xq))) < 1e-6
 
 
+def test_schmeisser_companion():
+    """Symmetric-tridiagonal Schmeisser companion: eigvalsh GUARANTEES real
+    roots and the off-diagonal-squared floor keeps them distinct -> BOUNDED
+    forces for n>=3, where Frobenius goes complex -> Re()-clamp -> coincident
+    roots -> p'(z)=0 -> SINGULAR force. Construction roundtrips to ~machine
+    precision (n=2..5)."""
+    from surrogate.companion import Schmeisser
+    rng = np.random.default_rng(9)
+
+    for m in (2, 3, 4, 5):
+        sc = Schmeisser(m, 0.0)
+        z  = rng.uniform(-1, 1, m); z -= z.mean()
+        zs, _ = sc.to_roots(sc.to_coeffs(z[:, None]))
+        err = np.max(np.abs(np.sort(zs[0]) - np.sort(z)))
+        print(f'  [{m}-state] schmeisser roundtrip err = {err:.2e}')
+        assert err < 1e-8, (m, err)
+
+    # 3-state with a real 0-1 CI: Schmeisser gradient stays BOUNDED where the
+    # Frobenius companion's force is singular (the n>=3 bug Schmeisser fixes).
+    Xc  = rng.uniform(-1, 1, size=(300, 2))
+    def Econe(X):
+        r = np.hypot(X[:, 0], X[:, 1])
+        return np.sort(np.vstack([-r, r, 2.0 + 0.5*r]), axis=0)
+    Etr = Econe(Xc)
+    cpf = surrogate.CP(3, IdentityDescriptor(), companion='frobenius',
+                       degeneracy_eps=1e-3)
+    cps = surrogate.CP(3, IdentityDescriptor(), companion='schmeisser',
+                       degeneracy_eps=1e-3)
+    cpf.create([Xc, Etr], states=[0, 1, 2])
+    cps.create([Xc, Etr], states=[0, 1, 2])
+    gf = max(np.max(np.abs(cpf.gradient(np.array([r, 0.0]))))
+             for r in (0.2, 0.05, 0.01, 1e-3))
+    gs = max(np.max(np.abs(cps.gradient(np.array([r, 0.0]))))
+             for r in (0.2, 0.05, 0.01, 1e-3))
+    print(f'  3-state near CI: max|grad| frobenius={gf:.1e}, schmeisser={gs:.1e}')
+    assert gs < 1e2                              # Schmeisser bounded (the fix)
+    assert gf > 1e3                              # Frobenius singular (the bug)
+
+    # Schmeisser analytic gradient == numerical on a well-conditioned 3-state
+    rng2 = np.random.default_rng(1); Xtr = rng2.uniform(-1, 1, size=(150, 2))
+    Esm  = np.sort(np.vstack([np.sin(Xtr[:, 0]), np.cos(Xtr[:, 1]),
+                              0.4*(Xtr[:, 0] - Xtr[:, 1])]), axis=0)
+    cp = surrogate.CP(3, IdentityDescriptor(), companion='schmeisser',
+                      degeneracy_eps=1e-3)
+    cp.create([Xtr, Esm], states=[0, 1, 2])
+    Xq  = rng2.uniform(-0.8, 0.8, size=(6, 2))
+    ga  = cp.gradient(Xq)
+    cp.numerical_grad = True; gn = cp.gradient(Xq); cp.numerical_grad = False
+    gerr = np.max(np.abs(ga - gn))
+    print(f'  schmeisser 3-state analytic-vs-numerical grad = {gerr:.2e}')
+    assert gerr < 1e-5, gerr
+
+
 if __name__ == '__main__':
     print('roundtrip (machine precision):')
     for n in (2, 3):
@@ -472,4 +525,6 @@ if __name__ == '__main__':
     test_colleague_companion()
     print('refit (log-c0 <-> faithful representation flip on the same data):')
     test_refit()
+    print('Schmeisser companion (guaranteed-real roots, bounded n>=3 forces):')
+    test_schmeisser_companion()
     print('\nALL CP SMOKE TESTS PASSED')
