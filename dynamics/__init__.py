@@ -7,5 +7,8 @@ Public API is import-compatible with the former dynamics.py module:
 from .base import Dynamics
 from .singlestate import SingleState
 from .fssh import FSSH
+from .propagator import (make_propagator, Propagator, RK45, VelocityVerlet,
+                         BulirschStoer)
 
-__all__ = ['Dynamics', 'SingleState', 'FSSH']
+__all__ = ['Dynamics', 'SingleState', 'FSSH', 'make_propagator', 'Propagator',
+           'RK45', 'VelocityVerlet', 'BulirschStoer']

@@ -2,19 +2,23 @@
 Single-state (Born-Oppenheimer) trajectory propagation.
 """
 import numpy as np
-from scipy.integrate import RK45
 import timer as timer
 from .base import Dynamics
+from .propagator import make_propagator
 
 class SingleState(Dynamics):
     """
     Propagate a trajectory in a single electronic state, while
     periodically checking the accuracy of the underlying suface
     """
-    def __init__(self, gradient=None):
+    def __init__(self, gradient=None, propagator='rk45', dt=10.0):
         super().__init__()
 
         self.grad  = gradient
+        # integrator (see dynamics.propagator): 'rk45' (default) |
+        # 'velocity-verlet' | 'bulirsch-stoer'
+        self.propagator = propagator
+        self.dt         = dt
         # mass of each coordinate
         self.m     = None
         self.nc    = None
@@ -40,16 +44,21 @@ class SingleState(Dynamics):
         failed      = False
         chk_vals    = []
 
-        # when we change states, we reinitialize the
-        # propagator
-        propagator = RK45(
+        # build the chosen propagator (rk45 / velocity-verlet). State vector is
+        # [x, p] (no auxiliary block: naux=0).
+        propagator = make_propagator(
+                self.propagator,
                 fun      = self.step_function,
                 t0       = traj.t(),
                 y0       = np.concatenate((traj.x(), traj.p())),
                 t_bound  = t_final,
+                ndof     = self.nc,
+                mass     = self.m,
+                naux     = 0,
                 rtol     = rtol,
                 atol     = atol,
-                max_step = max_step)
+                max_step = max_step,
+                dt       = self.dt)
 
         while propagator.status == 'running':
 

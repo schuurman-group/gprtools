@@ -3,22 +3,34 @@ Fewest-Switches Surface Hopping (Tully) trajectory propagation,
 with optional A-FSSH decoherence.
 """
 import numpy as np
-from scipy.integrate import RK45
 import timer as timer
 from .base import Dynamics
+from .propagator import make_propagator
 
 class FSSH(Dynamics):
     """
     Perform a FSSH propagation, periodically checking the accuracy
     of the surface being propagated on
     """
-    def __init__(self, nstates, gradient=None, coupling=None, decoherence=False):
+    def __init__(self, nstates, gradient=None, coupling=None, decoherence=False,
+                       propagator='rk45', dt=10.0, n_elec=1):
         super().__init__()
 
         self.ns          = nstates
         self.grad        = gradient
         self.coup        = coupling
         self.decoherence = decoherence
+        # integrator selected at construction (see dynamics.propagator):
+        #   'rk45'            adaptive RK4(5) of the full (nuclei + density-matrix)
+        #                     state -- the default / original behaviour
+        #   'velocity-verlet' fixed-step Verlet nuclei + RK4-substepped electronic
+        #                     density matrix; dt = nuclear step (au), n_elec =
+        #                     electronic substeps per dt
+        #   'bulirsch-stoer'  adaptive modified-midpoint + Richardson extrapolation
+        #                     of the full state; high order / few steps when smooth
+        self.propagator  = propagator
+        self.dt          = dt
+        self.n_elec      = n_elec
         self.m           = None
         self.state       = None
         self.nc          = None
@@ -54,17 +66,23 @@ class FSSH(Dynamics):
         update      = False 
         failed      = False
 
-        # when we change states, we reinitialize the
-        # propagator
-        propagator = RK45(
+        # build the chosen propagator (rk45 / velocity-verlet). The state vector
+        # is [x, p, dm]; dy/dt comes from step_function. ndof/mass/naux let a
+        # structured integrator (Verlet) split nuclei from the density matrix.
+        propagator = make_propagator(
+                self.propagator,
                 fun      = self.step_function,
                 t0       = traj.t(),
-                y0       = np.concatenate((traj.x(), traj.p(),
-                                           dm.ravel())),
+                y0       = np.concatenate((traj.x(), traj.p(), dm.ravel())),
                 t_bound  = t_final,
+                ndof     = self.nc,
+                mass     = self.m,
+                naux     = self.ns**2,
                 rtol     = rtol,
                 atol     = atol,
-                max_step = max_step)
+                max_step = max_step,
+                dt       = self.dt,
+                n_elec   = self.n_elec)
 
         while propagator.status == 'running':
 
