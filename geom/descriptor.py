@@ -29,8 +29,69 @@ class Soap(Descriptor):
     """
     def __init__(self, ref_gm, r_max, n_max, l_max, sigma):
         """
-        set the ci object to be evaluated and extract some info
-        about the object
+        Build a SOAP descriptor generator for the molecule given by ref_gm.
+
+        SOAP encodes each atom's local environment as an expansion of the
+        smoothed neighbour density, within a cutoff sphere of radius r_max,
+        in n_max radial basis functions and spherical harmonics up to degree
+        l_max, with every neighbour smeared by a Gaussian of width sigma. The
+        per-site power spectra are L2-normalized and outer-averaged over sites
+        (generate()) into one molecular descriptor.
+
+        Parameters
+        ----------
+        ref_gm : Geometry     reference geometry (supplies the species list)
+        r_max  : float, Ang   neighbour cutoff radius
+        n_max  : int          number of radial basis functions
+        l_max  : int          maximum spherical-harmonic degree
+        sigma  : float, Ang   Gaussian width of each atom's density
+
+        Choosing n_max / l_max / r_max / sigma
+        --------------------------------------
+        The descriptor length -- and hence the cost of EVERY descriptor and,
+        more importantly, every descriptor_gradient (the per-step force cost)
+        -- scales roughly as
+
+            n_feature ~ (l_max + 1) * n_max^2 * n_species^2 / 2
+
+        (e.g. C/H/O, n_max=l_max=8  ->  ~2700 features). So pick the SMALLEST
+        values that resolve the chemistry: over-resolving is quadratically
+        expensive in n_max and also overfits on small training sets.
+
+        r_max (cutoff) -- chosen by chemistry, not accuracy. It must enclose
+            the interactions that matter (bonds + first/second neighbours),
+            typically 3-6 Ang. Bigger is NOT better: once the cutoff exceeds
+            the molecular diameter every site sees every atom, so the analytic
+            derivative tensor becomes fully dense (no locality to exploit) and
+            cost rises with nothing gained. Use the smallest cutoff that still
+            captures the relevant couplings.
+
+        sigma (density width) -- small sigma (~0.2-0.3) is sharp and sensitive
+            to fine geometric detail but needs higher n_max/l_max to represent
+            and reacts strongly to small displacements; large sigma (~0.4-0.6)
+            smooths the density into a gentler, lower-resolution, cheaper-to-
+            represent descriptor. 0.3-0.5 is a sane default; set it near the
+            displacement scale you actually need to resolve.
+
+        n_max (radial resolution) -- how finely DISTANCE is resolved within
+            the cutoff. Raise it for larger cutoffs or multi-shell radial
+            structure. Usual range 4-8; cost ~ n_max^2.
+
+        l_max (angular resolution) -- how finely ANGLES / neighbour orientation
+            are resolved (e.g. distinguishing bond-angle or cis/trans changes).
+            Usual range 3-6; cost ~ (l_max + 1). Keep it balanced with n_max --
+            l_max >> n_max buys little -- and note dscribe caps l_max at 9 for
+            the default basis.
+
+        Practical recipe
+        ----------------
+        Start moderate -- n_max=l_max=4-6, sigma~0.4, r_max covering first/
+        second neighbours -- and only raise n_max/l_max if the surrogate
+        underfits (train error stays high once enough data is present); lower
+        them for speed whenever accuracy already suffices, since the force-
+        evaluation cost is set almost entirely by n_feature. For a small
+        molecule with few species (phenol, C/H/O) 5-6 / 4-6 is usually ample;
+        n_max=l_max=8 is high-resolution and rarely necessary.
         """
         super().__init__()
         self.atoms = ref_gm.atms
@@ -116,8 +177,6 @@ class Soap(Descriptor):
             return des_grad
 
         # analytic differentiation (default)
-        eye = np.eye(n_feature)
-
         for i in range(ng):
 
             gm       = np.reshape(gms[i,:]*constants.bohr2ang, (natm,3))
@@ -139,10 +198,14 @@ class Soap(Descriptor):
 
             # normalization: dhat = d/||d||
             #   d(dhat) = (1/||d||)(I - dhat dhat^T) d(d)
+            # Apply the projector as a RANK-1 update rather than forming the
+            # (nf x nf) matrix I - dhat dhat^T: dd_raw @ (I - dhat dhat^T) =
+            # dd_raw - (dd_raw . dhat) outer dhat. This is O(nc*nf) instead of
+            # O(nc*nf^2) and allocates no nf^2 array -- a large saving since
+            # nf is in the thousands (see the cost note in __init__).
             nrm  = np.linalg.norm(d_raw)
             dhat = d_raw/nrm
-            proj = eye - np.outer(dhat, dhat)
-            dd_n = (dd_raw @ proj)/nrm                             # (nc,nf)
+            dd_n = (dd_raw - np.outer(dd_raw @ dhat, dhat))/nrm    # (nc,nf)
 
             # chain rule for the bohr -> angstrom coordinate scaling
             des_grad[i,:,:] = dd_n*constants.bohr2ang
