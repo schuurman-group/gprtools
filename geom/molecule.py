@@ -338,6 +338,11 @@ class Trajectory():
         self.st[self.cnt]    = state
         self.dmt[self.cnt, state, state] = 1.
 
+        # absolute time at which the trajectory last entered the ground state
+        # (None when not on S0). Owned by the trajectory so the ground-state
+        # dwell timer survives a propagate() exit-for-update and re-entry.
+        self.gs_start = None
+
     #
     def current_geom(self):
         """
@@ -356,6 +361,10 @@ class Trajectory():
         """
         idx = np.searchsorted(self.time[:self.cnt], t0, side='right')
         self.cnt = idx
+
+        # the ground-state dwell timer refers to a (now-discarded) later time;
+        # re-arm it so the next propagate re-establishes it from the rewind point
+        self.gs_start = None
 
         # probably not necessary, but safer to zero them out
         self.st[idx+1:]        = 0

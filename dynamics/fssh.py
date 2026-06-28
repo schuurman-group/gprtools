@@ -55,7 +55,9 @@ class FSSH(Dynamics):
         self.nc     = traj.nc
         t0          = traj.t()
         dm          = traj.dm()
-        gs_start    = None
+        # NB: the ground-state dwell timer (traj.gs_start) is NOT reset here --
+        # it lives on the trajectory so it survives this method exiting for a
+        # surrogate update and being re-entered while still on S0.
 
         if self.decoherence:
             self._delta_R = np.zeros((self.ns, self.nc), dtype=float)
@@ -137,15 +139,19 @@ class FSSH(Dynamics):
                 else:
                     s_new = traj.state()
 
-            # if on the ground state, start ground state timer
+            # if on the ground state, accumulate ground-state dwell time.
+            # gs_start lives on the trajectory (NOT a local) so it survives a
+            # propagate() exit-for-update and re-entry while still on S0 --
+            # otherwise the timer reset on every surrogate update and the run
+            # never terminated via gs_stoptime.
             if traj.state() == 0.:
-                if gs_start is None:
-                    gs_start = propagator.t
-                elif (propagator.t - gs_start) >= gs_stoptime:
+                if traj.gs_start is None:
+                    traj.gs_start = propagator.t
+                elif (propagator.t - traj.gs_start) >= gs_stoptime:
                     break
             # else, deactivate gs timer
             else:
-                gs_start = None
+                traj.gs_start = None
 
             # update the trajectory object with current timestep info
             tupdate = {'time':     propagator.t,
