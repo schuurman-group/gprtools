@@ -55,10 +55,7 @@ class FSSH(Dynamics):
         self.nc     = traj.nc
         t0          = traj.t()
         dm          = traj.dm()
-        # NB: the ground-state dwell timer (traj.gs_start) is NOT reset here --
-        # it lives on the trajectory so it survives this method exiting for a
-        # surrogate update and being re-entered while still on S0.
-
+ 
         if self.decoherence:
             self._delta_R = np.zeros((self.ns, self.nc), dtype=float)
             self._delta_P = np.zeros((self.ns, self.nc), dtype=float)

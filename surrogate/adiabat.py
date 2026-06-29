@@ -164,9 +164,17 @@ class Adiabat(Surrogate):
 
     #
     @timer.timed
-    def update(self, data, states=[], hparam=None, nrestart=None):
+    def update(self, data, states=[], hparam=None, nrestart=None,
+                                                   optimize=True):
         """
-        update the surrogate with additional data
+        update the surrogate with additional data.
+
+        optimize=True (default): re-optimize the GP hyperparameters and
+        refit from scratch. optimize=False: EXTEND each GP with the new
+        points via an incremental Cholesky update at FIXED hyperparameters
+        (GPRegressor.add_points) -- O(N^2 m) instead of a full O(N^3) refit;
+        use once theta has stabilised. Falls back to a fixed-theta full refit
+        if the Schur complement is not positive-definite (too-low noise floor).
         """
 
         # sanity check the geometry array
@@ -209,22 +217,43 @@ class Adiabat(Surrogate):
             self.descriptors[st].resize((old + new, d_size))
             self.training[st].resize((old + new))
 
+            new_y                         = data[1][i,:].copy()
             self.descriptors[st][old:, :] = new_des
-            self.training[st][old:]       = data[1][i,:].copy()
+            self.training[st][old:]       = new_y
 
-            if hparam is not None:
-                self.models[st].kernel.theta = hparam[st]
-                self.models[st].kernel_.theta = hparam[st]
- 
-            if nrestart is not None:
-                self.models[st].set_params(n_restarts_optimizer =
-                                                            nrestart)
+            if optimize:
+                if hparam is not None:
+                    self.models[st].kernel.theta = hparam[st]
+                    self.models[st].kernel_.theta = hparam[st]
 
-            self.models[st].fit(self.descriptors[st],
-                                self.training[st])
+                if nrestart is not None:
+                    self.models[st].set_params(n_restarts_optimizer =
+                                                                nrestart)
+
+                self.models[st].fit(self.descriptors[st],
+                                    self.training[st])
+            else:
+                # fixed-theta incremental Cholesky extension with the new points
+                try:
+                    self.models[st].add_points(new_des, new_y)
+                except np.linalg.LinAlgError:
+                    self._refit_frozen(st, self.descriptors[st],
+                                           self.training[st])
 
         return np.array([model.kernel_.theta for model in self.models],
                                                            dtype=float)
+
+    #
+    def _refit_frozen(self, st, X, y):
+        """Full Cholesky refit of model st on (X, y) at its current FITTED
+        hyperparameters (no optimization) -- the fixed-theta fallback for the
+        incremental add_points path when the Schur complement is not PD."""
+        mdl = self.models[st]
+        opt = mdl.optimizer
+        mdl.kernel.theta = mdl.kernel_.theta
+        mdl.set_params(optimizer=None)
+        mdl.fit(X, y)
+        mdl.set_params(optimizer=opt)
 
     #
     def load(self, model_name):
@@ -799,14 +828,16 @@ class OrderedAdiabat(Adiabat):
 
     #
     @timer.timed
-    def update(self, data, states=[], hparam=None, nrestart=None):
+    def update(self, data, states=[], hparam=None, nrestart=None,
+                                                   optimize=True):
         """Validate ordering, transform new (lower, log-gaps), then append."""
         self._require_full_state_set(states, 'update')
         X, E = data
         y_int = self._check_and_transform(E)
         return super().update([X, y_int],
                               states=list(range(self.nstates)),
-                              hparam=hparam, nrestart=nrestart)
+                              hparam=hparam, nrestart=nrestart,
+                              optimize=optimize)
 
     #
     # -- helpers shared by evaluate/gradient/joint -------------------

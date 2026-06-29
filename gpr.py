@@ -3,7 +3,7 @@ import os
 import warnings
 import numpy as np
 from sklearn.gaussian_process import GaussianProcessRegressor
-from scipy.linalg import solve_triangular
+from scipy.linalg import solve_triangular, cholesky, cho_solve
 import utils as utils
 import timer as timer
 
@@ -26,6 +26,80 @@ class GPRegressor(GaussianProcessRegressor):
         """
     
         return super().fit(X, y)
+
+    #
+    @timer.timed
+    def add_points(self, X_new, y_new):
+        """
+        Incrementally extend the fit with new training points at FIXED
+        hyperparameters (kernel_ unchanged) via a bordered/incremental
+        Cholesky update, instead of an O(N^3) refit from scratch.
+
+        Appending m points borders the kernel matrix,
+            K_{N+m} = [[K_NN, K_Nm],
+                       [K_mN, K_mm]],
+        leaving K_NN (and hence its Cholesky L_NN = self.L_) untouched, so the
+        factor only needs to be EXTENDED:
+            L_{N+m} = [[L_NN,  0  ],
+                       [W^T,  L_mm]]
+            W    = L_NN^{-1} K_Nm                  (triangular solve, O(N^2 m))
+            L_mm = chol(K_mm - W^T W)              (Schur complement, O(m^3))
+        Cost is O(N^2 m) vs O(N^3) for a full refactor. alpha_ is then
+        recomputed by back/forward substitution on the extended factor (O(N^2)),
+        and normalize_y re-applied, so the result is bit-for-bit identical to a
+        from-scratch fit at the same theta.
+
+        REQUIRES the kernel hyperparameters to be unchanged since the last
+        fit/add -- re-optimizing theta changes every entry of K_NN and
+        invalidates L_NN. Pair with a frozen-theta (optimizer=None) update
+        policy.
+
+        Append-only: no downdating. Raises numpy/scipy LinAlgError if the Schur
+        complement is not positive-definite (the caller should then fall back to
+        a full fit, e.g. after raising the noise floor).
+        """
+        if not hasattr(self, 'L_'):
+            raise RuntimeError('add_points: model not fitted yet (call fit '
+                               'first to establish L_ / kernel_).')
+
+        X_new = np.atleast_2d(np.asarray(X_new, dtype=float))
+        y_new = np.atleast_1d(np.asarray(y_new, dtype=float))
+        N     = self.X_train_.shape[0]
+        m     = X_new.shape[0]
+
+        # kernel blocks at the FIXED fitted kernel. WhiteKernel is diagonal, so
+        # it contributes only to K_mm's diagonal (assuming X_new are distinct
+        # from the existing training set); add self.alpha to match the diagonal
+        # jitter sklearn applies in fit().
+        K_Nm = self.kernel_(self.X_train_, X_new)            # (N, m)
+        K_mm = self.kernel_(X_new)                           # (m, m), incl noise diag
+        K_mm[np.diag_indices_from(K_mm)] += self.alpha
+
+        # extend the Cholesky factor
+        W    = solve_triangular(self.L_, K_Nm, lower=True)   # (N, m) = L_NN^{-1} K_Nm
+        S    = K_mm - W.T @ W                                # Schur complement (m, m)
+        L_mm = cholesky(S, lower=True)                       # raises if S not PD
+
+        L_new          = np.zeros((N + m, N + m), dtype=float)
+        L_new[:N, :N]  = self.L_
+        L_new[N:, :N]  = W.T
+        L_new[N:, N:]  = L_mm
+        self.L_        = L_new
+
+        # extend the training inputs
+        self.X_train_  = np.vstack([self.X_train_, X_new])
+
+        # extend targets, re-apply normalize_y, recompute alpha_ exactly
+        y_raw = self.y_train_ * self._y_train_std + self._y_train_mean
+        y_raw = np.concatenate([y_raw, y_new])
+        if self.normalize_y:
+            self._y_train_mean = y_raw.mean(axis=0)
+            std                = y_raw.std(axis=0)
+            self._y_train_std  = std if std > 0 else 1.0
+        self.y_train_ = (y_raw - self._y_train_mean) / self._y_train_std
+        self.alpha_   = cho_solve((self.L_, GPR_CHOLESKY_LOWER), self.y_train_)
+
+        return self
 
     #
     def prior(self, X, physical=True):

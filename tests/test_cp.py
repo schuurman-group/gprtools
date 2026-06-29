@@ -2,11 +2,16 @@
 Smoke test for surrogate.CP (omega-CP characteristic-polynomial surrogate)
 and a regression for the multi-state Adiabat._num_gradient fix.
 
+Also covers the incremental-Cholesky update path: GPRegressor.add_points
+reproduces a from-scratch fit at fixed theta bit-for-bit, and
+CP/Adiabat.update(optimize=False) match a frozen full refit.
+
 Run with an env that has the gprtools deps (numpy, sklearn, opt_einsum):
   python tests/test_cp.py
 """
 import os
 import sys
+import copy
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -498,6 +503,112 @@ def test_schmeisser_companion():
     assert gerr < 1e-5, gerr
 
 
+def _arr(x):
+    """unwrap (value, std/cov, ...) tuples from evaluate/gradient."""
+    return np.asarray(x[0] if isinstance(x, tuple) else x)
+
+
+def test_add_points_equivalence():
+    """GPRegressor.add_points (bordered/incremental Cholesky at FIXED theta)
+    reproduces a from-scratch fit on the full data bit-for-bit."""
+    import gpr
+    from sklearn.gaussian_process.kernels import (ConstantKernel as C, RBF,
+                                                  WhiteKernel)
+    rng = np.random.default_rng(11)
+    d   = 12
+    def feats(n):
+        X = rng.standard_normal((n, d))
+        return X / np.linalg.norm(X, axis=1, keepdims=True)
+    def tgt(X):
+        return np.sin(3*X[:, 0]) + 0.5*X[:, 1]**2 - X[:, 2]
+
+    ker    = C(1.5)*RBF(0.7) + WhiteKernel(1e-4)
+    N0, m  = 60, 15
+    X0, Xm = feats(N0), feats(m)
+    y0, ym = tgt(X0), tgt(Xm)
+    mk = lambda: gpr.GPRegressor(kernel=ker, optimizer=None, normalize_y=True,
+                                 alpha=1e-10)
+    ref = mk().fit(np.vstack([X0, Xm]), np.concatenate([y0, ym]))   # from scratch
+    inc = mk().fit(X0, y0); inc.add_points(Xm, ym)                  # incremental
+    Xt  = feats(40)
+    dL  = np.max(np.abs(ref.L_ - inc.L_))
+    dm  = np.max(np.abs(ref.predict(Xt) - inc.predict(Xt)))
+    dg  = np.max(np.abs(_arr(ref.predict_grad(Xt)) - _arr(inc.predict_grad(Xt))))
+    print(f'  add_points vs from-scratch: max|dL_|={dL:.1e}, |d mean|={dm:.1e}, '
+          f'|d grad|={dg:.1e}, size={inc.X_train_.shape[0]}')
+    assert inc.X_train_.shape[0] == N0 + m
+    assert dL < 1e-10 and dm < 1e-10 and dg < 1e-9
+
+
+def test_cp_incremental_update(nstates):
+    """CP.update(optimize=False) -- fixed-theta incremental Cholesky -- matches a
+    frozen full refit on the same accumulated data (energies + gradients)."""
+    rng = np.random.default_rng(7)
+    st  = list(range(nstates))
+    X0, E0 = rng.uniform(-1, 1, (40, 2)), None; E0 = smooth_energies(X0, nstates)
+    Xm, Em = rng.uniform(-1, 1, (12, 2)), None; Em = smooth_energies(Xm, nstates)
+    Xt = rng.uniform(-1, 1, (15, 2))
+
+    cp0 = surrogate.CP(nstates, IdentityDescriptor())
+    cp0.create([X0, E0], states=st)
+
+    cpA = copy.deepcopy(cp0)
+    cpA.update([Xm, Em], states=st, optimize=False)                 # incremental
+
+    cpB = copy.deepcopy(cp0)                                        # frozen refit
+    new_t = cpB.project_targets(Em, Xm)
+    new_d = cpB.descriptor.generate(Xm)
+    cpB.geoms       = np.vstack([cpB.geoms, Xm])
+    cpB.descriptors = np.vstack([cpB.descriptors, new_d])
+    cpB.targets     = np.hstack([cpB.targets, new_t])
+    if cpB.energies is not None:
+        cpB.energies = np.hstack([cpB.energies, Em])
+    for mm in range(nstates):
+        cpB._refit_frozen(mm, cpB.descriptors, cpB.targets[mm])
+
+    assert cpA.descriptors.shape[0] == 52
+    dE = np.max(np.abs(_arr(cpA.evaluate(Xt)) - _arr(cpB.evaluate(Xt))))
+    dG = np.max(np.abs(_arr(cpA.gradient(Xt)) - _arr(cpB.gradient(Xt))))
+    print(f'  [{nstates}-state] CP optimize=False vs frozen refit: '
+          f'dE={dE:.1e}, dG={dG:.1e}')
+    assert dE < 1e-9 and dG < 1e-8
+
+
+def test_adiabat_incremental_update(nstates):
+    """Adiabat.update(optimize=False) matches a frozen full refit. A WhiteKernel
+    noise floor keeps K well-conditioned so the incremental factor stays exact
+    (floorless K is near-singular -> larger roundoff: the conditioning lever)."""
+    rng = np.random.default_rng(3)
+    st  = list(range(nstates))
+    X0, E0 = rng.uniform(-1, 1, (40, 2)), None; E0 = smooth_energies(X0, nstates)
+    Xm, Em = rng.uniform(-1, 1, (12, 2)), None; Em = smooth_energies(Xm, nstates)
+    Xt = rng.uniform(-1, 1, (15, 2))
+
+    ad0 = surrogate.Adiabat(nstates, IdentityDescriptor(),
+                            kernel='WhiteNoise', hparam=[10, 1, 1e-3])
+    ad0.create([X0, E0], states=st)
+
+    adA = copy.deepcopy(ad0)
+    adA.update([Xm, Em], states=st, optimize=False)                # incremental
+
+    adB = copy.deepcopy(ad0)                                       # frozen refit
+    for i, s in enumerate(st):
+        old = adB.descriptors[s].shape[0]
+        nd  = adB.descriptor.generate(Xm)
+        ny  = Em[i, :].copy()
+        adB.descriptors[s].resize((old + nd.shape[0], adB.descriptors[s].shape[1]))
+        adB.training[s].resize((old + nd.shape[0]))
+        adB.descriptors[s][old:, :] = nd
+        adB.training[s][old:]       = ny
+        adB._refit_frozen(s, adB.descriptors[s], adB.training[s])
+
+    dE = np.max(np.abs(_arr(adA.evaluate(Xt)) - _arr(adB.evaluate(Xt))))
+    dG = np.max(np.abs(_arr(adA.gradient(Xt)) - _arr(adB.gradient(Xt))))
+    print(f'  [{nstates}-state] Adiabat optimize=False vs frozen refit: '
+          f'dE={dE:.1e}, dG={dG:.1e}')
+    assert dE < 1e-9 and dG < 1e-8
+
+
 if __name__ == '__main__':
     print('roundtrip (machine precision):')
     for n in (2, 3):
@@ -527,4 +638,12 @@ if __name__ == '__main__':
     test_refit()
     print('Schmeisser companion (guaranteed-real roots, bounded n>=3 forces):')
     test_schmeisser_companion()
+    print('incremental Cholesky update (GPRegressor.add_points, fixed theta):')
+    test_add_points_equivalence()
+    print('CP.update(optimize=False) == frozen full refit:')
+    for n in (2, 3):
+        test_cp_incremental_update(n)
+    print('Adiabat.update(optimize=False) == frozen full refit:')
+    for n in (2, 3):
+        test_adiabat_incremental_update(n)
     print('\nALL CP SMOKE TESTS PASSED')

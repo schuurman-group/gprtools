@@ -310,8 +310,17 @@ class CP(Surrogate):
     #
     @timer.timed
     def update(self, data, states=[], hparam=None, nrestart=None,
-                                                   update_baseline=False):
+                                      update_baseline=False, optimize=True):
         """Append new (geometry, energies), recompute targets, refit.
+
+        optimize=True (default): re-optimize the GP hyperparameters and
+        refit from scratch (the original behaviour). optimize=False:
+        EXTEND each GP with the new points via an incremental Cholesky update at
+        FIXED hyperparameters (GPRegressor.add_points) -- O(N^2 m) instead of a
+        full O(N^3) refit; use once theta has stabilised. The incremental path
+        falls back to a fixed-theta full refit if the Schur complement is not
+        positive-definite (a too-low noise floor) or if a baseline refresh has
+        rewritten the targets.
 
         update_baseline=True additionally refits the Delta-learning baseline
         on ALL retained geometries (the omega channel) and re-derives every
@@ -335,19 +344,43 @@ class CP(Surrogate):
         if self.energies is not None:
             self.energies = np.hstack([self.energies, np.asarray(E, dtype=float)])
 
-        if update_baseline and self.baseline is not None:
+        rebaselined = update_baseline and self.baseline is not None
+        if rebaselined:
             self._rebaseline()
 
         for m in range(self.nstates):
-            if hparam is not None:
-                self.models[m].kernel.theta  = hparam[m]
-                self.models[m].kernel_.theta = hparam[m]
-            if nrestart is not None:
-                self.models[m].set_params(n_restarts_optimizer=nrestart)
-            self.models[m].fit(self.descriptors, self.targets[m])
+            if optimize:
+                if hparam is not None:
+                    self.models[m].kernel.theta  = hparam[m]
+                    self.models[m].kernel_.theta = hparam[m]
+                if nrestart is not None:
+                    self.models[m].set_params(n_restarts_optimizer=nrestart)
+                self.models[m].fit(self.descriptors, self.targets[m])
+            elif rebaselined:
+                # a baseline refresh rewrote EVERY omega target -> the cached
+                # factor is stale, so the incremental update is invalid
+                self._refit_frozen(m, self.descriptors, self.targets[m])
+            else:
+                # fixed-theta incremental Cholesky extension with the new points
+                try:
+                    self.models[m].add_points(new_d, new_t[m])
+                except np.linalg.LinAlgError:
+                    self._refit_frozen(m, self.descriptors, self.targets[m])
 
         return np.array([model.kernel_.theta for model in self.models],
                                                            dtype=float)
+
+    #
+    def _refit_frozen(self, m, X, y):
+        """Full Cholesky refit of model m on (X, y) at its current FITTED
+        hyperparameters (no optimization) -- the fixed-theta fallback for the
+        incremental add_points path (PD failure or a target rewrite)."""
+        mdl = self.models[m]
+        opt = mdl.optimizer
+        mdl.kernel.theta = mdl.kernel_.theta
+        mdl.set_params(optimizer=None)
+        mdl.fit(X, y)
+        mdl.set_params(optimizer=opt)
 
     #
     @timer.timed
