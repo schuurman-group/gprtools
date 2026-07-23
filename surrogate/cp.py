@@ -5,6 +5,7 @@ import os
 import copy as copy
 import numpy as np
 import pickle as pickle
+import warnings
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
 import gpr as gpr
 import utils as utils
@@ -133,6 +134,10 @@ class CP(Surrogate):
                                         # surrogate in another gap representation
         self.prior_covar    = False
         self.numerical_grad = False
+        # set True by _constrained_refit: the production model breaks the
+        # Gaussian posterior (truncated by the hard hyperbolicity inequality)
+        # AND near-interpolates, so any std/cov it returns is meaningless
+        self._constrained   = False
 
         if kernel == 'RBF':
             # length_scale lower bound mirrors Adiabat: keeps the hparam
@@ -384,7 +389,9 @@ class CP(Surrogate):
 
     #
     @timer.timed
-    def refit(self, degeneracy_eps=None, companion=None, nrestart=None):
+    def refit(self, degeneracy_eps=None, companion=None, nrestart=None,
+              constrained=False, delta=1.0e-3, grid=None, val_grid=3,
+              jitter=1.0e-8, refine_rounds=6, maxiter=300):
         """Re-express and re-fit the surrogate in a DIFFERENT gap representation
         on the SAME training data -- no oracle re-query. The intended use is the
         two-phase workflow: propagate / active-learn with the SMOOTH log-c0
@@ -394,10 +401,27 @@ class CP(Surrogate):
         the cusp, MECI-ready) once the data is in. Rebuilds the companion with
         the new degeneracy_eps (and optional companion kind), re-derives the
         targets from the retained training energies, and refits the GPs on the
-        existing descriptors. Returns the fitted kernel thetas."""
+        existing descriptors. Returns the fitted kernel thetas.
+
+        constrained=True dispatches to _constrained_refit: a one-shot FINAL
+        production refit that ACTIVELY constrains the raw coefficient channels so
+        the recovered spectrum is real-rooted (characteristic-polynomial
+        discriminant >= delta) over a region, avoiding the reconstruction-time
+        Re()-clamp (extended coincident-root degeneracy) and the min-gap floor
+        that the log-reparam sampling model relies on. `grid` (geometries) is the
+        region and DEFAULTS to the retained training geometries; `val_grid` is a
+        SCALAR densification factor (e.g. 3) for the between-sample check set (the
+        exchange loop that actually finds and fixes the violations) -- see
+        _constrained_refit. Breaks the Gaussian posterior (hard inequality ->
+        truncated); variances are meaningless afterwards, which is fine
+        post-sampling. n=2,3 only for now."""
         if self.targets is None or self.descriptors is None:
             raise RuntimeError('CP.refit: nothing fitted yet (call create '
                                'first).')
+        if constrained:
+            return self._constrained_refit(
+                delta=delta, grid=grid, companion=companion, maxiter=maxiter,
+                jitter=jitter, refine_rounds=refine_rounds, val_grid=val_grid)
         # the retained raw energies are the source of truth; fall back to
         # reconstructing them from the stored targets for pre-refit bundles /
         # descriptor-space rebuilds (exact except where the log-c0 floor clipped
@@ -416,6 +440,258 @@ class CP(Surrogate):
             self.models[m].fit(self.descriptors, self.targets[m])
         return np.array([model.kernel_.theta for model in self.models],
                                                            dtype=float)
+
+    #
+    def _constrained_refit(self, delta=1.0e-3, grid=None, companion=None,
+                                 maxiter=300, jitter=1.0e-8, refine_rounds=6,
+                                 val_grid=3):
+        """Constrained-GP-MAP production refit (see refit(constrained=True)).
+
+        Enforces real-rootedness (discriminant >= delta) of the recovered
+        spectrum so the PRODUCTION surface stays physical between samples -- no
+        reconstruction-time Re()-clamp / min-gap floor. The RAW coefficient
+        channels c_0..c_{n-2} are fit; omega is a pure additive shift on the
+        roots and keeps its ordinary fit.
+
+        `grid` (geometries) sets the region physicality is demanded over; it
+        DEFAULTS to the retained training geometries self.geoms. Enforcing at the
+        training points themselves is nearly a no-op (real energies -> already
+        hyperbolic), so `val_grid` (a SCALAR densification factor, e.g. 3) builds
+        a finer between-sample check set by perturbing `grid` around its local
+        nearest-neighbour spacing; the exchange loop promotes any violators there
+        into the (small) active constraint set. Pass an explicit `grid` (e.g. a
+        propagation region) to demand physicality somewhere other than the
+        sampled region. val_grid<=1 disables between-sample refinement.
+
+        Algorithm (three pieces that make it actually work):
+          1. The real training energies are GROUND TRUTH -- always hyperbolic --
+             so they are held FIXED; only the active-set coefficient values xi
+             are optimised. Objective: keep xi close to the unconstrained
+             interpolant mu in that channel's posterior-covariance metric
+             Sigma^-1 (the constraint-truncated posterior mode). trust-constr,
+             warm-started at mu.
+          2. The production models CONDITION near-noiselessly (interpolate: the
+             fitted C*RBF with the WhiteKernel noise DROPPED, tiny jitter). The
+             sampling noise floor would smooth xi back across the feasibility
+             boundary -- so the constrained field must interpolate xi to REALISE
+             it. Real-energy coefficients are deterministic, so interpolation is
+             the correct production model.
+          3. Exchange (semi-infinite) loop: check disc on the densified val set;
+             add any violated points to the active set and re-solve, up to
+             refine_rounds -- feasibility on the check set with a small active set.
+
+        Terminal: self.energies/geoms retain the TRUE data; the coefficient
+        models carry the active points as pseudo-observations. Breaks Gaussian
+        statistics (variances meaningless afterwards). n=2,3 only.
+        """
+        from scipy.optimize import minimize, NonlinearConstraint
+        from scipy.linalg import cho_factor, cho_solve
+
+        if self.nstates < 2 or self.nstates > 3:
+            raise NotImplementedError('CP._constrained_refit: discriminant '
+                                      'implemented for n=2,3 only.')
+        ncoef = self.nstates - 1
+
+        E = (self.energies if self.energies is not None
+             else self._recover_energies())
+        if companion is not None:
+            self.ctype = companion
+        # RAW (faithful) representation -- physicality now comes from the
+        # constraint, not the log-reparam floor / Re()-clamp
+        self.companion = make_companion(self.ctype, self.nstates, 0.0)
+        self.targets   = self.project_targets(E, self.geoms)   # raw (nstates,npts)
+
+        # unconstrained frozen-theta REFERENCE fit of every channel (fits omega,
+        # and supplies the mean/cov the coefficient MAP stays near)
+        for m in range(self.nstates):
+            self._refit_frozen(m, self.descriptors, self.targets[m])
+        ref = list(self.models)                                # keep as mu/Sigma source
+
+        D_tr = self.descriptors
+        y_tr = self.targets                                    # (nstates, Ntr)
+
+        # production (near-interpolating) refit of one channel on (D, y): the
+        # fitted C*RBF part with the WhiteKernel noise dropped, and the SMALLEST
+        # jitter that keeps the kernel positive-definite so the field passes
+        # THROUGH y (realising the constrained values). Real SOAP kernels with
+        # clustered samples (+ added midpoints) can be ill-conditioned, so the
+        # jitter self-escalates x10 on a Cholesky failure rather than being a
+        # knob the caller must tune. jitter_used is recorded (escalation is a
+        # conditioning signal).
+        jit = {'max': float(jitter)}
+        def _interp_model(kern, D, y):
+            base = kern.k1 if hasattr(kern, 'k1') else kern    # C*RBF (no White)
+            a    = float(jitter)
+            for _ in range(9):                                 # 1e-8 ... up to ~1
+                try:
+                    mdl = gpr.GPRegressor(kernel=base, optimizer=None, alpha=a,
+                                          normalize_y=True)
+                    mdl.fit(D, y)
+                    jit['max'] = max(jit['max'], a)
+                    return mdl
+                except np.linalg.LinAlgError:
+                    a *= 10.0
+            raise np.linalg.LinAlgError(
+                'CP._constrained_refit: near-noiseless conditioning failed even '
+                f'at alpha={a:.1e}; kernel is severely ill-conditioned (consider '
+                'raising the WhiteKernel noise floor at sampling time).')
+
+        # `grid` (geometries) defaults to the retained training geometries
+        if grid is None:
+            if self.geoms is None:
+                raise RuntimeError(
+                    'CP._constrained_refit: grid=None default needs retained '
+                    'geometries (self.geoms is None -- e.g. a descriptor-space '
+                    'rebuild); pass grid= explicitly.')
+            grid = self.geoms
+        grid = np.atleast_2d(np.asarray(grid, dtype=float))
+
+        # active constraint set = grid descriptors that are NOT already training
+        # points (training data is fixed and auto-hyperbolic) -> EMPTY when grid
+        # defaults to self.geoms; the exchange loop fills it from D_val below
+        D_gr = self._dedup_rows(self.descriptor.generate(grid), D_tr)
+
+        # between-sample check set: `grid` densified by the scalar factor val_grid
+        D_val = None
+        if val_grid and val_grid > 1:
+            D_val = self._dedup_rows(
+                self.descriptor.generate(self._densify(grid, val_grid)), D_tr)
+
+        def _solve(D_c):
+            """constrained-MAP over the coefficient values at D_c (grid only)."""
+            M  = D_c.shape[0]
+            mu = np.zeros((ncoef, M)); Pf = []
+            for k in range(ncoef):
+                mean, cov = ref[k + 1].predict(D_c, return_cov=True)
+                mu[k]     = mean
+                cov[np.diag_indices_from(cov)] += 1.0e-10*(np.trace(cov)/M + 1.0)
+                Pf.append(cho_factor(cov, lower=True))
+            split = lambda x: x.reshape(ncoef, M)
+            def obj(x):
+                xi = split(x); f = 0.0; g = np.empty_like(xi)
+                for k in range(ncoef):
+                    s = cho_solve(Pf[k], xi[k] - mu[k])
+                    f += 0.5*(xi[k] - mu[k]) @ s; g[k] = s
+                return f, g.ravel()
+            def hessp(x, p):
+                pk = split(p); out = np.empty_like(pk)
+                for k in range(ncoef):
+                    out[k] = cho_solve(Pf[k], pk[k])
+                return out.ravel()
+            con = NonlinearConstraint(
+                lambda x: self._discriminant(split(x)), delta, np.inf,
+                jac=lambda x: self._discriminant_jac(split(x)))
+            res = minimize(obj, mu.ravel().copy(), jac=True, hessp=hessp,
+                           method='trust-constr', constraints=[con],
+                           options={'maxiter': maxiter, 'gtol': 1e-8,
+                                    'xtol': 1e-10, 'verbose': 0})
+            return split(res.x), res
+
+        report = {}
+        for rnd in range(refine_rounds + 1):
+            if D_gr.shape[0] > 0:                              # solve the MAP
+                xi, res = _solve(D_gr)
+                D_cond  = np.vstack([D_tr, D_gr])
+                y_cond  = [np.concatenate([y_tr[k + 1], xi[k]])
+                           for k in range(ncoef)]
+                niter, conv = int(res.niter), bool(res.success)
+            else:                                             # nothing binds yet
+                D_cond      = D_tr
+                y_cond      = [y_tr[k + 1] for k in range(ncoef)]
+                niter, conv = 0, True
+            # condition production (near-noiseless): omega + constrained coeffs
+            self.models[0] = _interp_model(ref[0].kernel_, D_tr, y_tr[0])
+            for k in range(ncoef):
+                self.models[k + 1] = _interp_model(ref[k + 1].kernel_,
+                                                   D_cond, y_cond[k])
+
+            # feasibility check on the densified set (else the active set / data).
+            # 'feasible' (real-rootedness on the check set) is the production
+            # success criterion -- NOT trust-constr's optimality flag, which stays
+            # False on the flat-once-feasible objective while already feasible.
+            D_chk = D_val if D_val is not None else (D_gr if D_gr.shape[0] else D_tr)
+            cc    = [self.models[k + 1].predict(D_chk) for k in range(ncoef)]
+            dchk  = self._discriminant(np.asarray(cc))
+            report = {'round': rnd, 'niter': niter,
+                      'feasible': bool(dchk.min() >= 0.0), 'converged': conv,
+                      'n_active': int(D_gr.shape[0]),
+                      'min_disc_check': float(dchk.min()), 'delta': float(delta),
+                      'jitter_used': jit['max']}
+            viol = np.where(dchk < 0.5 * delta)[0]
+            if D_val is None or len(viol) == 0 or rnd == refine_rounds:
+                break
+            add  = D_val[viol]
+            D_gr = np.vstack([D_gr, add]) if D_gr.shape[0] else add  # grow active set
+
+        self._constrained = True
+        self._constraint_report = report
+        return np.array([m.kernel_.theta for m in self.models], dtype=float)
+
+    #
+    def _dedup_rows(self, D, ref, rtol=1.0e-8):
+        """Rows of D not (near-)coincident with any row of `ref` (both in
+        descriptor space). Used to drop grid/val points that duplicate the
+        fixed training set -- e.g. the whole of grid when it defaults to
+        self.geoms."""
+        if D.shape[0] == 0:
+            return D
+        from scipy.spatial import cKDTree
+        dist, _ = cKDTree(ref).query(D, k=1)
+        tol = rtol * (1.0 + float(np.median(np.linalg.norm(ref, axis=1))))
+        return D[dist > tol]
+
+    #
+    def _densify(self, geoms, factor):
+        """Keep the originals and add the MIDPOINTS between each point and its
+        (factor-1) nearest neighbours. Midpoints stay ON the sampled (trajectory)
+        manifold -- BETWEEN adjacent samples, where the interpolant actually runs
+        and a between-sample hyperbolicity violation would occur. A random
+        perturbation would instead go (almost surely) ORTHOGONAL to a low-
+        dimensional manifold embedded in a high-dimensional configuration space,
+        probing regions the surrogate never sees; midpoints do not. Deterministic;
+        unordered pairs de-duplicated."""
+        geoms = np.atleast_2d(np.asarray(geoms, dtype=float))
+        n     = geoms.shape[0]
+        m     = int(max(round(factor), 1)) - 1        # neighbours per point
+        if m < 1 or n < 2:
+            return geoms
+        from scipy.spatial import cKDTree
+        m      = min(m, n - 1)
+        _, idx = cKDTree(geoms).query(geoms, k=m + 1)  # col 0 is self
+        i      = np.repeat(np.arange(n), m)
+        j      = idx[:, 1:].ravel()                    # m nearest neighbours
+        mid    = 0.5 * (geoms[i] + geoms[j])           # on-manifold midpoints
+        # de-duplicate unordered pairs (mid of (i,j) == mid of (j,i))
+        pairs      = np.stack([np.minimum(i, j), np.maximum(i, j)], axis=1)
+        _, keep    = np.unique(pairs, axis=0, return_index=True)
+        return np.vstack([geoms, mid[keep]])
+
+    #
+    def _discriminant(self, xi):
+        """Characteristic-polynomial discriminant per constraint point; >= 0
+        iff all roots are real. xi shape (ncoef, M) holds (c_0, .., c_{n-2}).
+          n=2:  disc(l^2 + c_0)         = -4 c_0
+          n=3:  disc(l^3 + c_1 l + c_0) = -4 c_1^3 - 27 c_0^2
+        (c_{n-1}=0 traceless, monic.) n>=4 needs the subdiscriminant chain."""
+        if self.nstates == 2:
+            return -4.0 * xi[0]
+        c0, c1 = xi[0], xi[1]                 # c1 == c_{n-2}
+        return -4.0 * c1**3 - 27.0 * c0**2
+
+    #
+    def _discriminant_jac(self, xi):
+        """Sparse Jacobian (M, ncoef*M) of _discriminant wrt the flattened xi
+        (row j = constraint point j; columns k*M + j = d c_k / that point)."""
+        import scipy.sparse as sp
+        M    = xi.shape[1]
+        rows = np.arange(M)
+        if self.nstates == 2:
+            return sp.csr_matrix((np.full(M, -4.0), (rows, rows)), shape=(M, M))
+        c0, c1 = xi[0], xi[1]
+        r = np.concatenate([rows,          rows])
+        c = np.concatenate([rows,          rows + M])
+        d = np.concatenate([-54.0 * c0,   -12.0 * c1**2])
+        return sp.csr_matrix((d, (r, c)), shape=(M, 2 * M))
 
     #
     def _recover_energies(self):
@@ -569,6 +845,21 @@ class CP(Surrogate):
 
     #
     @timer.timed
+    def _warn_constrained_variance(self, std, cov):
+        """Warn (once) that std/cov are meaningless on a constrained-refit model:
+        the hard hyperbolicity inequality truncates the posterior (non-Gaussian),
+        and the production model near-interpolates, so any returned variance is
+        just the interpolation jitter -- use the unconstrained sampling model for
+        uncertainty. The value is still returned (no hard failure)."""
+        if (std or cov) and getattr(self, '_constrained', False):
+            warnings.warn(
+                'CP: std/cov requested on a CONSTRAINED (production) surrogate. '
+                'The constrained refit truncates the GP posterior (non-Gaussian) '
+                'and near-interpolates, so the returned variance is meaningless. '
+                'Use the unconstrained sampling model for uncertainty.',
+                RuntimeWarning, stacklevel=3)
+
+    #
     def evaluate(self, gms, states=None, std=False, cov=False, gradient=False):
         """
         Evaluate the recovered states E_0..E_{N-1} (ascending), or the
@@ -578,6 +869,7 @@ class CP(Surrogate):
         _evaluate_and_gradient -- i.e. returns (e, estd, g, gcov) rather than
         just energies.
         """
+        self._warn_constrained_variance(std, cov)
         if gradient:
             return self._evaluate_and_gradient(gms, states=states,
                                                 std=std, cov=cov)
@@ -767,6 +1059,7 @@ class CP(Surrogate):
         class docstring). Gradient covariance, if requested, uses the
         same state Jacobian (delta-method, independent GPs).
         """
+        self._warn_constrained_variance(std, cov)
         if self.numerical_grad:
             return self._num_gradient(gms, states)
 

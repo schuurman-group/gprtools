@@ -609,6 +609,77 @@ def test_adiabat_incremental_update(nstates):
     assert dE < 1e-9 and dG < 1e-8
 
 
+def test_discriminant_jacobian():
+    """CP._discriminant_jac (sparse) matches finite difference (n=2 and n=3)."""
+    for n in (2, 3):
+        cp  = surrogate.CP(n, IdentityDescriptor())
+        rng = np.random.default_rng(0)
+        xi  = rng.standard_normal((n - 1, 6))
+        if n == 3:
+            xi[1] = -np.abs(xi[1]) - 0.5           # c_{n-2} < 0 regime
+        J  = cp._discriminant_jac(xi).toarray()
+        Jn = np.zeros_like(J); h = 1e-6
+        for k in range(n - 1):
+            for j in range(6):
+                xp = xi.copy(); xp[k, j] += h
+                xm = xi.copy(); xm[k, j] -= h
+                Jn[:, k*6 + j] = (cp._discriminant(xp) - cp._discriminant(xm))/(2*h)
+        err = np.max(np.abs(J - Jn))
+        print(f'  [{n}-state] discriminant jac analytic-vs-FD = {err:.2e}')
+        assert err < 1e-6
+
+
+def test_constrained_refit(nstates):
+    """refit(constrained=True): the constrained-GP-MAP production refit enforces
+    real-rootedness (discriminant >= delta) between samples, exactly where the
+    unconstrained FAITHFUL fit goes complex -- while staying faithful to the
+    data. n=2,3."""
+    rng = np.random.default_rng(3)
+    th  = rng.uniform(0, 2*np.pi, 30); rr = rng.uniform(1.0, 1.5, 30)
+    Xtr = np.c_[rr*np.cos(th), rr*np.sin(th)]
+
+    def energies(X):                       # states 0/1 cone at the unsampled origin
+        x, y = X[:, 0], X[:, 1]
+        mean = 0.6 + 0.15*x + 0.05*y
+        half = 0.9*np.sqrt(x**2 + y**2)
+        rows = [mean - half, mean + half]
+        if nstates == 3:
+            rows.append(2.2 + 0.25*y - 0.1*x)
+        return np.vstack(rows)
+    def mesh(n):
+        gx, gy = np.meshgrid(np.linspace(-1.2, 1.2, n), np.linspace(-1.2, 1.2, n))
+        return np.c_[gx.ravel(), gy.ravel()]
+    def min_disc(cp, Xg):
+        d = cp.descriptor.generate(Xg)
+        c = np.asarray([cp.models[k + 1].predict(d) for k in range(nstates - 1)])
+        return cp._discriminant(c).min()
+
+    Etr, st, V = energies(Xtr), list(range(nstates)), mesh(21)
+
+    # unconstrained faithful refit -> complex between samples
+    cpU = surrogate.CP(nstates, IdentityDescriptor(), companion='frobenius')
+    cpU.create([Xtr, Etr], states=st); cpU.refit(degeneracy_eps=0.0)
+    du = min_disc(cpU, V)
+
+    # constrained production refit (small active grid + finer validation grid)
+    cpC = surrogate.CP(nstates, IdentityDescriptor(), companion='frobenius')
+    cpC.create([Xtr, Etr], states=st)
+    cpC.refit(constrained=True, delta=1e-3, grid=mesh(9), val_grid=3, maxiter=150)
+    dc  = min_disc(cpC, V)
+    rep = cpC._constraint_report
+
+    eC = _arr(cpC.evaluate(Xtr))
+    if eC.shape != Etr.shape:
+        eC = eC.T
+    fid = np.max(np.abs(np.sort(eC, axis=0) - np.sort(Etr, axis=0)))
+
+    print(f'  [{nstates}-state] unconstrained min_disc={du:+.2e} -> constrained '
+          f'{dc:+.2e} (feasible={rep["feasible"]}), fidelity={fid:.1e} eV')
+    assert du < 0.0                        # unconstrained IS non-hyperbolic
+    assert rep['feasible'] and dc >= 0.0   # constrained is real-rooted on the grid
+    assert fid < 1e-2                      # stays faithful to the data
+
+
 if __name__ == '__main__':
     print('roundtrip (machine precision):')
     for n in (2, 3):
@@ -646,4 +717,9 @@ if __name__ == '__main__':
     print('Adiabat.update(optimize=False) == frozen full refit:')
     for n in (2, 3):
         test_adiabat_incremental_update(n)
+    print('constrained-refit discriminant jacobian:')
+    test_discriminant_jacobian()
+    print('refit(constrained=True): real-rootedness enforced between samples:')
+    for n in (2, 3):
+        test_constrained_refit(n)
     print('\nALL CP SMOKE TESTS PASSED')
