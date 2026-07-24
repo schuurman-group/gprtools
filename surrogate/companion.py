@@ -36,18 +36,90 @@ import math
 import numpy as np
 
 
+# A companion strategy is TWO orthogonal choices:
+#   representation -- how the learned targets map to the char-poly coefficients:
+#       'standard'   monomial coefficients (log-c_{n-2} or raw, per degeneracy_eps)
+#       'hyperbolic' the n<=3 tanh-squash (real-rooted by construction; convex-
+#                    aggregatable; see class Hyperbolic)
+#   matrix         which companion matrix reconstructs the roots:
+#       'frobenius'  classical Frobenius companion (numpy.roots)
+#       'colleague'  Chebyshev colleague matrix (backward stable near the cusp)
+#       'schmeisser' symmetric-tridiagonal Schmeisser companion (guaranteed-real
+#                    eigvalsh + off-diagonal floor) -- a BUNDLED strategy that is
+#                    its own real-rootedness mechanism, so it pairs only with the
+#                    'standard' representation.
+# The API accepts either a (representation, matrix) pair or a bare-string alias.
+_STRATEGY_ALIASES = {
+    'frobenius':  ('standard',   'frobenius'),
+    'monomial':   ('standard',   'frobenius'),
+    'np.roots':   ('standard',   'frobenius'),
+    'numpy':      ('standard',   'frobenius'),
+    'standard':   ('standard',   'frobenius'),
+    'colleague':  ('standard',   'colleague'),
+    'chebyshev':  ('standard',   'colleague'),
+    'schmeisser': ('standard',   'schmeisser'),
+    'hyperbolic': ('hyperbolic', 'frobenius'),
+    'hyp':        ('hyperbolic', 'frobenius'),
+    'squash':     ('hyperbolic', 'frobenius'),
+}
+_REP_ALIASES    = {'monomial': 'standard', 'log': 'standard', 'raw': 'standard'}
+_MATRIX_ALIASES = {'chebyshev': 'colleague', 'np.roots': 'frobenius',
+                   'numpy': 'frobenius', 'monomial': 'frobenius'}
+
+
 def make_companion(kind, nstates, degeneracy_eps):
-    """Factory: map a kind string to a Companion strategy instance."""
-    key = (kind or 'frobenius').lower()
-    if key in ('frobenius', 'monomial', 'np.roots', 'numpy'):
-        return Frobenius(nstates, degeneracy_eps)
-    if key == 'schmeisser':
+    """Factory: map a companion spec to a Companion strategy instance.
+
+    `kind` is either a bare-string alias (e.g. 'frobenius', 'hyperbolic') or an
+    explicit ``(representation, matrix)`` pair, e.g. ``('hyperbolic',
+    'colleague')``. The default ``'frobenius'`` is exactly ``('standard',
+    'frobenius')``. See the module table above for the axes."""
+    if kind is None:
+        rep, matrix = 'standard', 'frobenius'
+    elif isinstance(kind, str):
+        key = kind.lower()
+        if key not in _STRATEGY_ALIASES:
+            raise ValueError(
+                f"CP companion '{kind}' not recognised. Use a bare alias "
+                f"({', '.join(sorted(_STRATEGY_ALIASES))}) or an explicit "
+                f"(representation, matrix) pair, e.g. ('hyperbolic', 'colleague').")
+        rep, matrix = _STRATEGY_ALIASES[key]
+    elif isinstance(kind, (tuple, list)) and len(kind) == 2:
+        rep    = _REP_ALIASES.get(str(kind[0]).lower(), str(kind[0]).lower())
+        matrix = _MATRIX_ALIASES.get(str(kind[1]).lower(), str(kind[1]).lower())
+    else:
+        raise ValueError(
+            f"CP companion must be an alias string or a (representation, matrix) "
+            f"pair; got {kind!r}.")
+
+    if rep not in ('standard', 'hyperbolic'):
+        raise ValueError(
+            f"companion representation (1st element) must be 'standard' or "
+            f"'hyperbolic'; got {rep!r}. Companion MATRICES ('frobenius', "
+            f"'colleague', 'schmeisser') go in the 2nd element -- e.g. "
+            f"('standard', {rep!r}) if you meant the matrix.")
+    if matrix not in ('frobenius', 'colleague', 'schmeisser'):
+        raise ValueError(
+            f"companion matrix (2nd element) must be 'frobenius', 'colleague' or "
+            f"'schmeisser'; got {matrix!r}.")
+
+    if matrix == 'schmeisser':
+        if rep != 'standard':
+            raise ValueError(
+                "('hyperbolic', 'schmeisser') is rejected: the Schmeisser "
+                "tridiagonal already guarantees real roots via its off-diagonal "
+                "floor, so composing it with the hyperbolic reparametrisation "
+                "stacks two redundant real-rootedness mechanisms. Use "
+                "('hyperbolic', 'frobenius') or ('hyperbolic', 'colleague') for "
+                "the reparam, or ('standard', 'schmeisser') for the tridiagonal.")
         return Schmeisser(nstates, degeneracy_eps)
-    if key in ('colleague', 'chebyshev'):
+    if rep == 'hyperbolic':
+        return Hyperbolic(nstates, degeneracy_eps, matrix=matrix)
+    # standard representation: keep the named subclass for the colleague matrix
+    # (Colleague == Frobenius(matrix='colleague')) so the type is self-describing
+    if matrix == 'colleague':
         return Colleague(nstates, degeneracy_eps)
-    raise ValueError(
-        f"CP companion '{kind}' not recognised; use 'frobenius' "
-        f"(default), 'schmeisser' or 'colleague'.")
+    return Frobenius(nstates, degeneracy_eps)
 
 
 class Companion:
@@ -121,6 +193,15 @@ class Frobenius(Companion):
     # runaway extrapolation, never physics.
     _G_MAX = 50.0
 
+    def __init__(self, nstates, degeneracy_eps, matrix='frobenius'):
+        super().__init__(nstates, degeneracy_eps)
+        if matrix not in ('frobenius', 'colleague'):
+            raise ValueError(
+                f"{type(self).__name__} rootfinder (matrix) must be 'frobenius' "
+                f"or 'colleague'; got {matrix!r}. (Schmeisser is a standalone "
+                f"bundled strategy, not a rootfinder for this representation.)")
+        self._matrix = matrix       # which companion matrix _roots() diagonalises
+
     #
     def _log_c2(self, c2):
         """Forward log-reparametrisation g = log(-c_{n-2}) with the in-log
@@ -184,9 +265,82 @@ class Frobenius(Companion):
     #
     def _roots(self, mono):
         """Roots of the monic monomial polynomial (highest-degree-first
-        coefficients), via the classical Frobenius companion (numpy.roots).
-        Overridden by Colleague to use the Chebyshev colleague matrix."""
+        coefficients) via the selected companion matrix (self._matrix): the
+        classical Frobenius companion (numpy.roots) or the Chebyshev colleague
+        matrix. The representation (log/tanh reparam) is orthogonal to this
+        choice, so any representation composes with either rootfinder."""
+        if self._matrix == 'colleague':
+            return self._roots_colleague(mono)
         return np.roots(mono)
+
+    #
+    def _roots_colleague(self, mono):
+        """Roots via the Chebyshev colleague matrix (Gutleb et al. Algorithm 4 /
+        Theorem 2.4): backward stable and free of the deconvolution the
+        Schmeisser construction needs -- the paper's best overall performer, and
+        better conditioned than Frobenius near a near-multiple root (the cusp the
+        hyperbolic representation operates against).
+
+        Per query the monic monomial polynomial is (i) rescaled by a Cauchy root
+        bound so all roots fall in the unit disk (where Chebyshev rootfinding is
+        well conditioned), (ii) converted to monic-in-Chebyshev coefficients b_j
+        via the fixed y^k -> sum_l gamma_{k,l} T_l map (Lemma 3.3), (iii)
+        diagonalised as the colleague matrix, (iv) rescaled back. The colleague
+        matrix is non-symmetric, so large perturbations can still yield complex
+        roots -- handled, as for Frobenius, by taking Re(.) in to_roots."""
+        n = len(mono) - 1
+        if n == 1:
+            return np.array([-mono[1]], dtype=complex)   # lambda + c_0 = 0
+        # (i) rescale to the unit disk (Cauchy bound); mono is highest-first, so
+        #     coeff of y^{n-i} is mono[i] and q(y)=p(R y)/R^n has coeffs
+        #     mono[i] * R^{-i} (still monic).
+        R     = 1.0 + float(np.max(np.abs(mono[1:])))
+        qmono = mono * (R ** (-np.arange(n + 1)))
+        b     = self._cheb_from_monomial(qmono)          # (ii) monic-in-Chebyshev
+        # (iii) colleague matrix eigenvalues, (iv) undo the rescaling
+        return np.linalg.eigvals(self._colleague_matrix(b)) * R
+
+    #
+    @staticmethod
+    def _cheb_from_monomial(qmono):
+        """Monic monomial coeffs (highest-first, leading 1) -> Chebyshev
+        coefficients b_0..b_{n-1} of the monic-in-Chebyshev polynomial
+        T_n + sum_j b_j T_j. Uses y^k = sum_{l} gamma_{k,l} T_l with
+        gamma_{k,l} = 2^{-k} C(k,(k-l)/2) (l=0) or 2^{1-k} C(k,(k-l)/2) (l>0),
+        (k-l) even (Gutleb et al. Lemma 3.3)."""
+        n    = len(qmono) - 1
+        a    = qmono[::-1]                       # low-to-high: a[k]=coeff y^k
+        beta = np.zeros(n + 1, dtype=float)
+        for k in range(n + 1):
+            ak = a[k]
+            if ak == 0.0:
+                continue
+            l = k
+            while l >= 0:
+                gam = ((2.0 ** -k if l == 0 else 2.0 ** (1 - k))
+                       * math.comb(k, (k - l) // 2))
+                beta[l] += ak * gam
+                l -= 2
+        # normalise so the T_n coefficient is 1 (beta[n] = 2^{1-n} > 0)
+        return beta[:n] / beta[n]
+
+    #
+    @staticmethod
+    def _colleague_matrix(b):
+        """Colleague matrix of T_n + sum_{j=0}^{n-1} b_j T_j (Gutleb et al.
+        eq 2.2): symmetric tridiagonal H (off-diagonals 1/2, last sqrt(2)/2)
+        minus the rank-1 first-row update (1/2) e_1 (b_{n-1},...,b_1,sqrt2 b_0)."""
+        n = len(b)
+        A = np.zeros((n, n), dtype=float)
+        for i in range(n - 1):
+            off = 0.5 if i < n - 2 else np.sqrt(0.5)     # sqrt(2)/2 on the last
+            A[i, i + 1] = off
+            A[i + 1, i] = off
+        c        = np.empty(n, dtype=float)
+        c[:n - 1] = b[n - 1:0:-1]                          # b_{n-1}, ..., b_1
+        c[n - 1]  = np.sqrt(2.0) * b[0]
+        A[0, :]  -= 0.5 * c
+        return A
 
     #
     def root_jacobian(self, z, slopes):
@@ -317,80 +471,161 @@ class Schmeisser(Frobenius):
 
 class Colleague(Frobenius):
     """
-    Chebyshev colleague matrix (Gutleb et al. Algorithm 4 / Theorem 2.4):
-    reconstruct the splitting roots by expressing the monic characteristic
-    polynomial in the Chebyshev basis and diagonalising the colleague matrix,
-    which is backward stable and free of the deconvolution that the Schmeisser
-    construction needs -- the paper's best overall performer.
-
-    This subclasses Frobenius and changes ONLY the rootfinder (`_roots`): the
-    learned coefficient targets, the c_{n-2} reparametrisation/dual-rep, and the
-    implicit-diff root jacobian dz_i/dc_k = -z_i^k/p'(z_i) are all identical
-    (the jacobian depends on the roots + the monomial polynomial, not on which
-    companion matrix produced the roots). So 'frobenius' vs 'colleague' is a
-    controlled comparison: same representation, different reconstruction matrix.
-
-    Per query the monic monomial polynomial is (i) rescaled by a Cauchy root
-    bound so all roots fall in the unit disk (where Chebyshev rootfinding is
-    well conditioned), (ii) converted to monic-in-Chebyshev coefficients b_j via
-    the fixed y^k -> sum_l gamma_{k,l} T_l map (Gutleb et al. Lemma 3.3), (iii)
-    diagonalised as the colleague matrix, (iv) rescaled back. The colleague
-    matrix is non-symmetric, so large perturbations can still yield complex
-    roots -- handled, as in Frobenius, by taking Re(.) with a one-shot warning.
+    Standard representation reconstructed with the Chebyshev colleague matrix
+    (Gutleb et al. Algorithm 4 / Theorem 2.4): backward stable and free of the
+    deconvolution the Schmeisser construction needs -- the paper's best overall
+    performer. This is exactly the ('standard', 'colleague') pairing; the learned
+    targets, the c_{n-2} reparametrisation and the implicit-diff jacobian are
+    identical to Frobenius (they depend on the roots + the monomial polynomial,
+    not on which companion matrix produced them), so 'frobenius' vs 'colleague'
+    is a controlled comparison: same representation, different rootfinder. The
+    rootfinding itself now lives on the base (`Frobenius._roots_colleague`), so
+    any representation -- including 'hyperbolic' -- can select it via the matrix
+    axis; this thin subclass is retained for the bare-string alias.
     """
-    #
-    def _roots(self, mono):
-        n = len(mono) - 1
-        if n == 1:
-            return np.array([-mono[1]], dtype=complex)   # lambda + c_0 = 0
-        # (i) rescale to the unit disk: |roots| <= 1 + max|non-leading coeff|
-        #     (Cauchy bound). mono is highest-first; coeff of y^{n-i} is mono[i],
-        #     so q(y)=p(R y)/R^n has coeffs mono[i] * R^{-i} (still monic).
-        R     = 1.0 + float(np.max(np.abs(mono[1:])))
-        qmono = mono * (R ** (-np.arange(n + 1)))
-        # (ii) monomial -> monic-in-Chebyshev coefficients b_0..b_{n-1}
-        b     = self._cheb_from_monomial(qmono)
-        # (iii) colleague matrix eigenvalues, (iv) undo the rescaling
-        return np.linalg.eigvals(self._colleague_matrix(b)) * R
+    def __init__(self, nstates, degeneracy_eps):
+        super().__init__(nstates, degeneracy_eps, matrix='colleague')
+
+
+class Hyperbolic(Frobenius):
+    """
+    HYPERBOLIC-BY-CONSTRUCTION reparametrisation of the coefficient channels,
+    so ANY value of the learned targets reconstructs to REAL (hyperbolic) roots
+    -- the n=3 structural analogue of what log-c_{n-2} already does for n=2.
+
+    Why: the Frobenius/Colleague log-reparam guarantees c_{n-2}<0 (necessary)
+    but for n>=3 the remaining coefficients are free, so an interpolating /
+    extrapolating GP can drive the char-poly OUT of the real-rooted region ->
+    complex pair -> Re()-clamp -> two adiabats glued over an extended patch
+    (artifactual extended degeneracy; p'(z)->0 -> singular force). A prior-mean
+    reference spectrum does NOT cure this -- the collapse is a feasibility-
+    during-extrapolation failure, not a far-field mean. This companion removes
+    the failure at the representation level.
+
+    n=2: delegates to Frobenius (log-c_0 is already hyperbolic-by-construction).
+
+    n=3: the depressed cubic p(z)=z^3 + c_1 z + c_0 (traceless, c_2=0) is real-
+    rooted iff its discriminant Delta = -4 c_1^3 - 27 c_0^2 >= 0, i.e.
+        c_1 < 0  and  |c_0| <= (2/sqrt27) (-c_1)^{3/2}
+    -- a cusped, NON-CONVEX region. Parametrise it by (a, b) in R^2:
+        c_1 = -exp(a)                             (a = log(-c_1), the log channel)
+        c_0 = (2/sqrt27) exp(1.5 a) tanh(b)       (b squashes c_0 into the band)
+    Then
+        Delta = 4 exp(3a) - 27 [(2/sqrt27) exp(1.5a) tanh b]^2
+              = 4 exp(3a) (1 - tanh^2 b) = 4 exp(3a) sech^2 b  >  0
+    for EVERY (a, b) in R^2. So:
+      * reconstruction is always real-rooted (and roots stay DISTINCT for finite
+        b -- bounded, smooth forces, like the Schmeisser off-diagonal floor but
+        with no deconvolution);
+      * the feasible target set is all of R^2 (CONVEX), so a BCM/GRBCM precision-
+        weighted MEAN of experts stays hyperbolic -- unlike the raw-coefficient
+        or hard-constrained representations, whose feasible set is non-convex and
+        can average to complex. This is the aggregatable route to n>=3 physical
+        sparsity (the constrained refit's win, but composable);
+      * it composes with the coefficient reference spectrum (all in target space).
+
+    The log channel (row -1) still carries the degeneracy_eps min-spread floor via
+    Frobenius._log_c2. The tanh keeps c_0 strictly inside the band, so an EXACT CI
+    (Delta=0) is only approached (b -> +-inf), never represented -- this is the
+    SMOOTH sampling/production representation; faithful MECI work stays on the
+    eps=0 Frobenius/Schmeisser path. n>=4 real-rootedness is the subresultant
+    chain, not one discriminant -> raises (deferred; see cp.py refit notes).
+    """
+    _K         = 2.0 / math.sqrt(27.0)      # discriminant-band half-width factor
+    _ATANH_CLIP = 1.0 - 1.0e-9              # keep b finite at the exact CI boundary
+    _B_MAX     = 20.0                        # cap |b| on reconstruction (tanh flat)
+
+    def __init__(self, nstates, degeneracy_eps, matrix='frobenius'):
+        # matrix selects the rootfinder (frobenius|colleague); the tanh-squash
+        # representation is orthogonal to it, so ('hyperbolic','colleague') pairs
+        # the by-construction-real coefficients with the better-conditioned
+        # colleague rootfinder (recommended near the cusp the squash operates in).
+        super().__init__(nstates, degeneracy_eps, matrix=matrix)
+        if nstates > 3:
+            raise NotImplementedError(
+                f"Hyperbolic companion supports n<=3 (n=2 -> log-c0; n=3 -> the "
+                f"discriminant tanh-squash); got nstates={nstates}. For n>=4 "
+                f"real-rootedness is the subresultant/subdiscriminant chain "
+                f"(floor(n/2) inequalities), not a single discriminant -- not "
+                f"yet implemented.")
 
     #
-    @staticmethod
-    def _cheb_from_monomial(qmono):
-        """Monic monomial coeffs (highest-first, leading 1) -> Chebyshev
-        coefficients b_0..b_{n-1} of the monic-in-Chebyshev polynomial
-        T_n + sum_j b_j T_j. Uses y^k = sum_{l} gamma_{k,l} T_l with
-        gamma_{k,l} = 2^{-k} C(k,(k-l)/2) (l=0) or 2^{1-k} C(k,(k-l)/2) (l>0),
-        (k-l) even (Gutleb et al. Lemma 3.3)."""
-        n    = len(qmono) - 1
-        a    = qmono[::-1]                       # low-to-high: a[k]=coeff y^k
-        beta = np.zeros(n + 1, dtype=float)
-        for k in range(n + 1):
-            ak = a[k]
-            if ak == 0.0:
-                continue
-            l = k
-            while l >= 0:
-                gam = ((2.0 ** -k if l == 0 else 2.0 ** (1 - k))
-                       * math.comb(k, (k - l) // 2))
-                beta[l] += ak * gam
-                l -= 2
-        # normalise so the T_n coefficient is 1 (beta[n] = 2^{1-n} > 0)
-        return beta[:n] / beta[n]
+    def to_coeffs(self, Z):
+        if self.nstates <= 2:
+            return super().to_coeffs(Z)             # log-c0, already hyperbolic
+        # n == 3: raw c_0, c_1 then (b, a) = (squashed c_0, log(-c_1))
+        n, npts = Z.shape
+        c0 = np.empty(npts, dtype=float)
+        c1 = np.empty(npts, dtype=float)
+        for p in range(npts):
+            poly  = np.poly(Z[:, p])                # [1, c_2(=0), c_1, c_0]
+            c0[p] = poly[3]
+            c1[p] = poly[2]
+        a = self._log_c2(c1)                        # log(-c_1), eps-floored (c_1<=0)
+        # band half-width uses exp(a) (= floored -c_1) so the roundtrip is exact
+        band = self._K * np.exp(1.5 * a)
+        arg  = np.clip(c0 / band, -self._ATANH_CLIP, self._ATANH_CLIP)
+        b    = np.arctanh(arg)
+        return np.vstack([b, a])                    # row 0 = b (c_0 slot), 1 = a
 
     #
-    @staticmethod
-    def _colleague_matrix(b):
-        """Colleague matrix of T_n + sum_{j=0}^{n-1} b_j T_j (Gutleb et al.
-        eq 2.2): symmetric tridiagonal H (off-diagonals 1/2, last sqrt(2)/2)
-        minus the rank-1 first-row update (1/2) e_1 (b_{n-1},...,b_1,sqrt2 b_0)."""
-        n = len(b)
-        A = np.zeros((n, n), dtype=float)
-        for i in range(n - 1):
-            off = 0.5 if i < n - 2 else np.sqrt(0.5)     # sqrt(2)/2 on the last
-            A[i, i + 1] = off
-            A[i + 1, i] = off
-        c        = np.empty(n, dtype=float)
-        c[:n - 1] = b[n - 1:0:-1]                          # b_{n-1}, ..., b_1
-        c[n - 1]  = np.sqrt(2.0) * b[0]
-        A[0, :]  -= 0.5 * c
-        return A
+    def to_roots(self, coeffs):
+        if self.nstates <= 2:
+            return super().to_roots(coeffs)
+        # n == 3: (b, a) -> (c_0, c_1), always-real roots, + full chain-rule M
+        ncoef, ngm = coeffs.shape
+        b   = np.clip(coeffs[0], -self._B_MAX, self._B_MAX)
+        a   = np.minimum(coeffs[1], self._G_MAX)
+        e15 = np.exp(1.5 * a)
+        th  = np.tanh(b)
+        c1  = -np.exp(a)                            # < 0
+        c0  = self._K * e15 * th                    # |c0| < K (-c1)^1.5
+
+        z      = np.zeros((ngm, 3), dtype=float)
+        max_im = 0.
+        for g in range(ngm):
+            mono   = np.array([1.0, 0.0, c1[g], c0[g]], dtype=float)
+            r      = self._roots(mono)              # real by construction
+            max_im = max(max_im, float(np.max(np.abs(r.imag))))
+            z[g]   = np.sort(r.real)
+        # by construction Delta>0, so |Im| is pure round-off; a large value would
+        # signal a numerical failure (near-triple root / ill-conditioning)
+        if max_im > self._ROOT_IM_TOL and not self._warned_im:
+            print(f'WARNING: CP (Hyperbolic) reconstruction roots have |Im| up '
+                  f'to {max_im:.3e} au despite Delta>0 by construction -- '
+                  f'rootfinder conditioning near a near-triple root. (further '
+                  f'warnings suppressed for this surrogate)')
+            self._warned_im = True
+
+        # full chain rule M[g] = d c_k / d stored_m, rows k=(c_0,c_1) cols m=(b,a)
+        M         = np.zeros((ngm, 2, 2), dtype=float)
+        M[:, 0, 0] = self._K * e15 * (1.0 - th * th)    # dc_0/db = K e^{1.5a} sech^2 b
+        M[:, 0, 1] = 1.5 * c0                           # dc_0/da = 1.5 c_0
+        M[:, 1, 0] = 0.0                                # dc_1/db = 0
+        M[:, 1, 1] = c1                                 # dc_1/da = -e^a = c_1
+        return z, M
+
+    #
+    def root_jacobian(self, z, slopes):
+        if self.nstates <= 2:
+            return super().root_jacobian(z, slopes)     # slopes = diagonal (ngm,1)
+        # slopes here is the full chain-rule tensor M (ngm, n-1, n-1) from to_roots
+        M      = slopes
+        ngm, n = z.shape                                # n == 3
+        Jc     = np.zeros((ngm, n, n - 1), dtype=float) # dz_i / d c_k, k=0..n-2
+        for g in range(ngm):
+            for i in range(n):
+                pprime = np.prod(z[g, i] - np.delete(z[g], i))
+                if abs(pprime) < self._PPRIME_TOL:
+                    if not self._warned_coinc:
+                        print(f"WARNING: CP (Hyperbolic) near-coincident roots "
+                              f"|p'(z_{i})|={abs(pprime):.3e} au (b saturated at "
+                              f"the CI boundary); force bounded but stiff. "
+                              f"(further warnings suppressed for this surrogate)")
+                        self._warned_coinc = True
+                    pprime = (self._PPRIME_TOL if pprime == 0.
+                              else np.copysign(self._PPRIME_TOL, pprime))
+                powers     = z[g, i] ** np.arange(n - 1)     # z^0, z^1
+                Jc[g, i, :] = -powers / pprime
+        # chain rule: dz_i/d stored_m = sum_k (dz_i/dc_k)(dc_k/d stored_m)
+        return np.einsum('gik,gkm->gim', Jc, M)

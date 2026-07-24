@@ -503,6 +503,152 @@ def test_schmeisser_companion():
     assert gerr < 1e-5, gerr
 
 
+def test_hyperbolic_companion():
+    """HYPERBOLIC-BY-CONSTRUCTION n=3 reparam: the depressed cubic is real-rooted
+    for ANY value of the learned targets (a=log(-c1), b=squashed c0), so the
+    n>=3 complex->Re()-clamp extended degeneracy cannot arise. Unlike Schmeisser
+    (real by PROJECTION -> GLUES to a min-gap floor in sparse voids), the target
+    can never leave the hyperbolic interior, so sparse regions revert to a
+    PHYSICALLY SEPARATED spectrum. And the feasible target set is all of R^2
+    (CONVEX) -> a precision-weighted expert average stays hyperbolic (aggregates,
+    unlike the raw-coefficient / hard-constrained reps whose feasible set is
+    non-convex)."""
+    from surrogate.companion import Hyperbolic
+    rng = np.random.default_rng(0)
+    H   = Hyperbolic(3, 1e-4)
+
+    # 1. hyperbolic-by-construction: 5000 random (b, a) -> Delta > 0, roots real
+    ab   = rng.normal(0, 3.0, (2, 5000))
+    b    = np.clip(ab[0], -20, 20); a = np.minimum(ab[1], 50)
+    c1   = -np.exp(a); c0 = H._K * np.exp(1.5 * a) * np.tanh(b)
+    disc = -4 * c1**3 - 27 * c0**2
+    z, _ = H.to_roots(ab)
+    print(f'  hyperbolic-by-construction: min Delta over 5000 random targets '
+          f'= {disc.min():.2e}; min root gap = {np.diff(z, axis=1).min():.2e}')
+    assert disc.min() > 0.0
+    assert np.diff(z, axis=1).min() > 0.0            # real AND distinct
+
+    # 2. roundtrip on well-separated spectra (gap >> eps -> floor inactive)
+    Zr = rng.normal(0, 1.0, (3, 400)); Zr -= Zr.mean(0)
+    zr, _ = H.to_roots(H.to_coeffs(Zr))
+    rerr  = np.max(np.abs(np.sort(Zr, 0).T - zr))
+    print(f'  roundtrip max|sort(Z) - recon| = {rerr:.2e}')
+    assert rerr < 1e-9, rerr
+
+    # 3. analytic root jacobian == finite difference (full non-diagonal chain)
+    ab0    = rng.normal(0, 1.5, (2, 1)); z0, M0 = H.to_roots(ab0)
+    J      = H.root_jacobian(z0, M0)[0]
+    fd     = np.zeros((3, 2)); h = 1e-6
+    for m in range(2):
+        p = ab0.copy(); p[m] += h; zp, _ = H.to_roots(p)
+        q = ab0.copy(); q[m] -= h; zq, _ = H.to_roots(q)
+        fd[:, m] = (zp[0] - zq[0]) / (2 * h)
+    print(f'  root jacobian analytic-vs-FD = {np.max(np.abs(J - fd)):.2e}')
+    assert np.max(np.abs(J - fd)) < 1e-6
+
+    # 4. CONVEXITY / aggregation: two strictly-hyperbolic experts whose RAW-coeff
+    #    mean is COMPLEX, but whose (a,b) mean stays hyperbolic
+    band = lambda cc1: H._K * (-cc1) ** 1.5
+    dsc  = lambda cc1, cc0: -4 * cc1**3 - 27 * cc0**2
+    c1A, c0A = -1.0, 0.98 * band(-1.0)
+    c1B, c0B = -4.0, 0.98 * band(-4.0)
+    dmean = dsc(0.5*(c1A+c1B), 0.5*(c0A+c0B))       # raw-coeff average
+    toab  = lambda cc1, cc0: (np.log(-cc1), np.arctanh(cc0 / band(cc1)))
+    aA, bA = toab(c1A, c0A); aB, bB = toab(c1B, c0B)
+    am, bm = 0.5*(aA+aB), 0.5*(bA+bB)
+    dab = dsc(-np.exp(am), H._K*np.exp(1.5*am)*np.tanh(bm))   # (a,b) average
+    print(f'  aggregation convexity: raw-coeff mean Delta={dmean:+.2f} (complex) '
+          f'-> (a,b) mean Delta={dab:+.2f} (hyperbolic)')
+    assert dmean < 0.0 and dab > 0.0                # the non-convexity the reparam removes
+
+    # 5. end-to-end near a SPARSE seam: no clamp (frobenius) and no glue
+    #    (schmeisser). Sample only the well-separated side, query the sparse tail.
+    xt  = rng.uniform(-4.0, -0.5, 70)[:, None]
+    def E3(xs):
+        xs = np.atleast_1d(np.ravel(xs))
+        out = np.empty((3, xs.size))
+        for j, x in enumerate(xs):
+            Hm = np.array([[0.5*x, 0.06, 0.40],
+                           [0.06, 2.0-0.5*x, 0.40],
+                           [0.40, 0.40, 5.0+0.2*x]])
+            out[:, j] = np.sort(np.linalg.eigvalsh(Hm))
+        return out
+    Et  = E3(xt.ravel())
+    cph = surrogate.CP(3, IdentityDescriptor(), companion='hyperbolic',
+                       degeneracy_eps=1e-4)
+    cph.create([xt, Et], states=[0, 1, 2])
+    xq   = np.array([[2.0], [2.5], [3.0]])          # sparse tail (seam at ~x=2)
+    Eh   = np.sort(_arr(cph.evaluate(xq)).reshape(3, -1), axis=0)
+    gaph = Eh[1] - Eh[0]
+    gmax = max(np.max(np.abs(_arr(cph.gradient(np.array([[x]])))))
+               for x in np.linspace(1.0, 3.0, 21))
+    print(f'  sparse-tail gap (x=2,2.5,3) = {np.round(gaph, 3)}; '
+          f'max|grad| across seam = {gmax:.2e}')
+    assert np.all(np.isfinite(gaph)) and gaph.min() > 0.5   # separated, not glued/clamped
+    assert gmax < 1e2                                       # bounded forces
+
+    # 6. n>=4 refuses loudly (subresultant chain, not one discriminant)
+    try:
+        Hyperbolic(4, 1e-4); raised = False
+    except NotImplementedError:
+        raised = True
+    print(f'  n>=4 NotImplementedError raised = {raised}')
+    assert raised
+
+
+def test_companion_spec():
+    """The `companion` argument is a (representation, matrix) pair: representation
+    in {standard, hyperbolic}, matrix in {frobenius, colleague, schmeisser}.
+    Bare strings are aliases; ('hyperbolic','schmeisser') is rejected (redundant
+    real-rootedness); the default 'frobenius' == ('standard','frobenius')."""
+    from surrogate.companion import make_companion
+    def kind(c): return (type(c).__name__, getattr(c, '_matrix', None))
+
+    # aliases and explicit pairs resolve identically
+    assert kind(make_companion('frobenius', 3, 1e-3))              == ('Frobenius', 'frobenius')
+    assert kind(make_companion(('standard', 'frobenius'), 3, 1e-3)) == ('Frobenius', 'frobenius')
+    assert kind(make_companion('colleague', 3, 1e-3))             == ('Colleague', 'colleague')
+    assert kind(make_companion(('standard', 'colleague'), 3, 1e-3)) == ('Colleague', 'colleague')
+    assert kind(make_companion('hyperbolic', 3, 1e-3))           == ('Hyperbolic', 'frobenius')
+    assert kind(make_companion(('hyperbolic', 'colleague'), 3, 1e-3)) == ('Hyperbolic', 'colleague')
+    assert type(make_companion('schmeisser', 3, 1e-3)).__name__  == 'Schmeisser'
+    print('  aliases and (representation, matrix) pairs resolve consistently')
+
+    # invalid combinations raise (not silently mis-resolve)
+    for bad in [('hyperbolic', 'schmeisser'),    # redundant real-rootedness
+                ('frobenius', 'frobenius'),       # matrix name in the rep slot
+                ('standard', 'bogus'),            # unknown matrix
+                'nonsense']:
+        try:
+            make_companion(bad, 3, 1e-3); raised = False
+        except ValueError:
+            raised = True
+        assert raised, bad
+    print('  invalid specs (incl. hyperbolic+schmeisser) rejected with ValueError')
+
+    # ('hyperbolic','colleague') is a working end-to-end CP: real, finite, and the
+    # colleague rootfinder agrees with frobenius on a well-conditioned fit
+    rng = np.random.default_rng(2)
+    xt  = rng.uniform(-4.0, -0.5, 60)[:, None]
+    def E3(xs):
+        xs = np.atleast_1d(np.ravel(xs)); out = np.empty((3, xs.size))
+        for j, x in enumerate(xs):
+            Hm = np.array([[0.5*x, 0.06, 0.40], [0.06, 2.0-0.5*x, 0.40],
+                           [0.40, 0.40, 5.0+0.2*x]])
+            out[:, j] = np.sort(np.linalg.eigvalsh(Hm))
+        return out
+    Et = E3(xt.ravel()); Xq = np.linspace(0, 3, 30)[:, None]
+    cpf = surrogate.CP(3, IdentityDescriptor(), companion=('hyperbolic', 'frobenius'))
+    cpc = surrogate.CP(3, IdentityDescriptor(), companion=('hyperbolic', 'colleague'))
+    cpf.create([xt, Et], states=[0, 1, 2]); cpc.create([xt, Et], states=[0, 1, 2])
+    Ef, Ec = _arr(cpf.evaluate(Xq)), _arr(cpc.evaluate(Xq))
+    assert np.all(np.isfinite(Ef)) and np.all(np.isfinite(Ec))
+    d = np.max(np.abs(Ef - Ec))
+    print(f'  ("hyperbolic","colleague") end-to-end OK; vs frobenius rootfinder '
+          f'max|dE| = {d:.2e}')
+    assert d < 1e-4
+
+
 def _arr(x):
     """unwrap (value, std/cov, ...) tuples from evaluate/gradient."""
     return np.asarray(x[0] if isinstance(x, tuple) else x)
@@ -709,6 +855,11 @@ if __name__ == '__main__':
     test_refit()
     print('Schmeisser companion (guaranteed-real roots, bounded n>=3 forces):')
     test_schmeisser_companion()
+    print('Hyperbolic companion (real-by-construction n=3, separates not glues, '
+          'convex-aggregatable):')
+    test_hyperbolic_companion()
+    print('companion spec ((representation, matrix) pair + aliases + rejection):')
+    test_companion_spec()
     print('incremental Cholesky update (GPRegressor.add_points, fixed theta):')
     test_add_points_equivalence()
     print('CP.update(optimize=False) == frozen full refit:')

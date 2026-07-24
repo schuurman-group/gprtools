@@ -104,11 +104,20 @@ class CP(Surrogate):
         # representations; the flag only selects how the recovered roots
         # are labelled at reconstruction
         self.representation = representation
-        # companion-matrix strategy (init-time choice): owns the coefficient
-        # basis, the reconstruction (companion matrix + eigensolver) and the
-        # implicit-diff root jacobian, so 'frobenius' (default), 'schmeisser'
-        # and 'colleague' are swappable behind one interface. It also owns the
-        # sign-definite-coefficient regularisation, hence `degeneracy_eps`:
+        # companion strategy (init-time choice): owns the coefficient basis, the
+        # reconstruction (companion matrix + eigensolver) and the implicit-diff
+        # root jacobian. It is TWO orthogonal choices, given as a bare-string
+        # alias or an explicit (representation, matrix) pair:
+        #   representation -- 'standard' (monomial; log-c_{n-2} or raw per
+        #        degeneracy_eps) or 'hyperbolic' (n<=3 tanh-squash; real-rooted
+        #        by construction and convex-aggregatable, for the sampling/
+        #        production/GRBCM path -- NOT faithful, so not for MECI);
+        #   matrix -- 'frobenius' (default), 'colleague' (better conditioned near
+        #        the cusp) or 'schmeisser' (bundled; pairs only with 'standard').
+        # 'frobenius' == ('standard','frobenius'); 'hyperbolic' ==
+        # ('hyperbolic','frobenius'); ('hyperbolic','schmeisser') is rejected.
+        # It also owns the sign-definite-coefficient regularisation, hence
+        # `degeneracy_eps`:
         #   > 0  SMOOTH (DEFAULT, trajectory): gap recovered strictly positive
         #        (no floor/damping), min gap ~eps near the data.
         #   == 0 FAITHFUL (MECI): gap can reach 0 at a genuine CI.
@@ -123,6 +132,14 @@ class CP(Surrogate):
         # only on the c_k), so the baseline never enters root-finding,
         # the c0 floor, or the delta-method variance.
         self.baseline       = baseline
+        # optional constant REFERENCE spectrum (nstates,) of real energies (the
+        # splittings at a reference geometry). When set, every coefficient
+        # channel is Delta-learnt against it, so data-sparse regions (residual
+        # -> 0) revert to this physical, well-separated (hyperbolic) spectrum
+        # rather than to a spurious near-degeneracy. It is the coefficient-channel
+        # analogue of the omega baseline; stays Gaussian (no hard constraint), so
+        # it composes with BCM/GRBCM aggregation. See _reference_coeffs / create.
+        self.reference      = None
         self.models         = []
         self.descriptors    = None      # shared (npts, nfeat) over all targets
         self.targets        = None      # (nstates, npts): omega + CP coeffs
@@ -220,14 +237,20 @@ class CP(Surrogate):
         omega everywhere."""
         t = self._to_targets(energies)
         t[0] -= self._baseline_omega(gms)
+        cref = self._reference_coeffs()
+        if cref is not None:
+            t[1:] -= cref[:, None]
         return t
 
     #
     def fold_baseline_mean(self, coeff_mean, gms):
         """Add omega_base back into AGGREGATED coefficient means (omega is
         model 0). Called by BCM/GRBCM once after coefficient-space
-        aggregation; no-op if there is no baseline."""
+        aggregation; no-op if there is no baseline. Also folds the constant
+        coefficient reference back into rows 1: (aggregation is over the
+        Delta-learnt residuals, so the reference is restored once, here)."""
         coeff_mean[0] += self._baseline_omega(gms)
+        self._fold_reference(coeff_mean)
         return coeff_mean
 
     #
@@ -236,6 +259,28 @@ class CP(Surrogate):
         (omega channel); no-op if there is no baseline."""
         coeff_grad[0] += self._baseline_omega_grad(gms)
         return coeff_grad
+
+    #
+    def _reference_coeffs(self):
+        """Coefficient-channel reference in TARGET space, (nstates-1,), from the
+        stored reference energies via the CURRENT companion (so it tracks any
+        degeneracy_eps / companion change). None if no reference is set. For the
+        log-reparam channel this is g_ref = log(-c_{n-2}_ref)."""
+        if self.reference is None:
+            return None
+        return self._to_targets(self.reference.reshape(self.nstates, 1))[1:, 0]
+
+    #
+    def _fold_reference(self, coeff_mean):
+        """Add the constant coefficient reference back into the coefficient
+        channels (rows 1:), mirroring the omega baseline fold on row 0. The
+        reference is the prior mean the coefficient GPs were Delta-learnt
+        against; constant -> zero gradient, so only the MEAN needs it. In place;
+        no-op if no reference set."""
+        cref = self._reference_coeffs()
+        if cref is not None:
+            coeff_mean[1:] += cref[:, None]
+        return coeff_mean
 
     #
     def _require_full_state_set(self, states, op):
@@ -284,13 +329,29 @@ class CP(Surrogate):
 
     #
     @timer.timed
-    def create(self, data, states=[], hparam=None, nrestart=None):
-        """Transform energies to (omega, CP coeffs) and fit N GPs."""
+    def create(self, data, states=[], hparam=None, nrestart=None,
+                                                   reference=None):
+        """Transform energies to (omega, CP coeffs) and fit N GPs.
+
+        reference: optional (nstates,) real energies at a reference geometry
+        (e.g. the FC vertical energies). If given, every coefficient channel is
+        Delta-learnt against this constant, well-separated spectrum, so
+        data-sparse regions revert to it (physical, non-degenerate) instead of
+        drifting to spurious degeneracy. Stays Gaussian -> composes with BCM."""
         self._require_full_state_set(states, 'create')
         X, E = data
 
-        # project to targets, Delta-learning omega against the baseline
-        # (c_k stay raw); project_targets is a no-op shift if baseline=None
+        if reference is not None:
+            reference = np.asarray(reference, dtype=float).ravel()
+            if reference.shape != (self.nstates,):
+                raise ValueError(
+                    f'CP.create: reference must be {self.nstates} energies, '
+                    f'got shape {reference.shape}.')
+            self.reference = reference
+
+        # project to targets, Delta-learning omega against the baseline and the
+        # coefficient channels against the reference spectrum (both no-op if
+        # unset); see project_targets
         self.targets     = self.project_targets(E, X)
         self.descriptors = self.descriptor.generate(X)
         self.geoms       = np.asarray(X, dtype=float).copy()   # retain raw geoms
@@ -299,10 +360,17 @@ class CP(Surrogate):
         nres = 1 if nrestart is None else nrestart
         self.models = []
         for m in range(self.nstates):
+            # a reference'd coefficient channel (m>=1) must revert to 0 in
+            # residual space so the field recovers the REFERENCE where data is
+            # sparse. normalize_y=True would re-centre on the residual mean and
+            # cancel the reference (reverting to the data mean -- the very
+            # degeneracy we're avoiding); so drop the y-mean centring there and
+            # let the ConstantKernel carry the target scale.
+            norm_y = not (self.reference is not None and m >= 1)
             gp = gpr.GPRegressor(
                      kernel               = self.kernel,
                      n_restarts_optimizer = nres,
-                     normalize_y          = True,
+                     normalize_y          = norm_y,
                      optimizer            = 'fmin_l_bfgs_b')
             if hparam is not None:
                 gp.kernel.theta = hparam[m]
@@ -490,6 +558,14 @@ class CP(Surrogate):
         if self.nstates < 2 or self.nstates > 3:
             raise NotImplementedError('CP._constrained_refit: discriminant '
                                       'implemented for n=2,3 only.')
+        if self.reference is not None:
+            raise NotImplementedError(
+                'CP._constrained_refit: not combinable with a coefficient '
+                'reference yet -- the discriminant is on raw coefficients but '
+                'the targets are Delta-learnt against the reference. They are '
+                'alternative routes to sparse-region physicality (the reference '
+                'is Gaussian/aggregatable, the constraint is a hard single-CP '
+                'guarantee); use one or the other.')
         ncoef = self.nstates - 1
 
         E = (self.energies if self.energies is not None
@@ -703,7 +779,11 @@ class CP(Surrogate):
         omega = self.targets[0] + self._baseline_omega(self.geoms)
         if self.nstates == 1:
             return omega[None, :]
-        z, _ = self.companion.to_roots(self.targets[1:])   # (npts, nstates)
+        coeffs = self.targets[1:]
+        cref   = self._reference_coeffs()
+        if cref is not None:
+            coeffs = coeffs + cref[:, None]                # fold reference back
+        z, _ = self.companion.to_roots(coeffs)             # (npts, nstates)
         return omega[None, :] + z.T
 
     #
@@ -759,6 +839,7 @@ class CP(Surrogate):
         # back; .get for back-compat with pre-baseline bundles. A non-
         # picklable baseline (e.g. ChemPotPy) must be re-attached by hand.
         self.baseline    = bundle.get('baseline', None)
+        self.reference   = bundle.get('reference', None)   # coeff prior spectrum
         # the companion (coefficient basis + reconstruction strategy + its
         # degeneracy_eps); .get for back-compat -- keep the __init__ one if a
         # pre-companion bundle is loaded.
@@ -777,6 +858,8 @@ class CP(Surrogate):
             'geoms':       self.geoms,
             'energies':    self.energies,    # raw energies, for refit()
             'baseline':    self.baseline,
+            'reference':   self.reference,   # coefficient prior spectrum
+
             'companion':   self.companion,   # basis + reconstruction strategy
             'ctype':       self.ctype,
         }
@@ -882,9 +965,11 @@ class CP(Surrogate):
         need_cov = std or cov
 
         raw_mean, raw_cov = self.raw_predict(Xq, need_cov=need_cov)
-        # fold the (deterministic) baseline back into the omega channel
-        # before reconstruction; variance is unaffected
+        # fold the (deterministic) baseline into omega and the constant
+        # reference into the coefficient channels before reconstruction;
+        # variance is unaffected (both are deterministic shifts)
         raw_mean[0] += self._baseline_omega(Xq)
+        self._fold_reference(raw_mean)
         evals, estd, ecov = self.reconstruct_energy(
                                 raw_mean, raw_cov, sts, std, cov)
 
@@ -1093,6 +1178,10 @@ class CP(Surrogate):
         # independent, so raw_mean[0] is left as-is here.)
         grad_cart[0] += self._baseline_omega_grad(Xq)
 
+        # fold the constant reference into the coefficient means (they shape the
+        # roots z and the jacobian); omega is root-independent, so raw_mean[0]
+        # is left as-is here
+        self._fold_reference(raw_mean)
         _, z, _, c2_slope = self._reconstruct(raw_mean)
         jac = self._state_jacobian(z, c2_slope)     # (ng, nstates, ntar)
 
@@ -1159,10 +1248,12 @@ class CP(Surrogate):
             if cov:
                 gcov_cart[m] = d_grad @ gcov_d @ d_grad.swapaxes(-2, -1)
 
-        # fold the baseline back into the omega channel (mean for E,
-        # gradient for the force) before reconstruction
+        # fold the baseline back into omega (mean for E, gradient for the force)
+        # and the constant reference into the coefficient means before
+        # reconstruction (the reference is constant -> no gradient contribution)
         raw_mean[0]  += self._baseline_omega(Xq)
         grad_cart[0] += self._baseline_omega_grad(Xq)
+        self._fold_reference(raw_mean)
 
         _, z, E, c2_slope = self._reconstruct(raw_mean)
         jac = self._state_jacobian(z, c2_slope)     # (ngm, nstates, ntar)
