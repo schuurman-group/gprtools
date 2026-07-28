@@ -211,3 +211,105 @@ class Soap(Descriptor):
             des_grad[i,:,:] = dd_n*constants.bohr2ang
 
         return des_grad
+
+
+#
+class Acsf(Descriptor):
+    """
+    Behler-Parrinello atom-centred symmetry functions (ACSF), via dscribe.
+
+    A LOCAL, atom-centred, UN-NORMALISED alternative to Soap. Unlike SOAP it is
+    NOT projected onto the unit sphere, so the descriptor distance grows ~mono-
+    tonically with structural change instead of saturating and folding back --
+    the L2-normalisation aliasing that makes a single RBF length scale ill-posed
+    and lets the GP go blind in the extrapolation/dissociation region (see the
+    descriptor bake-off: SOAP folds at ~2.2 Ang, ACSF stays monotone). It keeps
+    SOAP's favourable scaling (feature length grows with the number of atom
+    TYPES via species-resolved radial G2 + angular G4 channels, not with system
+    size), and is the KRR-friendly local descriptor for surfaces that must
+    extrapolate off the sampled manifold.
+
+    Parameters mirror Soap. ref_gm supplies the species; r_cut is the neighbour
+    cutoff (Ang); g2_params ([eta, R_s]) is the radial two-body basis and
+    g4_params ([eta, zeta, lambda]) the angular three-body basis -- a FIXED,
+    physically chosen basis (these are the "hyperparameters" you design once, not
+    fit). The per-site descriptors are outer-averaged over atoms (linear, so the
+    analytic derivatives are preserved); NO L2-normalisation is applied.
+
+    NOTE ON SCALE: the raw ACSF features are un-normalised, so for a GP their
+    magnitudes set the natural amplitude/length scales -- pair with a capped
+    ConstantKernel (kernel_bounds) or fixed (KRR) hyperparameters; an
+    unconstrained marginal-likelihood fit on thin data can overfit a large
+    amplitude (see the amplitude-runaway analysis).
+    """
+    def __init__(self, ref_gm, r_cut=5.0, g2_params=None, g4_params=None,
+                                                          g3_params=None):
+        super().__init__()
+        from dscribe.descriptors import ACSF
+        self.atoms = ref_gm.atms
+        # default: a small physical basis (3 radial widths, 3 angular terms)
+        if g2_params is None:
+            g2_params = [[1.0, 1.0], [1.0, 2.0], [1.0, 3.0]]
+        if g4_params is None:
+            g4_params = [[0.01, 1, 1], [0.01, 1, -1], [0.01, 4, 1]]
+        self.generator = ACSF(
+            species   = list(set(self.atoms)),
+            r_cut     = r_cut,
+            g2_params = g2_params,
+            g3_params = g3_params,
+            g4_params = g4_params,
+            periodic  = False)
+
+    #
+    @timer.timed
+    def generate(self, gms):
+        """Outer-averaged (over sites), UN-normalised ACSF. Mirrors Soap.generate
+        (bohr input -> ang for dscribe; 1-D input returns a single vector)."""
+        natm     = len(self.atoms)
+        one      = (gms.ndim == 1)
+        eval_gms = np.array([gms], dtype=float) if one else gms
+
+        descriptors = []
+        for i in range(eval_gms.shape[0]):
+            gm  = np.reshape(eval_gms[i, :]*constants.bohr2ang, (natm, 3))
+            mol = Atoms(symbols=self.atoms, positions=gm)
+            # per-site ACSF, outer-averaged over sites; NO L2-normalisation
+            descriptors.append(np.mean(self.generator.create(mol), axis=0))
+
+        return np.array(descriptors[0]) if one else np.array(descriptors)
+
+    #
+    @timer.timed
+    def descriptor_gradient(self, gms, delta=None):
+        """d(outer-averaged ACSF)/d(cartesian), shape (ng, nc, n_feature).
+        delta=None -> dscribe per-site derivatives (method='auto'; dscribe
+        supplies analytical for SOAP but NUMERICAL for ACSF) averaged over sites,
+        carrying the bohr->ang chain factor (no normalisation projector, unlike
+        Soap). delta!=None -> central finite difference of generate()."""
+        ng   = gms.shape[0]
+        nc   = gms.shape[1]
+        natm = len(self.atoms)
+
+        n_feature = self.generate(gms[0, :]).shape[0]
+        des_grad  = np.zeros((ng, nc, n_feature), dtype=float)
+
+        if delta is not None:
+            for i in range(ng):
+                origin = np.tile(gms[i, :], (nc, 1))
+                p_grad = self.generate(origin + np.diag(np.array([delta]*nc)))
+                m_grad = self.generate(origin - np.diag(np.array([delta]*nc)))
+                des_grad[i, :, :] = (p_grad - m_grad)/(2.*delta)
+            return des_grad
+
+        for i in range(ng):
+            gm  = np.reshape(gms[i, :]*constants.bohr2ang, (natm, 3))
+            mol = Atoms(symbols=self.atoms, positions=gm)
+            der = self.generator.derivatives(mol, method='auto',
+                                             attach=True, return_descriptor=False)
+            # der.shape = (nsite, natm, 3, n_feature); outer-average over sites.
+            # No unit-sphere projector (raw descriptor) -- just the mean, then the
+            # bohr -> angstrom coordinate chain factor.
+            dd = np.mean(der, axis=0).reshape(nc, n_feature)      # (nc, nf)
+            des_grad[i, :, :] = dd*constants.bohr2ang
+
+        return des_grad

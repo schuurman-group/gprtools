@@ -86,7 +86,8 @@ class CP(Surrogate):
                        representation='adiabatic',
                        degeneracy_eps=1.0e-3,
                        baseline=None,
-                       companion='frobenius'):
+                       companion='frobenius',
+                       kernel_bounds=None):
         super().__init__()
 
         if representation not in ('adiabatic', 'diabatic'):
@@ -96,6 +97,7 @@ class CP(Surrogate):
                 f"'diabatic' (diagonal elements); got '{representation}'.")
 
         self.ktype          = kernel
+        self.kernel_bounds  = kernel_bounds   # optional MLE search-box override
         self.hparam         = hparam
         self.nstates        = nstates
         self.descriptor     = descriptor
@@ -171,12 +173,23 @@ class CP(Surrogate):
             # experiment: regularising raw c0 instead does NOT help (still
             # wrong-sign -> floored), so reparam + noise floor together are the
             # win, not either alone.
+            # kernel_bounds optionally overrides the marginal-likelihood search
+            # box (dict keys 'amp', 'length', 'noise'). Capping the amplitude
+            # upper bound and raising the noise floor is the direct guard against
+            # the amplitude-runaway detonation (a thin-data MLE can otherwise
+            # jump into a memorising high-C basin: C -> ~1e4, near-interpolation,
+            # extrapolation blows up). Defaults reproduce the prior box exactly.
+            kb      = kernel_bounds or {}
+            amp_b   = kb.get('amp',    (1e-5, 1e5))
+            len_b   = kb.get('length', (0.25, 1e3))
+            noise_b = kb.get('noise',  (1e-6, 1e1))
+            n_init  = min(max(1e-3, noise_b[0]), noise_b[1])   # within-bounds init
             self.kernel = C(hparam[0],
-                            constant_value_bounds=(1e-5, 1e5)) * \
+                            constant_value_bounds=amp_b) * \
                           RBF(hparam[1],
-                            length_scale_bounds=(0.25, 1e3)) + \
-                          WhiteKernel(noise_level=1e-3,
-                            noise_level_bounds=(1e-6, 1e1))
+                            length_scale_bounds=len_b) + \
+                          WhiteKernel(noise_level=n_init,
+                            noise_level_bounds=noise_b)
         elif kernel == 'WhiteNoise':
             self.kernel = C(hparam[0]) * RBF(hparam[1],
                           length_scale_bounds=(1, 1e3)) + WhiteKernel(
@@ -205,7 +218,8 @@ class CP(Surrogate):
                  kernel=self.ktype,
                  hparam=self.hparam,
                  representation=self.representation,
-                 companion=self.ctype)
+                 companion=self.ctype,
+                 kernel_bounds=self.kernel_bounds)
         for key, value in self.__dict__.items():
             if not key.startswith('__'):
                 setattr(new, key, copy.deepcopy(value))
@@ -330,8 +344,15 @@ class CP(Surrogate):
     #
     @timer.timed
     def create(self, data, states=[], hparam=None, nrestart=None,
-                                                   reference=None):
+                                       reference=None, optimize=True):
         """Transform energies to (omega, CP coeffs) and fit N GPs.
+
+        optimize: True (default) marginal-likelihood-optimises the kernel
+        hyperparameters. False FREEZES them at `hparam` (a genuine KRR fit,
+        optimizer off) -- the robust production choice: it never enters the
+        multimodal-MLE lottery that can rail the amplitude on thin data. Pass
+        physically chosen hparam with optimize=False; pair with capped
+        kernel_bounds as a backstop.
 
         reference: optional (nstates,) real energies at a reference geometry
         (e.g. the FC vertical energies). If given, every coefficient channel is
@@ -371,7 +392,8 @@ class CP(Surrogate):
                      kernel               = self.kernel,
                      n_restarts_optimizer = nres,
                      normalize_y          = norm_y,
-                     optimizer            = 'fmin_l_bfgs_b')
+                     optimizer            = ('fmin_l_bfgs_b'
+                                             if optimize else None))
             if hparam is not None:
                 gp.kernel.theta = hparam[m]
             gp.fit(self.descriptors, self.targets[m])
