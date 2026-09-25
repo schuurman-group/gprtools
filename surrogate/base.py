@@ -32,9 +32,22 @@ class Surrogate(ABC):
     def evaluate(self):
         pass
 
+    def evaluate_pointwise(self, gms, states=None, std=False):
+        """Independent marginal evaluation used by batched dynamics.
+
+        Direct surrogates already evaluate query points independently when
+        ``cov=False``.  Committee models override this method to avoid their
+        full inter-query covariance aggregation.
+        """
+        return self.evaluate(gms, states=states, std=std, cov=False)
+
     @abstractmethod
     def gradient(self):
         pass
+
+    def gradient_pointwise(self, gms, states=None, std=False):
+        """Independent gradient evaluation used by batched dynamics."""
+        return self.gradient(gms, states=states, std=std, cov=False)
 
     @abstractmethod
     def hessian(self):

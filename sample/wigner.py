@@ -80,8 +80,10 @@ class Wigner(Sample):
         sigma_x = np.sqrt(0.25 / alpha)
         sigma_p = np.sqrt(alpha)
 
-        dx = self.rng.normal(0., sigma_x, (nsample, nc))
-        dp = self.rng.normal(0., sigma_p, (nsample, nc))
+        #dx = self.rng.normal(0., sigma_x, (nsample, nc))
+        #dp = self.rng.normal(0., sigma_p, (nsample, nc))
+        dx = np.random.normal(0., sigma_x, (nsample, nc))
+        dp = np.random.normal(0., sigma_p, (nsample, nc))
 
         if bounds == None:
             chk_bounds = False
@@ -114,8 +116,10 @@ class Wigner(Sample):
                         dist_p[ipass,:] = np.dot(modes, dp) * np.sqrt(masses)
 
                 if ipass < nsample:
-                    dx = self.rng.normal(0., sigma_x, (nsample, nc))
-                    dp = self.rng.normal(0., sigma_p, (nsample, nc))
+                    #dx = self.rng.normal(0., sigma_x, (nsample, nc))
+                    #dp = self.rng.normal(0., sigma_p, (nsample, nc))
+                    dx = self.rseed.normal(0., sigma_x, (nsample, nc))
+                    dp = self.rseed.normal(0., sigma_p, (nsample, nc))
 
             dist_x += self.ref_gm.x
             dist_p += self.ref_gm.p

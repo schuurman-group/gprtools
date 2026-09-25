@@ -174,9 +174,9 @@ class CP(Surrogate):
             self.kernel = C(hparam[0],
                             constant_value_bounds=(1e-5, 1e5)) * \
                           RBF(hparam[1],
-                            length_scale_bounds=(0.25, 1e3)) + \
-                          WhiteKernel(noise_level=1e-3,
-                            noise_level_bounds=(1e-6, 1e1))
+                            length_scale_bounds=(0.25, 1e3))# + \
+#                          WhiteKernel(noise_level=1e-3,
+#                            noise_level_bounds=(1e-6, 1e1))
         elif kernel == 'WhiteNoise':
             self.kernel = C(hparam[0]) * RBF(hparam[1],
                           length_scale_bounds=(1, 1e3)) + WhiteKernel(
@@ -349,6 +349,7 @@ class CP(Surrogate):
                     f'got shape {reference.shape}.')
             self.reference = reference
 
+        print(reference)
         # project to targets, Delta-learning omega against the baseline and the
         # coefficient channels against the reference spectrum (both no-op if
         # unset); see project_targets
@@ -369,6 +370,7 @@ class CP(Surrogate):
             norm_y = not (self.reference is not None and m >= 1)
             gp = gpr.GPRegressor(
                      kernel               = self.kernel,
+                     alpha                = 1e-5,
                      n_restarts_optimizer = nres,
                      normalize_y          = norm_y,
                      optimizer            = 'fmin_l_bfgs_b')

@@ -490,6 +490,80 @@ class GRBCM():
 
     #
     @timer.timed
+    def evaluate_pointwise(self, gms, states=None, std=False):
+        """Evaluate independent GRBCM marginals for a geometry batch.
+
+        Each communication/enhanced target GP is called once on the full
+        batch.  GRBCM Eq. 14 is then reduced independently along the geometry
+        axis, so no inter-trajectory covariance or batch-membership coupling
+        is introduced.
+        """
+        validator = getattr(self, 'validate_global_normalization', None)
+        if validator is not None:
+            validator()
+
+        if states is None:
+            sts = list(range(self.nstates))
+        else:
+            sts = list(states)
+        Xq, (ngm, _), singleX = utils.verify_geoms(gms)
+        if self.comm is None or not self.surrogates:
+            raise RuntimeError(
+                'GRBCM requires a communication and an enhanced expert')
+
+        d_data = self.comm.descriptor.generate(Xq)
+        experts = [self.comm] + list(self.surrogates)
+        nexpert = len(experts)
+        nmod = self.comm.n_models()
+        means = np.zeros((nexpert, nmod, ngm), dtype=float)
+        variances = np.zeros_like(means)
+        for expert_index, expert in enumerate(experts):
+            for target, model in enumerate(expert.models):
+                mean, pred_std = model.predict(d_data, return_std=True)
+                means[expert_index, target] = mean
+                variances[expert_index, target] = pred_std**2
+
+        tiny = 1.e-32
+        variances = np.maximum(variances, tiny)
+        aggregate_mean = np.zeros((nmod, ngm), dtype=float)
+        aggregate_variance = np.zeros((nmod, ngm), dtype=float)
+        for target in range(nmod):
+            var_c = variances[0, target]
+            mean_c = means[0, target]
+            enhanced_var = variances[1:, target]
+            enhanced_mean = means[1:, target]
+
+            beta = np.zeros_like(enhanced_var)
+            beta[0] = 1.
+            if beta.shape[0] > 1:
+                beta[1:] = np.maximum(
+                    0.5*(np.log(var_c)[None, :]
+                         - np.log(enhanced_var[1:])), 0.)
+            beta_sum = np.sum(beta, axis=0)
+
+            precision = (np.sum(beta/enhanced_var, axis=0)
+                         - (beta_sum - 1.)/var_c)
+            rhs = (np.sum(beta*enhanced_mean/enhanced_var, axis=0)
+                   - (beta_sum - 1.)*mean_c/var_c)
+            valid = precision > tiny
+            aggregate_variance[target, valid] = 1./precision[valid]
+            aggregate_mean[target, valid] = (
+                aggregate_variance[target, valid]*rhs[valid])
+
+        self.comm.fold_baseline_mean(aggregate_mean, Xq)
+        aggregate_covariance = np.zeros((nmod, ngm, ngm), dtype=float)
+        diagonal = np.arange(ngm)
+        aggregate_covariance[:, diagonal, diagonal] = aggregate_variance
+        energy, energy_std, _ = self.comm.reconstruct_energy(
+            aggregate_mean, aggregate_covariance, sts, std, False)
+
+        if singleX:
+            return utils.collect_output(
+                (energy[:, 0], energy_std[:, 0]), (True, std))
+        return utils.collect_output((energy, energy_std), (True, std))
+
+    #
+    @timer.timed
     def gradient(self, gms, states=None, std=False, cov=False,
                                                     numerical=False,
                                                     delta=1.e-4,
