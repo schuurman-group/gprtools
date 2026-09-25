@@ -1,0 +1,45 @@
+{
+  "system_name": "NH3",
+  "surface_name": "NH3_GEN_FFW1_2006",
+  "n_states": 2,
+  "n_trajectories": 400,
+  "initial_state": 1,
+  "horizons_fs": [
+    2.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0,
+    40.0, 45.0, 50.0, 55.0, 60.0, 65.0, 70.0,
+    75.0, 80.0, 85.0, 90.0, 95.0, 100.0
+  ],
+  "dt_fs": 0.1,
+  "electronic_substeps": 20,
+  "decoherence": true,
+  "ground_state_index": 0,
+  "ground_state_residence_fs": 5.0,
+  "terminal_time_tolerance_au": 1e-12,
+  "active_std_ev": 0.1,
+  "gap_std_ev": 0.1,
+  "gap_std_relative_fraction": 0.05,
+  "gap_floor_ev": 0.05,
+  "energy_bins": true,
+  "discovery_waves": 3,
+  "maximum_certification_cycles": 50,
+  "ic_seed_base": 715,
+  "hop_seed_offset": 1000003,
+  "hyperopt_seed": 1729,
+  "hyperopt_point_count": 300,
+  "hyperopt_restarts": 50,
+  "degeneracy_eps": 1e-12,
+  "alpha_scaled": 1e-9,
+  "minimum_target_scale": 1e-12,
+  "descriptor": {
+    "type": "soap",
+    "r_cut": 5.0,
+    "n_max": 6,
+    "l_max": 6,
+    "sigma": 0.3
+  },
+  "fused": {
+    "backend": "torch",
+    "torch_device": "cpu",
+    "batch_size": 0
+  }
+}
