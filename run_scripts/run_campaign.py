@@ -740,7 +740,7 @@ def run_frozen_stage(config, model, initial, phase, horizon,
         raise ValueError(f"unknown phase: {phase}")
 
     fused = config["fused"]
-    model.frozen_wts = True
+    model.frozen_wts = False
     evaluator = CachedFusedEvaluator(model.fused(
         matmul_backend=fused.get("backend", "torch"),
         torch_device=fused.get("torch_device", "cpu")))
