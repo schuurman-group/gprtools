@@ -33,12 +33,14 @@ class BCM():
         self.surrogates     = []
         self.sdata          = []
         self.prior_covar    = False
-        # frozen_wts controls whether derivatives of the geometry-dependent
-        # expert precisions are omitted from the BCM gradient.  False gives the
-        # full derivative of the BCM posterior mean and is the conservative
-        # choice for molecular dynamics.  True is an optional approximation
-        # that treats the precision weights as locally constant.
-        self.frozen_wts     = False
+        # frozen_wts: drop the weight-derivative (dC) terms in the gradient.
+        # The legacy full-weight path here routes them through O(1/v^2)
+        # intermediates that CATASTROPHICALLY CANCEL where the predictive
+        # variance v is small (verified O(1e3) blow-up for Adiabat at an
+        # in-data point), so frozen is the robust default. The cancellation-
+        # free full-weight gradient lives in FusedPointwiseBCM, which the AL
+        # campaign uses with frozen_wts=False set explicitly.
+        self.frozen_wts     = True
         self.numerical_grad = False
         # Monotonic mutation counter used by compiled/fused evaluators.  They
         # can safely cache concatenated training arrays and rebuild them only

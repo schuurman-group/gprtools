@@ -69,10 +69,9 @@ class Wigner(Sample):
         machine_reg  = 1.e-16 # regularizatio for finite temperature
         masses       = self.ref_gm._mvec
         omega, modes = self.ref_gm.freq()
-        nc = omega.shape[0]
-
-        if np.any([omega])== None or np.any([modes]) == None:
+        if omega is None or modes is None:
             return None
+        nc = omega.shape[0]
 
         alpha = 0.5*omega
         alpha *= np.tanh(omega / (2 * constants.kB * T + machine_reg))
@@ -80,56 +79,37 @@ class Wigner(Sample):
         sigma_x = np.sqrt(0.25 / alpha)
         sigma_p = np.sqrt(alpha)
 
-        #dx = self.rng.normal(0., sigma_x, (nsample, nc))
-        #dp = self.rng.normal(0., sigma_p, (nsample, nc))
-        dx = np.random.normal(0., sigma_x, (nsample, nc))
-        dp = np.random.normal(0., sigma_p, (nsample, nc))
-
-        if bounds == None:
-            chk_bounds = False
-        elif bounds.shape != (2, 2, nc):
+        if bounds is not None and np.shape(bounds) != (2, 2, nc):
             print('bounds wrong shape in Wigner.sample -- ignoring.')
-            chk_bounds = False
-        else:
-            chk_bounds = True
+            bounds = None
 
-        if chk_bounds:
-
-            dist_x = np.zeros((nsample, nc), dtype=float)
-            dist_p = np.zeros((nsample, nc), dtype=float)
-            ipass    = -1
-            while ipass < nsample:
-
-                for i in range(nsample):
-                    dxi = dx[i,:]
-                    dpi = dp[i,:]
-
-                    lowx  = any(dxi < bounds[0,0,:])
-                    highx = any(dxi > bounds[0,1,:])
-                    lowp  = any(dpi < bounds[1,0,:])
-                    highp = any(dpi > bounds[1,1,:])
-                    if (lowx or highx or lowp or highp):
-                        continue
-                    else:
-                        ipass += 1
-                        dist_x[ipass,:] = np.dot(modes, dx) / np.sqrt(masses)
-                        dist_p[ipass,:] = np.dot(modes, dp) * np.sqrt(masses)
-
-                if ipass < nsample:
-                    #dx = self.rng.normal(0., sigma_x, (nsample, nc))
-                    #dp = self.rng.normal(0., sigma_p, (nsample, nc))
-                    dx = self.rseed.normal(0., sigma_x, (nsample, nc))
-                    dp = self.rseed.normal(0., sigma_p, (nsample, nc))
-
-            dist_x += self.ref_gm.x
-            dist_p += self.ref_gm.p
+        if bounds is None:
+            dx = self.rng.normal(0., sigma_x, (nsample, nc))
+            dp = self.rng.normal(0., sigma_p, (nsample, nc))
 
         else:
+            # rejection sampling: keep normal-mode displacements whose
+            # positions (bounds[0]) and momenta (bounds[1]) lie in [low,high]
+            bounds = np.asarray(bounds, dtype=float)
+            dx = np.zeros((nsample, nc), dtype=float)
+            dp = np.zeros((nsample, nc), dtype=float)
+            naccept = 0
+            while naccept < nsample:
+                dxt = self.rng.normal(0., sigma_x, (nsample, nc))
+                dpt = self.rng.normal(0., sigma_p, (nsample, nc))
+                keep = (np.all(dxt >= bounds[0,0,:], axis=1) &
+                        np.all(dxt <= bounds[0,1,:], axis=1) &
+                        np.all(dpt >= bounds[1,0,:], axis=1) &
+                        np.all(dpt <= bounds[1,1,:], axis=1))
+                nadd = min(int(np.count_nonzero(keep)), nsample - naccept)
+                dx[naccept:naccept+nadd, :] = dxt[keep][:nadd]
+                dp[naccept:naccept+nadd, :] = dpt[keep][:nadd]
+                naccept += nadd
 
-            deltax = np.einsum('jn,kn->jk', modes, dx).T / np.sqrt(masses)
-            deltap = np.einsum('jn,kn->jk', modes, dp).T * np.sqrt(masses)
-            dist_x = self.ref_gm.x + deltax
-            dist_p = self.ref_gm.p + deltap
+        deltax = np.einsum('jn,kn->jk', modes, dx).T / np.sqrt(masses)
+        deltap = np.einsum('jn,kn->jk', modes, dp).T * np.sqrt(masses)
+        dist_x = self.ref_gm.x + deltax
+        dist_p = self.ref_gm.p + deltap
 
         # dist_x.shape = [nsample, ncart]
         # dist_p.shape = [nsample, ncart]

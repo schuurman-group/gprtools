@@ -32,6 +32,11 @@ class GloballyNormalizedCP(CP):
 
     def __init__(self, *args, target_scaler,
                  alpha_scaled=1.e-7, target_unit_factors=None, **kwargs):
+        # fixed alpha_scaled is the jitter here: no fitted WhiteKernel (the
+        # fused BCM evaluator requires a pure C*RBF kernel)
+        kb = dict(kwargs.get('kernel_bounds') or {})
+        kb.setdefault('noise', None)
+        kwargs['kernel_bounds'] = kb
         super().__init__(*args, **kwargs)
         if not isinstance(target_scaler, GlobalTargetScaler):
             raise TypeError(
@@ -44,8 +49,18 @@ class GloballyNormalizedCP(CP):
         self.normalization_version = target_scaler.normalization_version
         self.normalization_convention = NORMALIZATION_CONVENTION
         self.alpha_convention = ALPHA_CONVENTION
-        self.alpha_scaled = float(alpha_scaled)
-        if not np.isfinite(self.alpha_scaled) or self.alpha_scaled <= 0.:
+        # alpha_scaled: one jitter for every channel, or one per channel (a
+        # frozen per-channel noise level, the WhiteKernel equivalent the
+        # fused BCM evaluator can use). Stored as float or tuple of floats.
+        alpha = np.atleast_1d(np.asarray(alpha_scaled, dtype=float))
+        if alpha.size == 1:
+            self.alpha_scaled = float(alpha[0])
+        elif alpha.shape == (self.nstates,):
+            self.alpha_scaled = tuple(float(a) for a in alpha)
+        else:
+            raise ValueError(
+                'alpha_scaled must be a scalar or one value per CP target')
+        if not np.all(np.isfinite(alpha)) or np.any(alpha <= 0.):
             raise ValueError('alpha_scaled must be positive and finite')
 
         factors = (np.ones(self.nstates, dtype=float)
@@ -81,7 +96,8 @@ class GloballyNormalizedCP(CP):
             raise RuntimeError('CP normalization convention is unsupported')
         if self.alpha_convention != ALPHA_CONVENTION:
             raise RuntimeError('CP alpha convention is unsupported')
-        if not np.isfinite(self.alpha_scaled) or self.alpha_scaled <= 0.:
+        alpha = np.atleast_1d(np.asarray(self.alpha_scaled, dtype=float))
+        if not np.all(np.isfinite(alpha)) or np.any(alpha <= 0.):
             raise RuntimeError('CP normalized alpha is invalid')
         for target, model in enumerate(self.models):
             if bool(model.normalize_y):
@@ -103,7 +119,7 @@ class GloballyNormalizedCP(CP):
                     f'CP target {target} has an ambiguous alpha convention')
             model_alpha = np.asarray(model.alpha, dtype=float)
             if (model_alpha.ndim != 0
-                    or float(model_alpha) != self.alpha_scaled):
+                    or float(model_alpha) != self.channel_alpha(target)):
                 raise RuntimeError(
                     f'CP target {target} has inconsistent normalized alpha')
             if (not np.allclose(model._y_train_mean, 0.)
@@ -125,12 +141,18 @@ class GloballyNormalizedCP(CP):
         model._global_target_index = int(target)
         model._alpha_convention = ALPHA_CONVENTION
 
+    def channel_alpha(self, target):
+        """Normalized-space jitter/noise for one CP target."""
+        if isinstance(self.alpha_scaled, tuple):
+            return self.alpha_scaled[target]
+        return self.alpha_scaled
+
     def _make_model(self, target, hparam, nrestart):
         optimize = hparam is None and (nrestart is None or int(nrestart) != 0)
         nres = 1 if nrestart is None else int(nrestart)
         model = gpr.GPRegressor(
             kernel=copy.deepcopy(self.kernel),
-            alpha=self.alpha_scaled,
+            alpha=self.channel_alpha(target),
             n_restarts_optimizer=nres,
             normalize_y=False,
             optimizer='fmin_l_bfgs_b' if optimize else None)
@@ -225,7 +247,7 @@ class GloballyNormalizedCP(CP):
                 model.kernel = model.kernel_.clone_with_theta(theta)
                 model.set_params(optimizer=None, n_restarts_optimizer=0,
                                  normalize_y=False,
-                                 alpha=self.alpha_scaled)
+                                 alpha=self.channel_alpha(target))
                 model.fit(self.descriptors, scaled_all[target])
             self._stamp_model(model, target)
         self.validate_global_normalization()
@@ -254,7 +276,7 @@ class GloballyNormalizedCP(CP):
                 model.kernel = fitted.clone_with_theta(hparam[target])
                 model.set_params(optimizer=None, n_restarts_optimizer=0,
                                  normalize_y=False,
-                                 alpha=self.alpha_scaled)
+                                 alpha=self.channel_alpha(target))
             else:
                 model = self._make_model(target, hparam, 0)
             model.fit(self.descriptors, scaled[target])
@@ -276,7 +298,7 @@ class GloballyNormalizedCP(CP):
         model = self.models[0]
         model.kernel = model.kernel_.clone_with_theta(theta)
         model.set_params(optimizer=None, n_restarts_optimizer=0,
-                         normalize_y=False, alpha=self.alpha_scaled)
+                         normalize_y=False, alpha=self.channel_alpha(0))
         model.fit(self.descriptors, self._scaled_targets(self.targets)[0])
         self._stamp_model(model, 0)
 

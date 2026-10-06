@@ -76,7 +76,7 @@ class GloballyNormalizedBCM(BCM):
         if template.models:
             template.validate_global_normalization()
         factors = np.asarray(template.target_unit_factors, dtype=float)
-        alpha = float(template.alpha_scaled)
+        alpha = tuple(np.atleast_1d(np.asarray(template.alpha_scaled, dtype=float)))
         reference_hparams = None
         for expert_index, expert in enumerate(self.surrogates):
             if type(expert) is not type(template):
@@ -99,7 +99,7 @@ class GloballyNormalizedBCM(BCM):
             if expert.alpha_convention != self.alpha_convention:
                 raise RuntimeError(
                     f'Expert {expert_index} alpha convention mismatch')
-            if float(expert.alpha_scaled) != alpha:
+            if tuple(np.atleast_1d(np.asarray(expert.alpha_scaled, dtype=float))) != alpha:
                 raise RuntimeError(
                     f'Expert {expert_index} uses a different normalized alpha')
             if not np.array_equal(expert.target_unit_factors, factors):

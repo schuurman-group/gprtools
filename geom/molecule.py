@@ -287,7 +287,7 @@ class Geometry():
         """
 
         # can only compute frequencies if we have a hessian defined
-        if np.any([self.hessian]) == None:
+        if self.hessian is None:
             return None, None
 
         # form mass-weighted hessian

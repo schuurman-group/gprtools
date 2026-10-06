@@ -52,6 +52,7 @@ FLOOR_LOCAL_LHS_POINTS = 8
 FLOOR_LOCAL_LHS_CANDIDATES_PER_CENTER = 64
 FLOOR_LOCAL_LHS_HALF_WIDTH_BOHR = 0.01
 CERTIFIED_PREFIX_TIME_TOLERANCE_FS = 1e-12
+ENERGY_GATE_BACKTRACK_FRAMES = 3
 
 ENERGY_BIN_EDGES_EV = np.array([
     0.0, 0.025, 0.05, 0.10, 0.20, 0.35, 0.50,
@@ -176,6 +177,8 @@ def validate_config(config):
     for key in positive:
         if float(config[key]) <= 0.0:
             raise ValueError(f"{key} must be positive")
+    if float(config.get("energy_gate_margin_ev", 2.0)) < 0.0:
+        raise ValueError("energy_gate_margin_ev must be non-negative")
     descriptor = config["descriptor"]
     if descriptor.get("type") != "soap":
         raise ValueError("descriptor.type must be soap")
@@ -242,21 +245,45 @@ def make_descriptor(config, reference):
         int(setting["l_max"]), float(setting["sigma"]))
 
 
-def cp_target_factors(nstates):
+def cp_companion(config):
+    """CP companion spec: 'schmeisser' (raw c_k, default) or 'hyperbolic'
+    (n=3 tanh-squash (b, a): real, distinct roots by construction)."""
+    return config.get("companion", "schmeisser")
+
+
+def hyperbolic_companion(config):
+    return str(cp_companion(config)).lower() in ("hyperbolic", "hyp", "squash")
+
+
+def cp_target_factors(nstates, config=None):
+    # reparametrised (b, a) channels are dimensionless/log: no unit scaling
+    if config is not None and hyperbolic_companion(config):
+        return np.asarray([constants.au2ev] + [1.0]*(nstates - 1), dtype=float)
     return np.asarray(
         [constants.au2ev]
         + [constants.au2ev**(nstates - k) for k in range(nstates - 1)],
         dtype=float)
 
 
-def model_template(config, reference, scaler):
+def cp_target_labels(nstates, config):
+    if hyperbolic_companion(config) and nstates == 3:
+        return ("omega", "b", "a"), ("eV", "1", "1")
+    if hyperbolic_companion(config):
+        return ("omega", "log_neg_c0"), ("eV", "1")
+    return (("omega",) + tuple(f"c{k}" for k in range(nstates - 1)),
+            ("eV",) + tuple(f"eV^{nstates - k}" for k in range(nstates - 1)))
+
+
+def model_template(config, reference, scaler, alpha=None, kernel_bounds=None):
+    extra = {} if kernel_bounds is None else {"kernel_bounds": kernel_bounds}
     return GloballyNormalizedCP(
         int(config["n_states"]), make_descriptor(config, reference),
-        kernel="RBF", companion=("standard", "schmeisser"),
+        kernel="RBF", companion=cp_companion(config),
         degeneracy_eps=float(config["degeneracy_eps"]),
         target_scaler=scaler,
-        target_unit_factors=cp_target_factors(int(config["n_states"])),
-        alpha_scaled=float(config["alpha_scaled"]))
+        target_unit_factors=cp_target_factors(int(config["n_states"]), config),
+        alpha_scaled=(float(config["alpha_scaled"]) if alpha is None else alpha),
+        **extra)
 
 
 def energy_bin_memberships(energies):
@@ -310,16 +337,13 @@ def initial_groups(energies, use_energy_bins):
 def build_initial_model(config, reference, geometries, energies):
     converter = CP(
         int(config["n_states"]), make_descriptor(config, reference),
-        kernel="RBF", companion=("standard", "schmeisser"),
+        kernel="RBF", companion=cp_companion(config),
         degeneracy_eps=float(config["degeneracy_eps"]))
     targets = converter.project_targets(energies, geometries)
     nstates = int(config["n_states"])
     states = list(range(nstates))
-    factors = cp_target_factors(nstates)
-    target_names = ("omega",) + tuple(
-        f"c{k}" for k in range(nstates - 1))
-    target_units = ("eV",) + tuple(
-        f"eV^{nstates - k}" for k in range(nstates - 1))
+    factors = cp_target_factors(nstates, config)
+    target_names, target_units = cp_target_labels(nstates, config)
     scaler = GlobalTargetScaler(
         minimum_target_scale=float(config["minimum_target_scale"]),
         normalization_version=1,
@@ -332,17 +356,36 @@ def build_initial_model(config, reference, geometries, energies):
     descriptor_values = template.descriptor.generate(geometries)
     optimize = farthest_point_indices(
         descriptor_values, int(config["hyperopt_point_count"]))
-    optimizer = GloballyNormalizedBCM(template)
+    alpha = None
     random_state = np.random.get_state()
     np.random.seed(int(config["hyperopt_seed"]))
     try:
-        shared_hparams = optimizer.grow(
-            [geometries[optimize], energies[:, optimize]], states=states,
-            nrestart=int(config["hyperopt_restarts"]))
+        if config.get("hyperopt_noise", False):
+            # one-time fit WITH a WhiteKernel per channel; its noise level is
+            # then frozen as that channel's alpha (the fused BCM evaluator
+            # needs a pure C*RBF kernel). A noiseless interpolant memorises the
+            # rough hyperbolic b channel and rings between points.
+            bounds = tuple(config.get("hyperopt_noise_bounds", (1e-6, 10.0)))
+            probe = model_template(config, reference, scaler,
+                                   kernel_bounds={"noise": bounds})
+            probe.create([geometries[optimize], energies[:, optimize]],
+                         states=states, nrestart=int(config["hyperopt_restarts"]))
+            shared_hparams = np.asarray(
+                [m.kernel_.k1.theta for m in probe.models], dtype=float)
+            alpha = tuple(float(config["alpha_scaled"])
+                          + float(m.kernel_.k2.noise_level) for m in probe.models)
+            print("hyperopt (with noise): "
+                  + "; ".join(str(m.kernel_) for m in probe.models), flush=True)
+        else:
+            optimizer = GloballyNormalizedBCM(template)
+            shared_hparams = optimizer.grow(
+                [geometries[optimize], energies[:, optimize]], states=states,
+                nrestart=int(config["hyperopt_restarts"]))
     finally:
         np.random.set_state(random_state)
 
-    model = GloballyNormalizedBCM(model_template(config, reference, scaler))
+    model = GloballyNormalizedBCM(model_template(config, reference, scaler,
+                                                 alpha=alpha))
     model.Kmax = np.inf
     groups, source, bins = initial_groups(energies, config["energy_bins"])
     assignments = np.full(len(source), -1, dtype=int)
@@ -570,6 +613,9 @@ class UncertaintyChecker:
         self.gap_relative = float(config["gap_std_relative_fraction"])
         self.gap_floor = float(config["gap_floor_ev"])
         self.degeneracy_eps = float(config["degeneracy_eps"])
+        # hyperbolic targets reconstruct real roots by construction: there is
+        # no Schmeisser projection to detect
+        self.hyperbolic = hyperbolic_companion(config)
         self.evaluator = evaluator
         self.protected_prefix_fs = (
             None if protected_prefix_fs is None
@@ -608,6 +654,8 @@ class UncertaintyChecker:
             template.target_scaler.inverse_model_mean(coefficient_mean)
             / factors)
         projected = np.asarray(physical_mean[1] > 0.0, dtype=bool)
+        if self.hyperbolic:
+            projected = np.zeros(count, dtype=bool)
         if projected.shape != (count,):
             raise RuntimeError("invalid two-state Schmeisser projection")
         return gap, gap_std, gap_limit, projected
@@ -1118,6 +1166,84 @@ def append_data(data, candidates, energies, assigned, bins):
     }
 
 
+def energy_gate_active(config, state):
+    """Energy gate is on, and the current horizon is within its window."""
+    if not bool(config.get("energy_gate", False)):
+        return False
+    limit = config.get("energy_gate_max_horizon_fs")
+    horizon = float(config["horizons_fs"][int(state["horizon_index"])])
+    return limit is None or horizon <= float(limit) + 1e-12
+
+
+def trajectory_total_energies(config, results, reference, trajectory_ids):
+    """True-surface total energy KE(p0) + E_active(x0) of each trajectory."""
+    with np.load(result_paths(results)["initial"]) as initial:
+        x0 = np.asarray(initial["x"], dtype=float)
+        p0 = np.asarray(initial["p"], dtype=float)
+        s0 = np.asarray(initial["state"], dtype=int)
+    ids = np.asarray(trajectory_ids, dtype=int)
+    states = list(range(int(config["n_states"])))
+    energies = np.asarray(true_surface(config, reference).evaluate(
+        x0[ids], states=states), dtype=float).reshape(len(states), len(ids))
+    masses = np.asarray(reference._mvec, dtype=float)
+    kinetic = 0.5*np.sum(p0[ids]**2/masses, axis=1)
+    return dict(zip(map(int, ids), energies[s0[ids], np.arange(len(ids))]
+                    + kinetic))
+
+
+def energy_gate(config, results, reference, result, candidates, energies):
+    """Drop candidates that are energetically inaccessible to the trajectory
+    that produced them: true E_0(x) > E_tot + margin, with E_tot the
+    trajectory's conserved true-surface total energy. E_0 is the lowest
+    adiabat, so this is necessary for every active state (hops conserve
+    E_tot). Unlike a structural filter it admits dissociation, which is
+    energetically accessible. If every candidate of a trajectory is
+    inaccessible, back-track along that trajectory's committed path and
+    sample its last accessible frames instead -- where the surrogate first
+    went wrong."""
+    margin = float(config.get("energy_gate_margin_ev", 2.0))/constants.au2ev
+    ids = np.asarray(candidates["trajectory_id"], dtype=int)
+    e_tot = trajectory_total_energies(config, results, reference, np.unique(ids))
+    limit = np.asarray([e_tot[int(i)] for i in ids]) + margin
+    keep = np.asarray(energies)[0] <= limit
+    kept = {key: np.asarray(value)[keep] for key, value in candidates.items()}
+    kept_energies = np.asarray(energies)[:, keep]
+
+    backtrack = []
+    for trajectory_id in np.unique(ids[~keep]):
+        if np.any(keep[ids == trajectory_id]):
+            continue
+        trajectory = result.trajectories[int(trajectory_id)]
+        frames = np.asarray(trajectory.xt[:trajectory.cnt + 1], dtype=float)
+        times = np.asarray(trajectory.time[:trajectory.cnt + 1], dtype=float)
+        frame_energies = np.asarray(true_surface(config, reference).evaluate(
+            frames, states=list(range(int(config["n_states"])))),
+            dtype=float).reshape(int(config["n_states"]), len(frames))
+        accessible = frame_energies[0] <= e_tot[int(trajectory_id)] + margin
+        inaccessible = np.flatnonzero(~accessible)
+        last = (inaccessible[0] if len(inaccessible) else len(frames)) - 1
+        if last < 0:
+            continue
+        for index in range(max(0, last - ENERGY_GATE_BACKTRACK_FRAMES + 1),
+                           last + 1):
+            backtrack.append((frames[index], int(trajectory_id),
+                              float(times[index])*constants.au2fs,
+                              frame_energies[:, index]))
+
+    if backtrack:
+        extra = {
+            "geometries": np.asarray([item[0] for item in backtrack]),
+            "trajectory_id": np.asarray([item[1] for item in backtrack],
+                                        dtype=int),
+            "source_time_fs": np.asarray([item[2] for item in backtrack]),
+            "sample_kind": np.asarray(["energy_gate_backtrack"]*len(backtrack)),
+        }
+        kept = {key: np.concatenate((kept[key], extra[key])) for key in kept}
+        kept_energies = np.hstack((
+            kept_energies, np.asarray([item[3] for item in backtrack]).T))
+    return kept, kept_energies, int(np.count_nonzero(~keep)), len(backtrack)
+
+
 def apply_update(config, results, state, result, model, data, stage_id):
     reference = Geometry("geom.xyz", None)
     candidates = deduplicate(
@@ -1128,6 +1254,21 @@ def apply_update(config, results, state, result, model, data, stage_id):
     states = list(range(int(config["n_states"])))
     energies = np.asarray(true_surface(config, reference).evaluate(
         candidates["geometries"], states=states), dtype=float)
+    if energy_gate_active(config, state):
+        total = len(candidates["geometries"])
+        candidates, energies, gated, backtracked = energy_gate(
+            config, results, reference, result, candidates, energies)
+        # back-tracked frames may coincide with existing rows; carry the
+        # labels through deduplication as a row-aligned field
+        candidates["energies_rows"] = energies.T
+        candidates = deduplicate(candidates, data["geometries"])
+        energies = np.asarray(candidates.pop("energies_rows")).T.reshape(
+            len(states), -1)
+        print(f"[{stage_id}] energy gate: rejected {gated}/{total}, "
+              f"back-tracked {backtracked}", flush=True)
+        if not len(candidates["geometries"]):
+            raise RuntimeError(
+                "energy gate left no accessible samples to add")
     candidates, energies, assigned, bins = update_model(
         config, state, model, candidates, energies, data)
     data = append_data(data, candidates, energies, assigned, bins)

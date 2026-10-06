@@ -98,7 +98,6 @@ class Adiabat(Surrogate):
 
             gpregress = gpr.GPRegressor(
                              kernel               = self.kernel,
-                             alpha                = 1e-5,
                              n_restarts_optimizer = nres,
                              normalize_y          = True,
                              optimizer            = 'fmin_l_bfgs_b')
