@@ -21,6 +21,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 from aggregate import GloballyNormalizedBCM
@@ -31,6 +32,7 @@ from sample import LHS
 from scipy.spatial import cKDTree
 from scipy.stats import qmc
 from surrogate import CP, GlobalTargetScaler, GloballyNormalizedCP
+from surrogate.normalized_adiabat import GloballyNormalizedAdiabat
 from surface import ChemPotPy
 
 
@@ -179,6 +181,30 @@ def validate_config(config):
             raise ValueError(f"{key} must be positive")
     if float(config.get("energy_gate_margin_ev", 2.0)) < 0.0:
         raise ValueError("energy_gate_margin_ev must be non-negative")
+    if str(config.get("representation", "cp")).lower() not in ("cp", "adiabat"):
+        raise ValueError("representation must be 'cp' or 'adiabat'")
+    if config.get("jacobian_sigma_e_ev") is not None:
+        if is_adiabat(config) or hyperbolic_companion(config):
+            raise ValueError("jacobian_sigma_e_ev applies to raw (schmeisser) CP only")
+        if float(config["jacobian_sigma_e_ev"]) <= 0.0:
+            raise ValueError("jacobian_sigma_e_ev must be positive")
+    box = config.get("fc_box")
+    if box is not None:
+        span = [float(v) for v in box.get("span_fs", (-0.5, 0.5))]
+        if len(span) != 2 or not span[0] < 0.0 < span[1]:
+            raise ValueError("fc_box.span_fs must be [negative, positive] fs")
+        if int(box.get("points_per_ic", 0)) < 1:
+            raise ValueError("fc_box.points_per_ic must be positive")
+    cp_uncertainty_mode(config)
+    hopping_scheme(config)
+    if int(config.get("cp_mc_samples", 256)) < 16:
+        raise ValueError("cp_mc_samples must be at least 16")
+    calibration = config.get("sigma_calibration")
+    if calibration is not None and calibration is not False:
+        if not isinstance(calibration, dict):
+            raise ValueError("sigma_calibration must be an object or false")
+        if int(calibration.get("min_points", 200)) < 1:
+            raise ValueError("sigma_calibration.min_points must be positive")
     descriptor = config["descriptor"]
     if descriptor.get("type") != "soap":
         raise ValueError("descriptor.type must be soap")
@@ -242,7 +268,14 @@ def make_descriptor(config, reference):
     setting = config["descriptor"]
     return Soap(
         reference, float(setting["r_cut"]), int(setting["n_max"]),
-        int(setting["l_max"]), float(setting["sigma"]))
+        int(setting["l_max"]), float(setting["sigma"]),
+        average=str(setting.get("average", "outer")))
+
+
+def is_adiabat(config):
+    """representation: 'cp' (default; omega + characteristic-polynomial
+    coefficients) or 'adiabat' (one GP per adiabatic energy)."""
+    return str(config.get("representation", "cp")).lower() == "adiabat"
 
 
 def cp_companion(config):
@@ -275,7 +308,18 @@ def cp_target_labels(nstates, config):
 
 
 def model_template(config, reference, scaler, alpha=None, kernel_bounds=None):
+    nstates = int(config["n_states"])
+    if is_adiabat(config):
+        return GloballyNormalizedAdiabat(
+            nstates, make_descriptor(config, reference), kernel="RBF",
+            target_scaler=scaler,
+            target_unit_factors=np.full(nstates, constants.au2ev),
+            alpha_scaled=(float(config["alpha_scaled"]) if alpha is None
+                          else float(np.max(alpha))))
     extra = {} if kernel_bounds is None else {"kernel_bounds": kernel_bounds}
+    sigma_e = config.get("jacobian_sigma_e_ev")
+    if sigma_e is not None:
+        extra["jacobian_sigma_e_au"] = float(sigma_e)/constants.au2ev
     return GloballyNormalizedCP(
         int(config["n_states"]), make_descriptor(config, reference),
         kernel="RBF", companion=cp_companion(config),
@@ -335,15 +379,21 @@ def initial_groups(energies, use_energy_bins):
     return groups, source, np.full(count, -1, dtype=int)
 
 def build_initial_model(config, reference, geometries, energies):
-    converter = CP(
-        int(config["n_states"]), make_descriptor(config, reference),
-        kernel="RBF", companion=cp_companion(config),
-        degeneracy_eps=float(config["degeneracy_eps"]))
-    targets = converter.project_targets(energies, geometries)
     nstates = int(config["n_states"])
     states = list(range(nstates))
-    factors = cp_target_factors(nstates, config)
-    target_names, target_units = cp_target_labels(nstates, config)
+    if is_adiabat(config):
+        targets = np.asarray(energies, dtype=float)
+        factors = np.full(nstates, constants.au2ev)
+        target_names = tuple(f"E{s}" for s in states)
+        target_units = ("eV",)*nstates
+    else:
+        converter = CP(
+            nstates, make_descriptor(config, reference),
+            kernel="RBF", companion=cp_companion(config),
+            degeneracy_eps=float(config["degeneracy_eps"]))
+        targets = converter.project_targets(energies, geometries)
+        factors = cp_target_factors(nstates, config)
+        target_names, target_units = cp_target_labels(nstates, config)
     scaler = GlobalTargetScaler(
         minimum_target_scale=float(config["minimum_target_scale"]),
         normalization_version=1,
@@ -435,6 +485,48 @@ def result_paths(results, version=0):
     }
 
 
+def fc_box_points(config, reference, initial):
+    """Franck-Condon box around every IC: momentum-directed LHS candidates
+    spanning fc_box.span_fs of motion along the IC velocity, of which
+    fc_box.points_per_ic are kept by farthest-point selection in descriptor
+    space (same construction as the trigger-time momentum-LHS sampling)."""
+    box = config["fc_box"]
+    back, forward = (-float(box.get("span_fs", (-0.5, 0.5))[0]),
+                     float(box.get("span_fs", (-0.5, 0.5))[1]))
+    keep = int(box["points_per_ic"])
+    pool = int(box.get("candidates_per_ic", 8*keep))
+    masses = np.asarray(reference._mvec, dtype=float)
+    # select with the OUTER-averaged SOAP whatever the model descriptor, so the
+    # initial Franck-Condon data do not change when only the averaging does
+    selection = dict(config, descriptor=dict(config["descriptor"], average="outer"))
+    descriptor = make_descriptor(selection, reference)
+    points, owners = [], []
+    for ic in range(len(initial["x"])):
+        seed = int.from_bytes(hashlib.sha256(
+            f"fc_box:{MOMENTUM_LHS_SEED_BASE}:{ic}".encode()).digest()[:8],
+            "little", signed=False)
+        origin = reference.copy()
+        origin.set("x", np.asarray(initial["x"][ic], dtype=float))
+        origin.set("p", np.asarray(initial["p"][ic], dtype=float))
+        lhs = LHS(origin, seed, crd="cart")
+        bounds = lhs.make_bounds(
+            np.asarray(initial["p"][ic], dtype=float)/masses,
+            scale=[back*constants.fs2au, forward*constants.fs2au])
+        candidates = np.asarray(lhs.sample(pool, bounds, cartesian=True), dtype=float)
+        candidates = np.asarray([
+            geometry for geometry in candidates
+            if np.all(np.isfinite(geometry))
+            and minimum_pair_distance_ang(geometry, reference)
+            >= MINIMUM_PAIR_DISTANCE_ANG])
+        if len(candidates) < keep:
+            raise RuntimeError(
+                f"FC box for IC {ic} kept only {len(candidates)} physical candidates")
+        selected = farthest_point_indices(descriptor.generate(candidates), keep)
+        points.append(candidates[selected])
+        owners.extend([ic]*keep)
+    return np.vstack(points), np.asarray(owners, dtype=int)
+
+
 def prepare(config, results, overwrite=False):
     paths = result_paths(results)
     if paths["state"].is_file() and not overwrite:
@@ -459,18 +551,27 @@ def prepare(config, results, overwrite=False):
         reference, int(config["n_trajectories"]), int(config["ic_seed_base"]),
         int(config["hop_seed_offset"]), int(config["initial_state"]))
     states = list(range(int(config["n_states"])))
+    geometries = np.asarray(initial["x"], dtype=float)
+    owner = np.arange(len(geometries), dtype=int)
+    kind = ["initial"]*len(geometries)
+    if config.get("fc_box") is not None:
+        box_x, box_owner = fc_box_points(config, reference, initial)
+        geometries = np.vstack((geometries, box_x))
+        owner = np.concatenate((owner, box_owner))
+        kind += ["fc_box"]*len(box_x)
+        print(f"initial data: {len(initial['x'])} ICs + {len(box_x)} FC-box points", flush=True)
     energies = np.asarray(
-        surface.evaluate(initial["x"], states=states), dtype=float)
+        surface.evaluate(geometries, states=states), dtype=float)
     model, scaler, source, assignments, bins, bin_experts = build_initial_model(
-        config, reference, initial["x"], energies)
+        config, reference, geometries, energies)
 
     atomic_npz(paths["initial"], **initial)
     atomic_npz(
-        paths["data"], geometries=initial["x"][source],
+        paths["data"], geometries=geometries[source],
         energies=energies[:, source], expert_id=assignments, energy_bin=bins,
-        trajectory_id=np.arange(len(initial["x"]), dtype=int)[source],
+        trajectory_id=owner[source],
         source_time_fs=np.zeros(len(source)),
-        sample_kind=np.asarray(["initial"]*len(source)))
+        sample_kind=np.asarray(kind)[source])
     save_model(model, paths["model"])
     scaler.save(results / "target_scaler.npz", results / "target_scaler.json")
     stored_config = config
@@ -554,7 +655,7 @@ def multistate_gap_statistics(template, prediction, active_states):
         template.target_scaler.inverse_model_variance(coefficient_variance)
         / factors**2)
     _, roots, energies, slopes = template._reconstruct(physical_mean)
-    jacobian = template._state_jacobian(roots, slopes)
+    jacobian = template._root_map_jacobian(physical_mean)
 
     active = np.asarray(active_states, dtype=int)
     count = coefficient_mean.shape[1]
@@ -591,6 +692,62 @@ def multistate_gap_statistics(template, prediction, active_states):
     }
 
 
+MC_UNCERTAINTY_SEED = 20261019
+MC_REFINE_FRACTION = 0.5
+
+
+def cp_mc_statistics(template, prediction, active_states, nsamples):
+    """Monte Carlo CP uncertainties: per-state energy and active-to-nearest gap
+    standard deviations from sampled coefficients pushed through the same root
+    reconstruction (and Schmeisser projection) as the mean. Unlike the delta
+    method this stays bounded where the projected roots are near-degenerate.
+    Nearest state and projection flag come from the mean, as in the delta
+    method. Fixed seed: identical predictions give identical scores."""
+    statistics = multistate_gap_statistics(template, prediction, active_states)
+    coefficient_mean = np.asarray(prediction.coefficient_mean, dtype=float)
+    coefficient_variance = np.asarray(
+        prediction.coefficient_variance, dtype=float)
+    if coefficient_mean.ndim == 1:
+        coefficient_mean = coefficient_mean[:, None]
+        coefficient_variance = coefficient_variance[:, None]
+    nstates, count = coefficient_mean.shape
+    factors = np.asarray(template.target_unit_factors, dtype=float)[:, None]
+    rng = np.random.default_rng(MC_UNCERTAINTY_SEED)
+    draws = (coefficient_mean[None]
+             + np.sqrt(np.maximum(coefficient_variance, 0.0))[None]
+             * rng.standard_normal((int(nsamples), nstates, count)))
+    draws = np.moveaxis(draws, 0, 1).reshape(nstates, -1)
+    physical = template.target_scaler.inverse_model_mean(draws)/factors
+    _, _, energies, _ = template._reconstruct(physical)
+    energies = np.asarray(energies).reshape(
+        int(nsamples), count, nstates)*constants.au2ev
+    rows = np.arange(count)
+    active = np.asarray(active_states, dtype=int)
+    nearest = statistics["nearest_state"]
+    statistics["energy_std_ev"] = energies.std(axis=0).T
+    statistics["gap_std_ev"] = (
+        energies[:, rows, active] - energies[:, rows, nearest]).std(axis=0)
+    return statistics
+
+
+def hopping_scheme(config):
+    """'fssh' (true-surface couplings) or 'lz' (Landau-Zener, energies only:
+    the surrogate drives both the forces and the hops)."""
+    scheme = str(config.get("hopping", "fssh")).lower()
+    if scheme not in ("fssh", "lz"):
+        raise ValueError("hopping must be 'fssh' or 'lz'")
+    return scheme
+
+
+def cp_uncertainty_mode(config):
+    # default: Monte Carlo through the root map (the delta method misjudges the
+    # spread where roots are near-degenerate); "delta" remains available
+    mode = str(config.get("cp_uncertainty", "mc")).lower()
+    if mode not in ("delta", "mc"):
+        raise ValueError("cp_uncertainty must be 'delta' or 'mc'")
+    return mode
+
+
 def protected_prefix_for_horizon(state, horizon):
     """Return the latest certified horizon preceding the current one."""
     certified = np.asarray(
@@ -603,8 +760,15 @@ def protected_prefix_for_horizon(state, horizon):
 class UncertaintyChecker:
     """Score active energy and the appropriate two- or three-state gap."""
 
-    def __init__(self, config, evaluator, protected_prefix_fs=None):
+    def __init__(self, config, evaluator, protected_prefix_fs=None,
+                 sigma_scale=1.0):
         self.result_type = ParallelCheckResult
+        # online calibration factor (sigma_calibration): every predicted
+        # standard deviation is multiplied by it before thresholding
+        self.sigma_scale = float(sigma_scale)
+        self.cp_mc = (not is_adiabat(config)
+                      and cp_uncertainty_mode(config) == "mc")
+        self.cp_mc_samples = int(config.get("cp_mc_samples", 256))
         self.au2ev = constants.au2ev
         self.au2fs = constants.au2fs
         self.nstates = int(config["n_states"])
@@ -616,6 +780,7 @@ class UncertaintyChecker:
         # hyperbolic targets reconstruct real roots by construction: there is
         # no Schmeisser projection to detect
         self.hyperbolic = hyperbolic_companion(config)
+        self.adiabat = is_adiabat(config)
         self.evaluator = evaluator
         self.protected_prefix_fs = (
             None if protected_prefix_fs is None
@@ -673,19 +838,71 @@ class UncertaintyChecker:
                 or np.any(active_states < 0)
                 or np.any(active_states >= self.nstates)):
             raise RuntimeError("invalid active states for uncertainty checking")
+        prediction = self._prediction(count)
+        deviation_ev = deviation_ev*self.sigma_scale
+        mc_statistics = None
+        if self.cp_mc and self.nstates > 2:
+            # delta method everywhere (cheap); Monte Carlo where the delta
+            # score is within MC_REFINE_FRACTION of triggering, and ALWAYS at
+            # projected points or where the active-nearest gap is below 3 sigma:
+            # the root map is not linear there on the scale of the uncertainty
+            template = self.evaluator.base.template
+            mc_statistics = multistate_gap_statistics(
+                template, prediction, active_states)
+            delta_score = np.maximum(
+                deviation_ev[active_states, rows]/self.active_threshold,
+                mc_statistics["gap_std_ev"]*self.sigma_scale/np.maximum(
+                    self.gap_threshold,
+                    self.gap_relative*mc_statistics["gap_ev"]))
+            near_degenerate = (
+                mc_statistics["gap_ev"]
+                < 3.0*np.maximum(deviation_ev[active_states, rows],
+                                 deviation_ev[mc_statistics["nearest_state"],
+                                              rows]))
+            refine = np.flatnonzero(
+                (delta_score >= MC_REFINE_FRACTION)
+                | np.asarray(mc_statistics["schmeisser_floor_projected"],
+                             dtype=bool)
+                | near_degenerate)
+            if len(refine):
+                mean = np.asarray(prediction.coefficient_mean, dtype=float)
+                variance = np.asarray(
+                    prediction.coefficient_variance, dtype=float)
+                if mean.ndim == 1:
+                    mean, variance = mean[:, None], variance[:, None]
+                refined = cp_mc_statistics(
+                    template,
+                    SimpleNamespace(coefficient_mean=mean[:, refine],
+                                    coefficient_variance=variance[:, refine]),
+                    active_states[refine], self.cp_mc_samples)
+                deviation_ev[:, refine] = (
+                    refined["energy_std_ev"]*self.sigma_scale)
+                mc_statistics["gap_std_ev"][refine] = refined["gap_std_ev"]
         active_std = deviation_ev[active_states, rows]
         active_score = active_std/self.active_threshold
-        prediction = self._prediction(count)
 
-        if self.nstates == 2:
+        if self.adiabat:
+            # independent per-state GPs: gap to the nearest state, its variance
+            # the sum of the two states' committee variances; nothing projected
+            separation = np.abs(energy_ev - energy_ev[active_states, rows])
+            separation[active_states, rows] = np.inf
+            nearest_states = np.argmin(separation, axis=0)
+            gap = separation[nearest_states, rows]
+            gap_std = np.hypot(deviation_ev[active_states, rows],
+                               deviation_ev[nearest_states, rows])
+            gap_limit = np.maximum(self.gap_threshold, self.gap_relative*gap)
+            projected = np.zeros(count, dtype=bool)
+        elif self.nstates == 2:
             gap, gap_std, gap_limit, projected = self._two_state_gap(
                 energy_ev, deviation_ev, prediction)
             nearest_states = 1 - active_states
         else:
-            statistics = multistate_gap_statistics(
-                self.evaluator.base.template, prediction, active_states)
+            statistics = (mc_statistics if mc_statistics is not None
+                          else multistate_gap_statistics(
+                              self.evaluator.base.template, prediction,
+                              active_states))
             gap = statistics["gap_ev"]
-            gap_std = statistics["gap_std_ev"]
+            gap_std = statistics["gap_std_ev"]*self.sigma_scale
             gap_limit = np.maximum(
                 self.gap_threshold, self.gap_relative*gap)
             projected = statistics["schmeisser_floor_projected"]
@@ -731,6 +948,7 @@ class UncertaintyChecker:
             "schmeisser_floor_projected": bool(projected[index]),
             "at_schmeisser_floor": bool(floor_event[index]),
             "state_collapse_override": bool(collapse[index]),
+            "sigma_scale": self.sigma_scale,
         } for index in rows)
         return self.result_type(score, metadata)
 
@@ -771,7 +989,8 @@ def trajectory_arrays(trajectory):
 
 
 def run_frozen_stage(config, model, initial, phase, horizon,
-                     continuation=None, protected_prefix_fs=None):
+                     continuation=None, protected_prefix_fs=None,
+                     sigma_scale=1.0):
     if phase == "certify":
         ids = tuple(range(int(config["n_trajectories"])))
         reference, trajectories = make_trajectories(config, initial, ids)
@@ -792,11 +1011,13 @@ def run_frozen_stage(config, model, initial, phase, horizon,
     evaluator = CachedFusedEvaluator(model.fused(
         matmul_backend=fused.get("backend", "torch"),
         torch_device=fused.get("torch_device", "cpu")))
+    lz = hopping_scheme(config) == "lz"
     engine = ParallelSurfaceHopping(
         int(config["n_states"]), gradient=evaluator,
-        coupling=true_surface(config, reference),
+        coupling=None if lz else true_surface(config, reference),
         decoherence=bool(config.get("decoherence", True)),
-        rng_seed=int(config["ic_seed_base"]))
+        rng_seed=int(config["ic_seed_base"]),
+        hopping=hopping_scheme(config))
     batch_size = int(fused.get("batch_size", 0))
     start = time.perf_counter()
     result = engine.propagate(
@@ -807,7 +1028,7 @@ def run_frozen_stage(config, model, initial, phase, horizon,
         dt=float(config["dt_fs"])*constants.fs2au,
         electronic_substeps=int(config["electronic_substeps"]),
         chk_func=UncertaintyChecker(
-            config, evaluator, protected_prefix_fs),
+            config, evaluator, protected_prefix_fs, sigma_scale),
         chk_thresh=1.0,
         trigger_policy="individual",
         ground_state_time=(
@@ -929,13 +1150,17 @@ def momentum_lhs_records(result, trajectory_id, reference, config, stage_id):
         >= MINIMUM_PAIR_DISTANCE_ANG
     ])
     if len(candidates) < MOMENTUM_LHS_POINTS:
-        raise RuntimeError(
-            f"momentum-LHS retained only {len(candidates)} physical "
-            f"candidates; {MOMENTUM_LHS_POINTS} are required")
+        # a very fast (typically runaway) trajectory sweeps the box through
+        # atom collisions; keep what is physical rather than abort the stage
+        print(f"[{stage_id}] momentum-LHS: trajectory {trajectory_id} kept "
+              f"{len(candidates)} of {MOMENTUM_LHS_POINTS} physical "
+              "candidates", flush=True)
+        if not len(candidates):
+            return records
     descriptor_values = np.asarray(
         make_descriptor(config, reference).generate(candidates), dtype=float)
     selected = farthest_point_indices(
-        descriptor_values, MOMENTUM_LHS_POINTS)
+        descriptor_values, min(MOMENTUM_LHS_POINTS, len(candidates)))
     records.extend(
         (geometry, trajectory_id, failed_time, "momentum_lhs")
         for geometry in candidates[selected])
@@ -1166,6 +1391,16 @@ def append_data(data, candidates, energies, assigned, bins):
     }
 
 
+# escalating fallback when gating + deduplication leave nothing new: the
+# triggered trajectory resumed past the accessible boundary along a path the
+# surrogate is confidently wrong about; sample further along that path
+ENERGY_GATE_OVERSHOOT_FRAMES = (0, 3, 6, 12, 24)
+
+
+class NothingToAdd(RuntimeError):
+    """No new training rows could be produced for a triggered stage."""
+
+
 def energy_gate_active(config, state):
     """Energy gate is on, and the current horizon is within its window."""
     if not bool(config.get("energy_gate", False)):
@@ -1191,7 +1426,8 @@ def trajectory_total_energies(config, results, reference, trajectory_ids):
                     + kinetic))
 
 
-def energy_gate(config, results, reference, result, candidates, energies):
+def energy_gate(config, results, reference, result, candidates, energies,
+                overshoot=0):
     """Drop candidates that are energetically inaccessible to the trajectory
     that produced them: true E_0(x) > E_tot + margin, with E_tot the
     trajectory's conserved true-surface total energy. E_0 is the lowest
@@ -1200,7 +1436,9 @@ def energy_gate(config, results, reference, result, candidates, energies):
     energetically accessible. If every candidate of a trajectory is
     inaccessible, back-track along that trajectory's committed path and
     sample its last accessible frames instead -- where the surrogate first
-    went wrong."""
+    went wrong. overshoot > 0 also takes that many of the first inaccessible
+    committed frames (just past the boundary, where the surrogate energy is
+    too low); apply_update uses it only when nothing else is left to add."""
     margin = float(config.get("energy_gate_margin_ev", 2.0))/constants.au2ev
     ids = np.asarray(candidates["trajectory_id"], dtype=int)
     e_tot = trajectory_total_energies(config, results, reference, np.unique(ids))
@@ -1224,8 +1462,9 @@ def energy_gate(config, results, reference, result, candidates, energies):
         last = (inaccessible[0] if len(inaccessible) else len(frames)) - 1
         if last < 0:
             continue
+        stop = min(len(frames), last + 1 + int(overshoot))
         for index in range(max(0, last - ENERGY_GATE_BACKTRACK_FRAMES + 1),
-                           last + 1):
+                           stop):
             backtrack.append((frames[index], int(trajectory_id),
                               float(times[index])*constants.au2fs,
                               frame_energies[:, index]))
@@ -1244,6 +1483,84 @@ def energy_gate(config, results, reference, result, candidates, energies):
     return kept, kept_energies, int(np.count_nonzero(~keep)), len(backtrack)
 
 
+def prediction_z_scores(config, model, geometries, energies):
+    """(predicted - exact)/sigma per state for rows the model has not seen,
+    with sigma computed exactly as the trigger computes it (unscaled)."""
+    fused = config["fused"]
+    model.frozen_wts = False
+    evaluator = model.fused(matmul_backend=fused.get("backend", "torch"),
+                            torch_device=fused.get("torch_device", "cpu"))
+    cp_mc = not is_adiabat(config) and cp_uncertainty_mode(config) == "mc"
+    nstates = int(config["n_states"])
+    scores = []
+    for start in range(0, len(geometries), 200):
+        prediction = evaluator.predict(
+            geometries[start:start + 200], need_gradient=False)
+        energy = np.asarray(prediction.energy, dtype=float)*constants.au2ev
+        sigma = np.asarray(prediction.energy_std, dtype=float)*constants.au2ev
+        if cp_mc and nstates > 2:
+            sigma = cp_mc_statistics(
+                evaluator.template, prediction,
+                np.zeros(energy.shape[1], dtype=int),
+                int(config.get("cp_mc_samples", 256)))["energy_std_ev"]
+        exact = np.asarray(energies[:, start:start + 200])*constants.au2ev
+        scores.append(((energy - exact)/np.maximum(sigma, 1e-12)).T)
+    return np.vstack(scores)
+
+
+def record_calibration(config, results, state, model, candidates, energies,
+                       stage_id):
+    """Online sigma calibration from the loop's own new samples: before they
+    are added, the current model predicts them; the pooled median |z| over all
+    samples so far sets sigma_scale = median|z|/0.6745 (1 for an honest
+    Gaussian sigma). Applied once at least min_points rows are pooled.
+    Energy-gate back-track/overshoot rows are excluded: they are not trigger
+    samples, and overshoot frames are where the model is known to be
+    confidently wrong. Rows are keyed by model version, so rerunning an
+    interrupted stage replaces its rows instead of pooling them twice."""
+    setting = config["sigma_calibration"]
+    path = Path(results) / "calibration.npz"
+    version = int(state["version"])
+    kinds = np.asarray(candidates.get(
+        "sample_kind", ["?"]*len(candidates["geometries"]))).astype(str)
+    sampled = kinds != "energy_gate_backtrack"
+    z = (prediction_z_scores(
+        config, model, candidates["geometries"][sampled],
+        np.asarray(energies)[:, sampled])
+         if np.any(sampled) else np.empty((0, int(config["n_states"]))))
+    previous_z = np.empty((0, z.shape[1]))
+    previous_version = np.empty(0)
+    if path.is_file():
+        with np.load(path) as previous:
+            keep = previous["version"] != version
+            previous_z = previous["z"][keep]
+            previous_version = previous["version"][keep]
+    pooled = np.vstack((previous_z, z))
+    versions = np.concatenate((previous_version, np.full(len(z), version)))
+    if not len(pooled):
+        return
+    atomic_npz(path, z=pooled, version=versions)
+    median = float(np.median(np.abs(pooled)))
+    scale = (median/0.6744897501960817
+             if len(pooled) >= int(setting.get("min_points", 200)) else 1.0)
+    scale = float(np.clip(scale, float(setting.get("minimum", 0.25)),
+                          float(setting.get("maximum", 20.0))))
+    batch = float(np.median(np.abs(z))) if len(z) else None
+    state["sigma_scale"] = scale
+    history = [entry for entry in state.get("sigma_scale_history", [])
+               if int(entry["version"]) != version]
+    history.append(
+        {"version": version, "rows": int(len(pooled)),
+         "batch_median_abs_z": batch,
+         "pooled_median_abs_z": median, "sigma_scale": scale})
+    state["sigma_scale_history"] = history
+    batch = float("nan") if batch is None else batch
+    print(f"[{stage_id}] sigma calibration: batch median |z| "
+          f"{batch:.2f} ({int(np.sum(~sampled))} back-track rows excluded), "
+          f"pooled {median:.2f} over {len(pooled)} rows -> sigma_scale "
+          f"{scale:.2f}", flush=True)
+
+
 def apply_update(config, results, state, result, model, data, stage_id):
     reference = Geometry("geom.xyz", None)
     candidates = deduplicate(
@@ -1256,19 +1573,28 @@ def apply_update(config, results, state, result, model, data, stage_id):
         candidates["geometries"], states=states), dtype=float)
     if energy_gate_active(config, state):
         total = len(candidates["geometries"])
-        candidates, energies, gated, backtracked = energy_gate(
-            config, results, reference, result, candidates, energies)
-        # back-tracked frames may coincide with existing rows; carry the
-        # labels through deduplication as a row-aligned field
-        candidates["energies_rows"] = energies.T
-        candidates = deduplicate(candidates, data["geometries"])
-        energies = np.asarray(candidates.pop("energies_rows")).T.reshape(
-            len(states), -1)
-        print(f"[{stage_id}] energy gate: rejected {gated}/{total}, "
-              f"back-tracked {backtracked}", flush=True)
+        ungated, ungated_energies = candidates, energies
+        for overshoot in ENERGY_GATE_OVERSHOOT_FRAMES:
+            candidates, energies, gated, backtracked = energy_gate(
+                config, results, reference, result, ungated,
+                ungated_energies, overshoot=overshoot)
+            # back-tracked frames may coincide with existing rows; carry the
+            # labels through deduplication as a row-aligned field
+            candidates["energies_rows"] = energies.T
+            candidates = deduplicate(candidates, data["geometries"])
+            energies = np.asarray(candidates.pop("energies_rows")).T.reshape(
+                len(states), -1)
+            print(f"[{stage_id}] energy gate: rejected {gated}/{total}, "
+                  f"back-tracked {backtracked}, overshoot {overshoot}, "
+                  f"adding {len(candidates['geometries'])}", flush=True)
+            if len(candidates["geometries"]):
+                break
         if not len(candidates["geometries"]):
-            raise RuntimeError(
+            raise NothingToAdd(
                 "energy gate left no accessible samples to add")
+    if config.get("sigma_calibration"):
+        record_calibration(config, results, state, model, candidates,
+                           energies, stage_id)
     candidates, energies, assigned, bins = update_model(
         config, state, model, candidates, energies, data)
     data = append_data(data, candidates, energies, assigned, bins)
@@ -1340,7 +1666,7 @@ def run_one_stage(config, results, state):
     print(f"[{name}] starting", flush=True)
     result, elapsed = run_frozen_stage(
         config, model, initial, state["phase"], horizon, continuation,
-        protected_prefix_fs)
+        protected_prefix_fs, float(state.get("sigma_scale", 1.0)))
     summary = save_stage(
         temporary_stage, result, state["phase"], horizon, elapsed)
     record = {
@@ -1355,11 +1681,21 @@ def run_one_stage(config, results, state):
         state["status"] = "failed"
         record["status"] = "failed"
     elif result.triggered_ids:
-        state["version"] = apply_update(
-            config, results, state, result, model, data, name)
-        record["status"] = "updated"
-        record["new_model_version"] = int(state["version"])
-        advance_triggered(state, config, final_stage / "continuation.pkl")
+        try:
+            state["version"] = apply_update(
+                config, results, state, result, model, data, name)
+        except NothingToAdd as exc:
+            # cannot learn anything from these triggers: abandon discovery and
+            # rerun every trajectory from t=0 in the next certification cycle
+            print(f"[{name}] stalled: {exc}; starting next certification "
+                  "cycle", flush=True)
+            record["status"] = "stalled"
+            state.update(phase="certify", discovery_wave=0, continuation=None)
+            state["cycle"] += 1
+        else:
+            record["status"] = "updated"
+            record["new_model_version"] = int(state["version"])
+            advance_triggered(state, config, final_stage / "continuation.pkl")
     else:
         record["status"] = "certified" if state["phase"] == "certify" else "clean"
         advance_clean(state, config, horizon)
@@ -1443,7 +1779,8 @@ def run(config, results, max_stages=None):
         certified_before = len(state.get("certified_horizons_fs", []))
         state = run_one_stage(config, results, state)
         atomic_json(state_path, state)
-        if len(state.get("certified_horizons_fs", [])) > certified_before:
+        if (config.get("prune_models_every_stage", False)
+                or len(state.get("certified_horizons_fs", [])) > certified_before):
             retention = prune_uncertified_models(results, state)
             print(
                 "model retention after certification: "
