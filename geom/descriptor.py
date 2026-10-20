@@ -700,9 +700,20 @@ class Soap(Descriptor):
     """
     GRaCI surface evaluator
     """
-    def __init__(self, ref_gm, r_max, n_max, l_max, sigma):
+    def __init__(self, ref_gm, r_max, n_max, l_max, sigma, average='outer',
+                 fd_step_bohr=1.e-4):
         """
         Build a SOAP descriptor generator for the molecule given by ref_gm.
+
+        average : 'outer' (default) -- per-site power spectra averaged over
+                  sites; analytic derivatives.
+                  'inner' -- expansion coefficients averaged over sites before
+                  the power spectrum (dscribe average='inner'); dscribe has no
+                  analytic derivatives for it, so descriptor gradients are
+                  central finite differences with step fd_step_bohr. One inner
+                  evaluation is ~0.2 ms for phenol, so the 2*3N-point gradient
+                  costs about the same as the analytic outer one.
+        Both are L2-normalized.
 
         SOAP encodes each atom's local environment as an expansion of the
         smoothed neighbour density, within a cutoff sphere of radius r_max,
@@ -767,6 +778,10 @@ class Soap(Descriptor):
         n_max=l_max=8 is high-resolution and rarely necessary.
         """
         super().__init__()
+        if average not in ('outer', 'inner'):
+            raise ValueError("Soap average must be 'outer' or 'inner'")
+        self.average = average
+        self.fd_step_bohr = float(fd_step_bohr)
         self.atoms = ref_gm.atms
         self.generator = SOAP(
             species = list(set(self.atoms)), # list of unique elements
@@ -776,7 +791,8 @@ class Soap(Descriptor):
             n_max = n_max,      # maximum radial basis functions
             l_max = l_max,      # maximum degree of spherical harmonics
             sigma = sigma,      # Gaussian smearing of atomic densities
-            average = "off"     # per-site SOAP; the outer (site) average
+            average = ("inner" if average == "inner" else "off"),
+                                # 'off' = per-site SOAP; the outer (site) average
                                 # is taken explicitly in generate(). This
                                 # keeps analytic derivatives available --
                                 # dscribe does not provide them for
@@ -799,6 +815,10 @@ class Soap(Descriptor):
         else:
             eval_gms = gms
 
+        if getattr(self, 'average', 'outer') == 'inner':
+            values = self._inner_values(eval_gms)
+            return values[0] if len(gms.shape) == 1 else values
+
         for i in range(eval_gms.shape[0]):
             gm        = np.reshape(
                             eval_gms[i,:]*constants.bohr2ang,(natm,3))
@@ -813,6 +833,28 @@ class Soap(Descriptor):
         else:
             return np.array(descriptors)
 
+
+    def _inner_values(self, geometries):
+        """Normalized inner-averaged SOAP for (ng, 3N) bohr geometries."""
+        natm = len(self.atoms)
+        molecules = [Atoms(symbols=self.atoms,
+                           positions=np.reshape(row*constants.bohr2ang, (natm, 3)))
+                     for row in np.atleast_2d(geometries)]
+        values = np.atleast_2d(np.asarray(
+            self.generator.create(molecules, n_jobs=1), dtype=float))
+        return values/np.linalg.norm(values, axis=1)[:, None]
+
+    def _inner_gradient(self, geometries):
+        """Central finite-difference Jacobian (ng, 3N, n_feature) of the
+        normalized inner-averaged SOAP."""
+        geometries = np.atleast_2d(np.asarray(geometries, dtype=float))
+        ng, nc = geometries.shape
+        step = getattr(self, 'fd_step_bohr', 1.e-4)
+        shifts = step*np.eye(nc)
+        displaced = np.concatenate([
+            np.vstack((row + shifts, row - shifts)) for row in geometries])
+        values = self._inner_values(displaced).reshape(ng, 2*nc, -1)
+        return (values[:, :nc] - values[:, nc:])/(2.*step)
 
     @timer.timed
     def descriptor_gradient(self, gms, delta=None):
@@ -834,6 +876,9 @@ class Soap(Descriptor):
         ng   = gms.shape[0]
         nc   = gms.shape[1]
         natm = len(self.atoms)
+
+        if getattr(self, 'average', 'outer') == 'inner' and delta is None:
+            return self._inner_gradient(gms)
 
         n_feature = self.generate(gms[0,:]).shape[0]
         des_grad  = np.zeros((ng, nc, n_feature), dtype=float)
@@ -903,6 +948,13 @@ class Soap(Descriptor):
                 f'Expected geometries with {3*natm} Cartesian coordinates')
         if not np.all(np.isfinite(geometries)):
             raise ValueError('Geometry coordinates must all be finite')
+
+        if getattr(self, 'average', 'outer') == 'inner':
+            values = self._inner_values(geometries)
+            jacobian = self._inner_gradient(geometries)
+            if single:
+                return values[0], jacobian
+            return values, jacobian
 
         molecules = [Atoms(
             symbols=self.atoms,
