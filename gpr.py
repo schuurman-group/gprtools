@@ -29,7 +29,7 @@ class GPRegressor(GaussianProcessRegressor):
 
     #
     @timer.timed
-    def add_points(self, X_new, y_new):
+    def add_points(self, X_new, y_new, alpha_new=None):
         """
         Incrementally extend the fit with new training points at FIXED
         hyperparameters (kernel_ unchanged) via a bordered/incremental
@@ -57,6 +57,10 @@ class GPRegressor(GaussianProcessRegressor):
         Append-only: no downdating. Raises numpy/scipy LinAlgError if the Schur
         complement is not positive-definite (the caller should then fall back to
         a full fit, e.g. after raising the noise floor).
+
+        alpha_new: per-point noise for the appended points, required when the
+        model was fitted with a per-point alpha array (it is appended to
+        self.alpha); None keeps the scalar-alpha behaviour.
         """
         if not hasattr(self, 'L_'):
             raise RuntimeError('add_points: model not fitted yet (call fit '
@@ -73,7 +77,15 @@ class GPRegressor(GaussianProcessRegressor):
         # jitter sklearn applies in fit().
         K_Nm = self.kernel_(self.X_train_, X_new)            # (N, m)
         K_mm = self.kernel_(X_new)                           # (m, m), incl noise diag
-        K_mm[np.diag_indices_from(K_mm)] += self.alpha
+        if np.ndim(self.alpha) == 0:
+            if alpha_new is not None and not np.allclose(alpha_new, self.alpha):
+                raise ValueError('add_points: alpha_new given for a scalar-alpha model')
+            K_mm[np.diag_indices_from(K_mm)] += self.alpha
+        else:
+            if alpha_new is None:
+                raise ValueError('add_points: a per-point-alpha model needs alpha_new')
+            alpha_new = np.broadcast_to(np.asarray(alpha_new, dtype=float), (m,))
+            K_mm[np.diag_indices_from(K_mm)] += alpha_new
 
         # extend the Cholesky factor
         W    = solve_triangular(self.L_, K_Nm, lower=True)   # (N, m) = L_NN^{-1} K_Nm
@@ -85,6 +97,8 @@ class GPRegressor(GaussianProcessRegressor):
         L_new[N:, :N]  = W.T
         L_new[N:, N:]  = L_mm
         self.L_        = L_new
+        if np.ndim(self.alpha) != 0:          # only after the factor extended cleanly
+            self.alpha = np.concatenate([np.asarray(self.alpha, dtype=float), alpha_new])
 
         # extend the training inputs
         self.X_train_  = np.vstack([self.X_train_, X_new])

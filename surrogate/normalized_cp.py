@@ -31,7 +31,8 @@ class GloballyNormalizedCP(CP):
     """
 
     def __init__(self, *args, target_scaler,
-                 alpha_scaled=1.e-7, target_unit_factors=None, **kwargs):
+                 alpha_scaled=1.e-7, target_unit_factors=None,
+                 jacobian_sigma_e_au=None, **kwargs):
         # fixed alpha_scaled is the jitter here: no fitted WhiteKernel (the
         # fused BCM evaluator requires a pure C*RBF kernel)
         kb = dict(kwargs.get('kernel_bounds') or {})
@@ -73,6 +74,35 @@ class GloballyNormalizedCP(CP):
                 'target_unit_factors must contain one positive finite value '
                 'per CP target')
         self.target_unit_factors = factors.copy()
+        # Jacobian-weighted noise (gprtools/docs/jacobian_weighting, sensitivity
+        # form): each training point of channel k gets, on top of alpha_scaled,
+        # the normalized noise variance equivalent to an energy-space noise
+        # sigma_E, alpha_ki = (sigma_E/s_ki)^2 with s_ki the RMS over states of
+        # |dE_s/dc_k| at that point's true energies. None = scalar alpha only.
+        if jacobian_sigma_e_au is not None and not (
+                np.isfinite(jacobian_sigma_e_au) and jacobian_sigma_e_au > 0.):
+            raise ValueError('jacobian_sigma_e_au must be positive and finite')
+        self.jacobian_sigma_e_au = (
+            None if jacobian_sigma_e_au is None else float(jacobian_sigma_e_au))
+
+    def point_alpha(self, target, physical_targets):
+        """Normalized noise for channel `target` at the given PHYSICAL
+        training targets: the scalar channel alpha, or (Jacobian weighting)
+        a per-point array alpha_scaled + clip((sigma_E/s)^2, 1e-8, 1e2) in
+        normalized units."""
+        base = self.channel_alpha(target)
+        if getattr(self, 'jacobian_sigma_e_au', None) is None:
+            return base
+        full = np.array(physical_targets, dtype=float, copy=True)
+        reference = self._reference_coeffs()
+        if reference is not None:
+            full[1:] += reference[:, None]
+        jacobian = self._root_map_jacobian(full)              # (point, state, channel)
+        sensitivity = np.sqrt(np.mean(jacobian[:, :, target]**2, axis=1))
+        physical_var = (self.jacobian_sigma_e_au/np.maximum(sensitivity, 1e-300))**2
+        normalized_var = (physical_var*self.target_unit_factors[target]**2
+                          / self.target_scaler.target_scale[target]**2)
+        return base + np.clip(normalized_var, 1e-8, 1e2)
 
     def copy(self):
         """Deep-copy the model while retaining the shared scaler identity."""
@@ -118,7 +148,14 @@ class GloballyNormalizedCP(CP):
                 raise RuntimeError(
                     f'CP target {target} has an ambiguous alpha convention')
             model_alpha = np.asarray(model.alpha, dtype=float)
-            if (model_alpha.ndim != 0
+            if getattr(self, 'jacobian_sigma_e_au', None) is not None:
+                ntrain = model.X_train_.shape[0] if hasattr(model, 'X_train_') else None
+                if (model_alpha.ndim != 1
+                        or (ntrain is not None and model_alpha.shape[0] != ntrain)
+                        or np.any(model_alpha < self.channel_alpha(target))):
+                    raise RuntimeError(
+                        f'CP target {target} has an inconsistent per-point alpha')
+            elif (model_alpha.ndim != 0
                     or float(model_alpha) != self.channel_alpha(target)):
                 raise RuntimeError(
                     f'CP target {target} has inconsistent normalized alpha')
@@ -189,6 +226,7 @@ class GloballyNormalizedCP(CP):
         self.models = []
         for target in range(self.nstates):
             model = self._make_model(target, hparam, nrestart)
+            model.set_params(alpha=self.point_alpha(target, self.targets))
             model.fit(self.descriptors, scaled[target])
             # The first shared fit may optimize.  From this point onward its
             # fitted theta is the committee-wide immutable kernel.
@@ -240,14 +278,18 @@ class GloballyNormalizedCP(CP):
 
         scaled_all = self._scaled_targets(self.targets)
         for target, model in enumerate(self.models):
+            jacobian = getattr(self, 'jacobian_sigma_e_au', None) is not None
             try:
-                model.add_points(new_descriptors, scaled_new[target])
+                model.add_points(
+                    new_descriptors, scaled_new[target],
+                    alpha_new=(self.point_alpha(target, new_targets)
+                               if jacobian else None))
             except np.linalg.LinAlgError:
                 theta = model.kernel_.theta.copy()
                 model.kernel = model.kernel_.clone_with_theta(theta)
                 model.set_params(optimizer=None, n_restarts_optimizer=0,
                                  normalize_y=False,
-                                 alpha=self.channel_alpha(target))
+                                 alpha=self.point_alpha(target, self.targets))
                 model.fit(self.descriptors, scaled_all[target])
             self._stamp_model(model, target)
         self.validate_global_normalization()
@@ -276,9 +318,10 @@ class GloballyNormalizedCP(CP):
                 model.kernel = fitted.clone_with_theta(hparam[target])
                 model.set_params(optimizer=None, n_restarts_optimizer=0,
                                  normalize_y=False,
-                                 alpha=self.channel_alpha(target))
+                                 alpha=self.point_alpha(target, self.targets))
             else:
                 model = self._make_model(target, hparam, 0)
+                model.set_params(alpha=self.point_alpha(target, self.targets))
             model.fit(self.descriptors, scaled[target])
             self._stamp_model(model, target)
             self.models.append(model)
@@ -298,7 +341,7 @@ class GloballyNormalizedCP(CP):
         model = self.models[0]
         model.kernel = model.kernel_.clone_with_theta(theta)
         model.set_params(optimizer=None, n_restarts_optimizer=0,
-                         normalize_y=False, alpha=self.channel_alpha(0))
+                         normalize_y=False, alpha=self.point_alpha(0, self.targets))
         model.fit(self.descriptors, self._scaled_targets(self.targets)[0])
         self._stamp_model(model, 0)
 
