@@ -390,10 +390,13 @@ class Schmeisser(Frobenius):
 
     Learns RAW monomial coefficients (NOT the log-c_{n-2} reparam -- the
     off-diagonal floor is the real-rootedness mechanism here). The implicit-diff
-    root jacobian dz_i/dc_k = -z_i^k/p'(z_i) is inherited from Frobenius and is
-    EXACT where the floor is inactive (real-rooted data); where it is active
-    (the regularised region) it is bounded-but-approximate -- the point being it
-    never blows up. The Algorithm-1 construction uses polynomial division
+    root jacobian dz_i/dc_k = -z_i^k/p'(z_i) inherited from Frobenius is exact
+    only where the clamp/floor is inactive. Where it is active (a "projected"
+    point: the predicted coefficients have no real-rooted solution) it is NOT
+    the derivative of the returned roots and diverges as the projected pair
+    becomes degenerate (by ~1e3-1e4 on phenol). CP._root_map_jacobian therefore
+    differentiates the implemented root map numerically for this companion;
+    use that, not root_jacobian, for forces and delta-method variances. The Algorithm-1 construction uses polynomial division
     (deconvolution), which the paper flags as conditioning-sensitive for high n.
     """
     def to_coeffs(self, Z):

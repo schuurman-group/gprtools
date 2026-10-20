@@ -1060,7 +1060,7 @@ class CP(Surrogate):
 
         _, z, E, c2_slope = self._reconstruct(raw_mean)   # E (ngm, nstates)
         if need_cov:
-            jac = self._state_jacobian(z, c2_slope)  # (ngm, nstates, ntar)
+            jac = self._root_map_jacobian(raw_mean)  # (ngm, nstates, ntar)
 
         evals = np.zeros((ns, ngm),      dtype=float)
         estd  = np.zeros((ns, ngm),      dtype=float)
@@ -1074,6 +1074,20 @@ class CP(Surrogate):
                 ecov[k] = cov_st
                 if std:
                     estd[k] = utils.extract_std(cov_st)
+        if std:
+            # projected points: Monte Carlo std instead of the linearization
+            # (the covariance, if requested, stays delta-method)
+            raw_var = np.array([np.diagonal(raw_cov[t])
+                                for t in range(raw_cov.shape[0])])
+            lin_std = np.zeros((ngm, raw_mean.shape[0]), dtype=float)
+            for k, st in enumerate(states):
+                lin_std[:, st] = estd[k]
+            if len(states) < raw_mean.shape[0]:
+                lin_std = np.sqrt(np.einsum('gst,tg->gs', jac**2, raw_var))
+            mask, mc_std = self._projected_energy_std(raw_mean, raw_var, lin_std)
+            if mc_std is not None:
+                for k, st in enumerate(states):
+                    estd[k, mask] = mc_std[:, st]
         if not cov:
             ecov = np.zeros((ns, ngm, ngm), dtype=float)
         return evals, estd, ecov
@@ -1106,6 +1120,117 @@ class CP(Surrogate):
         return rmean, rstd, rgrad, rgcov
 
     #
+    def _clamped_root_map(self):
+        """True for the Schmeisser companion. Its root map clamps (or, with
+        degeneracy_eps > 0, softplus-floors) the squared off-diagonals; where
+        that is active (projected coefficients) the implicit-differentiation
+        jacobian -z^k/p'(z) of the unclamped roots is NOT the derivative of
+        the energies actually returned -- near a projected degeneracy it
+        overestimates it by orders of magnitude (singular, non-conservative
+        forces; inflated delta-method variances)."""
+        from .companion import Schmeisser
+        return isinstance(self.companion, Schmeisser)
+
+    def _root_map_jacobian(self, raw_mean):
+        """dE_i/d(target_t) of the root map AS IMPLEMENTED, for every point:
+        raw_mean (ntargets, ngm) -> (ngm, nstates, ntargets).
+
+        For the Schmeisser companion this is a central difference of
+        _reconstruct in each coefficient (the omega column is 1), so it is the
+        exact derivative of the returned energies, projection/floor included.
+        Relative step 1e-7 plus the floor scale eps^(n-k) of the degree-(n-k)
+        coefficient; converged to <1e-3 in tests. Vectorized over points:
+        2(n-1) extra reconstructions. Other companions keep the analytic
+        implicit-differentiation jacobian."""
+        raw_mean = np.asarray(raw_mean, dtype=float)
+        _, z, _, slopes = self._reconstruct(raw_mean)
+        if not self._clamped_root_map():
+            return self._state_jacobian(z, slopes)
+        n, ngm = raw_mean.shape
+        eps = float(self.companion.degeneracy_eps)
+        J = np.zeros((ngm, n, n), dtype=float)
+        J[:, :, 0] = 1.0
+        for m in range(1, n):
+            h = 1.0e-7*(np.abs(raw_mean[m]) + eps**(n - m + 1)) + 1.0e-30
+            plus, minus = raw_mean.copy(), raw_mean.copy()
+            plus[m] += h
+            minus[m] -= h
+            _, _, e_plus, _ = self._reconstruct(plus)
+            _, _, e_minus, _ = self._reconstruct(minus)
+            J[:, :, m] = (e_plus - e_minus)/(2.0*h[:, None])
+        return J
+
+    # Monte Carlo energy std at projected points (see _projected_energy_std)
+    _MC_STD_SAMPLES = 256
+    _MC_STD_SEED = 20261019
+
+    def _projected_columns(self, raw_mean):
+        """Boolean (ngm,): points where the Schmeisser root map projects, i.e.
+        some squared off-diagonal of the tridiagonal is at or below the floor
+        (eps/2)^2 (or <= 0 without a floor): the predicted coefficients have
+        no real-rooted solution and two roots are pinned (nearly) together."""
+        raw_mean = np.asarray(raw_mean, dtype=float)
+        n, ngm = raw_mean.shape
+        mask = np.zeros(ngm, dtype=bool)
+        if not self._clamped_root_map() or n < 3:
+            return mask
+        eps = float(self.companion.degeneracy_eps)
+        floor = 0.25*eps**2 if eps > 0. else 0.
+        for g in range(ngm):
+            mono = np.empty(n + 1, dtype=float)
+            mono[0], mono[1] = 1.0, 0.0
+            mono[2:] = raw_mean[1:, g][::-1]           # as in companion.to_roots
+            _, c = self.companion._schmeisser_qc(mono[::-1])
+            mask[g] = bool(np.any(c[:-1] <= floor))
+        return mask
+
+    # linearization is trusted only where adjacent roots are separated by more
+    # than this many (linearized) standard deviations
+    _MC_GAP_SIGMAS = 3.0
+
+    def _nonlinear_columns(self, raw_mean, lin_std):
+        """Boolean (ngm,): points where the delta method cannot be trusted --
+        projected points (kink in the root map), or adjacent roots closer than
+        _MC_GAP_SIGMAS linearized standard deviations (the floor and the
+        square-root behaviour of near-degenerate roots bend the map on a scale
+        smaller than the coefficient uncertainty). lin_std (ngm, nstates),
+        aligned with the ascending energies of _reconstruct."""
+        mask = self._projected_columns(raw_mean)
+        if not self._clamped_root_map():
+            return mask
+        _, _, energies, _ = self._reconstruct(np.asarray(raw_mean, dtype=float))
+        gaps = np.diff(energies, axis=1)                          # (ngm, n-1)
+        pair_std = np.maximum(lin_std[:, :-1], lin_std[:, 1:])
+        return mask | np.any(gaps < self._MC_GAP_SIGMAS*pair_std, axis=1)
+
+    def _projected_energy_std(self, raw_mean, raw_var, lin_std=None):
+        """Where the root map is not linear on the scale of the coefficient
+        uncertainty (_nonlinear_columns: projected points, or near-degenerate
+        roots) no linearization gives the spread of the energies: at a
+        projection the implicit jacobian diverges while the exact local
+        derivative is ~0 along the clamped direction. There the energy std is
+        taken by Monte Carlo instead: _MC_STD_SAMPLES draws of the coefficients
+        from N(raw_mean, raw_var) (independent per channel, as in the delta
+        method) pushed through the same root map, fixed seed.
+        raw_mean, raw_var (ntargets, ngm); lin_std (ngm, nstates) or None
+        (then projected points only) -> (mask (ngm,), std (nsel, nstates) or
+        None)."""
+        raw_mean = np.asarray(raw_mean, dtype=float)
+        mask = (self._projected_columns(raw_mean) if lin_std is None
+                else self._nonlinear_columns(raw_mean, lin_std))
+        if not np.any(mask):
+            return mask, None
+        mean = raw_mean[:, mask]
+        var = np.maximum(np.asarray(raw_var, dtype=float)[:, mask], 0.)
+        n, npts = mean.shape
+        nsamp = self._MC_STD_SAMPLES
+        rng = np.random.default_rng(self._MC_STD_SEED)
+        draws = mean[None] + np.sqrt(var)[None]*rng.standard_normal((nsamp, n, npts))
+        draws = np.moveaxis(draws, 0, 1).reshape(n, nsamp*npts)
+        _, _, energies, _ = self._reconstruct(draws)
+        energies = energies.reshape(nsamp, npts, -1)
+        return mask, energies.std(axis=0)
+
     def reconstruct_gradient(self, coeff_mean, coeff_grad, coeff_gcov,
                              states, std, cov):
         """
@@ -1116,8 +1241,8 @@ class CP(Surrogate):
             gcov_E_st = sum_m J[st, m]^2 coeff_gcov[m]   (delta-method)
         with J the state jacobian at the roots of coeff_mean.
         """
-        _, z, _, c2_slope = self._reconstruct(np.asarray(coeff_mean)[:, None])
-        J  = self._state_jacobian(z, c2_slope)[0]  # (nstates, ntargets)
+        J = self._root_map_jacobian(
+            np.asarray(coeff_mean, dtype=float)[:, None])[0]  # (nstates, ntargets)
         ns = len(states)
         nc = coeff_grad.shape[-1]
         grad = np.zeros((ns, nc),     dtype=float)
@@ -1210,8 +1335,7 @@ class CP(Surrogate):
         # roots z and the jacobian); omega is root-independent, so raw_mean[0]
         # is left as-is here
         self._fold_reference(raw_mean)
-        _, z, _, c2_slope = self._reconstruct(raw_mean)
-        jac = self._state_jacobian(z, c2_slope)     # (ng, nstates, ntar)
+        jac = self._root_map_jacobian(raw_mean)     # (ng, nstates, ntar)
 
         # dE_i/dR = sum_t jac[:,i,t] grad_cart[t];  gcov via jac^2
         grad_recon = np.einsum('git,tgc->igc', jac, grad_cart)
@@ -1284,7 +1408,7 @@ class CP(Surrogate):
         self._fold_reference(raw_mean)
 
         _, z, E, c2_slope = self._reconstruct(raw_mean)
-        jac = self._state_jacobian(z, c2_slope)     # (ngm, nstates, ntar)
+        jac = self._root_map_jacobian(raw_mean)     # (ngm, nstates, ntar)
 
         grad_recon = np.einsum('git,tgc->igc', jac, grad_cart)
         if std:
@@ -1304,6 +1428,14 @@ class CP(Surrogate):
                 estd_out[k] = np.sqrt(np.maximum(var_recon[st], 0.))
             if cov:
                 gcov_out[k] = gcov_recon[st]
+        if std:
+            # projected points: Monte Carlo std instead of the linearization
+            mask, mc_std = self._projected_energy_std(
+                raw_mean, raw_std**2,
+                np.sqrt(np.maximum(var_recon, 0.)).T)
+            if mc_std is not None:
+                for k, st in enumerate(sts):
+                    estd_out[k, mask] = mc_std[:, st]
 
         if singleX:
             return (e_out[:, 0], estd_out[:, 0],
