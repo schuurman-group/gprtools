@@ -91,9 +91,16 @@ class ParallelSurfaceHopping(FSSH):
     """
 
     def __init__(self, nstates, gradient=None, coupling=None,
-                 decoherence=False, rng_seed=None):
+                 decoherence=False, rng_seed=None, hopping='fssh'):
+        if hopping not in ('fssh', 'lz'):
+            raise ValueError("hopping must be 'fssh' or 'lz'")
+        # 'lz': Landau-Zener (Belyaev-Lebedev) hops from adiabatic energies
+        # only -- no couplings, no electronic propagation, no decoherence
         super().__init__(nstates, gradient=gradient, coupling=coupling,
-                         decoherence=decoherence, rng_seed=rng_seed)
+                         decoherence=decoherence and hopping == 'fssh',
+                         rng_seed=rng_seed)
+        self.hopping = hopping
+        self._lz_previous_energy: dict[Any, np.ndarray] = {}
         self._rngs: dict[Any, np.random.Generator] = {}
         self._delta_R_by_id: dict[Any, np.ndarray] = {}
         self._delta_P_by_id: dict[Any, np.ndarray] = {}
@@ -148,6 +155,9 @@ class ParallelSurfaceHopping(FSSH):
             'delta_P': self._delta_P_by_id[trajectory_id].copy(),
             'rng_state': copy.deepcopy(
                 self._rngs[trajectory_id].bit_generator.state),
+            'lz_previous_energy': (
+                None if self._lz_previous_energy.get(trajectory_id) is None
+                else self._lz_previous_energy[trajectory_id].copy()),
         }
 
     def restore_checkpoint_states(self, checkpoint_states):
@@ -165,6 +175,10 @@ class ParallelSurfaceHopping(FSSH):
                 state.get('ground_state_residence', 0.))
             self._rngs[trajectory_id].bit_generator.state = copy.deepcopy(
                 state['rng_state'])
+            previous = state.get('lz_previous_energy')
+            self._lz_previous_energy[trajectory_id] = (
+                None if previous is None
+                else np.asarray(previous, dtype=float).copy())
 
     def _resolve_ids(self, trajectories, trajectory_ids):
         if trajectory_ids is None:
@@ -289,7 +303,7 @@ class ParallelSurfaceHopping(FSSH):
             return np.concatenate(values, axis=0)
         ngm, nc = geometries.shape
         nac = np.zeros((ngm, self.ns, self.ns, nc), dtype=float)
-        if self.ns <= 1:
+        if self.ns <= 1 or self.hopping == 'lz':
             return nac
         if self.coup is None:
             raise ValueError('A coupling surface is required for nstates > 1')
@@ -407,6 +421,60 @@ class ParallelSurfaceHopping(FSSH):
         candidates = np.argmax(crossed, axis=1)
         has_hop = np.any(crossed, axis=1)
         return np.where(has_hop, candidates, active)
+
+    def _lz_hops(self, ids, energy_previous, energy_old, energy_new,
+                 gradient_new, momentum, masses, dt, active):
+        """Landau-Zener hops at the new endpoint (Belyaev-Lebedev form).
+
+        A hop s->j (j adjacent to s) is attempted when the gap |E_s - E_j|
+        had a local minimum at the old endpoint, with probability
+        exp[-(pi/2) sqrt(D^3/D'')], D'' the finite-difference curvature. On a
+        hop the momentum moves along grad(E_j - E_s) at the new endpoint by
+        the smallest-magnitude amount that conserves total energy; if none
+        exists the hop is frustrated. One uniform draw per attempt, from the
+        member's RNG. Energies geometry-major (n, ns); gradient (n, ns, nc).
+        """
+        states = active.copy()
+        result = momentum.copy()
+        for index, key in enumerate(ids):
+            previous = energy_previous[index]
+            if previous is None:
+                continue
+            s = int(active[index])
+            candidates, probabilities = [], []
+            for j in (s - 1, s + 1):
+                if not 0 <= j < self.ns:
+                    continue
+                d0 = abs(previous[s] - previous[j])
+                d1 = abs(energy_old[index, s] - energy_old[index, j])
+                d2 = abs(energy_new[index, s] - energy_new[index, j])
+                if d1 < d0 and d1 < d2:
+                    curvature = (d2 - 2.*d1 + d0)/dt[index]**2
+                    if curvature > 0.:
+                        candidates.append(j)
+                        probabilities.append(
+                            np.exp(-0.5*np.pi*np.sqrt(d1**3/curvature)))
+            if not candidates:
+                continue
+            draw = self._rngs[key].random()
+            cumulative = 0.
+            for j, probability in zip(candidates, probabilities):
+                cumulative += probability
+                if draw >= cumulative:
+                    continue
+                direction = gradient_new[index, j] - gradient_new[index, s]
+                gained = energy_new[index, j] - energy_new[index, s]
+                a = 0.5*np.sum(direction*direction/masses[index])
+                b = np.sum(momentum[index]*direction/masses[index])
+                discriminant = b*b - 4.*a*gained
+                if a <= 0. or discriminant < 0.:
+                    break
+                roots = ((-b + np.sqrt(discriminant))/(2.*a),
+                         (-b - np.sqrt(discriminant))/(2.*a))
+                result[index] = momentum[index] + min(roots, key=abs)*direction
+                states[index] = j
+                break
+        return states, result
 
     @staticmethod
     def _rescale_momentum_batch(momentum, masses, energy_old, energy_new,
@@ -618,10 +686,13 @@ class ParallelSurfaceHopping(FSSH):
                     * gradient_new[row, states]
                 nac_new = self._nac_batch(x_new)
                 energy_new = energy_surface.T
-                dm_new = self._propagate_electronic_batch(
-                    dm_old, energy_old, p_old, nac_old,
-                    energy_new, p_new, nac_new, masses,
-                    steps, int(electronic_substeps))
+                if self.hopping == 'lz':
+                    dm_new = dm_old.copy()
+                else:
+                    dm_new = self._propagate_electronic_batch(
+                        dm_old, energy_old, p_old, nac_old,
+                        energy_new, p_new, nac_new, masses,
+                        steps, int(electronic_substeps))
                 new_times = times + steps
                 proposed_steps += len(alive)
 
@@ -702,13 +773,27 @@ class ParallelSurfaceHopping(FSSH):
                         safe_dm = self._apply_decoherence_batch(
                             safe_ids, safe_dm, safe_steps, safe_gradient,
                             safe_states, safe_masses)
-                    proposed_states = self._draw_hop_states(
-                        safe_ids, p_new[safe_indices], safe_masses,
-                        nac_new[safe_indices], safe_dm, safe_steps,
-                        safe_states)
-                    hopping = proposed_states != safe_states
                     accepted_hop = np.zeros(len(safe_ids), dtype=bool)
-                    safe_momentum = p_new[safe_indices].copy()
+                    if self.hopping == 'lz':
+                        proposed_states, safe_momentum = self._lz_hops(
+                            safe_ids,
+                            [self._lz_previous_energy.get(key)
+                             for key in safe_ids],
+                            energy_old[safe_indices],
+                            energy_new[safe_indices],
+                            safe_gradient, p_new[safe_indices], safe_masses,
+                            safe_steps, safe_states)
+                        for local_index, key in enumerate(safe_ids):
+                            self._lz_previous_energy[key] = \
+                                energy_old[safe_indices[local_index]].copy()
+                        hopping = np.zeros(len(safe_ids), dtype=bool)
+                    else:
+                        proposed_states = self._draw_hop_states(
+                            safe_ids, p_new[safe_indices], safe_masses,
+                            nac_new[safe_indices], safe_dm, safe_steps,
+                            safe_states)
+                        hopping = proposed_states != safe_states
+                        safe_momentum = p_new[safe_indices].copy()
                     if np.any(hopping):
                         local = np.where(hopping)[0]
                         global_index = safe_indices[local]
